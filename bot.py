@@ -1,5 +1,5 @@
 """
-🤖 GÖREV YAPSAM BOTU v9.0 - TAM ÖZELLİKLİ
+🤖 GÖREV YAPSAM BOTU v10.0 - GÜNCELLENMİŞ
 Telegram: @GorevYapsam
 Developer: Alperen
 Token: 8465270393:AAGu8J5m8taovdjiffbU8LFc-9XbA1dv_co
@@ -20,7 +20,7 @@ import json
 TOKEN = "8465270393:AAGu8J5m8taovdjiffbU8LFc-9XbA1dv_co"
 ADMIN_ID = 7904032877
 ADMIN_USER = "@AlperenTHE"
-ZORUNLU_KANAL = "@GorevYapsam"
+ZORUNLU_KANAL = "GY_Refim"  # Güncellenmiş kanal
 
 # FİYATLAR
 PRICES = {
@@ -43,11 +43,12 @@ def init_db():
     with get_db() as conn:
         cursor = conn.cursor()
         
-        # Kullanıcılar tablosu
+        # Kullanıcılar tablosu - TÜM VERİLER İÇİN
         cursor.execute('''CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
             first_name TEXT,
+            last_name TEXT,
             balance REAL DEFAULT 0.0,
             total_earned REAL DEFAULT 0.0,
             tasks_completed INTEGER DEFAULT 0,
@@ -56,10 +57,15 @@ def init_db():
             daily_streak INTEGER DEFAULT 0,
             last_daily TIMESTAMP,
             last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            joined_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            joined_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            channel_joined INTEGER DEFAULT 0,
+            phone_number TEXT,
+            language_code TEXT,
+            is_bot INTEGER DEFAULT 0,
+            data_json TEXT  -- Tüm kullanıcı verisi JSON olarak
         )''')
         
-        # Görevler tablosu
+        # Görevler tablosu - TÜM VERİLER İÇİN
         cursor.execute('''CREATE TABLE IF NOT EXISTS tasks (
             task_id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -72,16 +78,18 @@ def init_db():
             cost_spent REAL DEFAULT 0.0,
             status TEXT DEFAULT 'active',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            task_json TEXT  -- Tüm görev verisi JSON olarak
         )''')
         
-        # Görev tamamlamalar
+        # Görev tamamlamalar - TÜM VERİLER İÇİN
         cursor.execute('''CREATE TABLE IF NOT EXISTS completions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             task_id INTEGER,
             user_id INTEGER,
             earned REAL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completion_json TEXT  -- Tüm tamamlama verisi
         )''')
         
         # Referanslar
@@ -91,7 +99,8 @@ def init_db():
             referred_id INTEGER,
             earned REAL DEFAULT 1.0,
             status TEXT DEFAULT 'active',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            ref_json TEXT
         )''')
         
         # Kampanyalar
@@ -104,7 +113,8 @@ def init_db():
             spent REAL DEFAULT 0.0,
             clicks INTEGER DEFAULT 0,
             status TEXT DEFAULT 'active',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            campaign_json TEXT
         )''')
         
         # Admin işlemleri
@@ -114,6 +124,17 @@ def init_db():
             action TEXT,
             target_id INTEGER,
             details TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            log_json TEXT
+        )''')
+        
+        # Sistem logları
+        cursor.execute('''CREATE TABLE IF NOT EXISTS system_logs (
+            log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            log_type TEXT,
+            user_id INTEGER,
+            details TEXT,
+            data_json TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
         
@@ -129,9 +150,22 @@ def format_money(num):
 def kanal_kontrol(user_id):
     """Kanal üyeliği kontrolü"""
     try:
-        member = bot.get_chat_member(ZORUNLU_KANAL, user_id)
-        return member.status in ['member', 'administrator', 'creator']
-    except:
+        member = bot.get_chat_member("@" + ZORUNLU_KANAL, user_id)
+        is_member = member.status in ['member', 'administrator', 'creator']
+        
+        # Veritabanına kaydet
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''UPDATE users SET 
+                           channel_joined = ?
+                           WHERE user_id = ?''', 
+                           (1 if is_member else 0, user_id))
+            conn.commit()
+        
+        return is_member
+    except Exception as e:
+        # Hata durumunda logla
+        log_system("channel_check_error", user_id, f"Kanal kontrol hatası: {str(e)}")
         return False
 
 def get_user(user_id):
@@ -141,15 +175,38 @@ def get_user(user_id):
         cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
         return cursor.fetchone()
 
-def create_user(user_id, username, first_name):
-    """Yeni kullanıcı oluştur"""
+def create_user(user_id, user_data):
+    """Yeni kullanıcı oluştur - TÜM VERİLERİ KAYDET"""
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute('''INSERT OR IGNORE INTO users 
-                       (user_id, username, first_name, balance) 
-                       VALUES (?, ?, ?, 0.0)''', 
-                       (user_id, username, first_name))
+        
+        # JSON veriyi hazırla
+        data_json = json.dumps({
+            "id": user_data.id,
+            "username": user_data.username,
+            "first_name": user_data.first_name,
+            "last_name": user_data.last_name,
+            "language_code": user_data.language_code,
+            "is_bot": user_data.is_bot,
+            "created_at": datetime.now().isoformat()
+        })
+        
+        # Kullanıcıyı oluştur veya güncelle
+        cursor.execute('''INSERT OR REPLACE INTO users 
+                       (user_id, username, first_name, last_name, 
+                        language_code, is_bot, data_json, joined_date, balance) 
+                       VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 0.0)''', 
+                       (user_id, 
+                        user_data.username, 
+                        user_data.first_name,
+                        user_data.last_name,
+                        user_data.language_code,
+                        1 if user_data.is_bot else 0,
+                        data_json))
         conn.commit()
+        
+        # Sistem logu
+        log_system("user_created", user_id, "Yeni kullanıcı oluşturuldu", data_json)
 
 def update_balance(user_id, amount, reason=""):
     """Bakiye güncelle"""
@@ -200,10 +257,19 @@ def add_ref(referrer_id, referred_id):
         if cursor.fetchone():
             return False
         
+        # JSON veri
+        ref_json = json.dumps({
+            "referrer_id": referrer_id,
+            "referred_id": referred_id,
+            "earned": 1.0,
+            "created_at": datetime.now().isoformat()
+        })
+        
         # Referans kaydı oluştur
         cursor.execute('''INSERT INTO referrals 
-                       (referrer_id, referred_id, earned)
-                       VALUES (?, ?, ?)''', (referrer_id, referred_id, 1.0))
+                       (referrer_id, referred_id, earned, ref_json)
+                       VALUES (?, ?, ?, ?)''', 
+                       (referrer_id, referred_id, 1.0, ref_json))
         
         # Referrer'a bonus ver
         cursor.execute('''UPDATE users SET 
@@ -214,6 +280,11 @@ def add_ref(referrer_id, referred_id):
                        WHERE user_id = ?''', (referrer_id,))
         
         conn.commit()
+        
+        # Log
+        log_system("referral_added", referrer_id, 
+                  f"Yeni referans: {referred_id}", ref_json)
+        
         return True
 
 def get_active_tasks(task_type=None, limit=10):
@@ -237,14 +308,93 @@ def get_task(task_id):
         cursor.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
         return cursor.fetchone()
 
+def add_task_to_db(user_id, task_type, title, link, description, cost_per_view):
+    """Görevi veritabanına ekle - TÜM VERİLERİ KAYDET"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        # JSON veri
+        task_json = json.dumps({
+            "user_id": user_id,
+            "task_type": task_type,
+            "title": title,
+            "link": link,
+            "description": description,
+            "cost_per_view": cost_per_view,
+            "created_at": datetime.now().isoformat(),
+            "status": "active"
+        })
+        
+        cursor.execute('''INSERT INTO tasks 
+                       (user_id, task_type, title, link, description, 
+                        cost_per_view, task_json, status)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 'active')''',
+                       (user_id, task_type, title, link, description, 
+                        cost_per_view, task_json))
+        
+        task_id = cursor.lastrowid
+        conn.commit()
+        
+        # Log
+        log_system("task_created", user_id, 
+                  f"Yeni görev: {title}", task_json)
+        
+        return task_id
+
+def add_completion_to_db(task_id, user_id, earned):
+    """Tamamlamayı veritabanına ekle - TÜM VERİLERİ KAYDET"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        # JSON veri
+        completion_json = json.dumps({
+            "task_id": task_id,
+            "user_id": user_id,
+            "earned": earned,
+            "created_at": datetime.now().isoformat()
+        })
+        
+        cursor.execute('''INSERT INTO completions 
+                       (task_id, user_id, earned, completion_json)
+                       VALUES (?, ?, ?, ?)''',
+                       (task_id, user_id, earned, completion_json))
+        
+        conn.commit()
+        
+        # Log
+        log_system("task_completed", user_id, 
+                  f"Görev tamamlandı: {task_id}", completion_json)
+
 def add_admin_log(admin_id, action, target_id=None, details=""):
     """Admin log ekle"""
     with get_db() as conn:
         cursor = conn.cursor()
+        
+        log_json = json.dumps({
+            "admin_id": admin_id,
+            "action": action,
+            "target_id": target_id,
+            "details": details,
+            "created_at": datetime.now().isoformat()
+        })
+        
         cursor.execute('''INSERT INTO admin_logs 
-                       (admin_id, action, target_id, details)
+                       (admin_id, action, target_id, details, log_json)
+                       VALUES (?, ?, ?, ?, ?)''',
+                       (admin_id, action, target_id, details, log_json))
+        conn.commit()
+
+def log_system(log_type, user_id=None, details="", data_json=None):
+    """Sistem logu ekle"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        data_json_str = json.dumps(data_json) if data_json else "{}"
+        
+        cursor.execute('''INSERT INTO system_logs 
+                       (log_type, user_id, details, data_json)
                        VALUES (?, ?, ?, ?)''',
-                       (admin_id, action, target_id, details))
+                       (log_type, user_id, details, data_json_str))
         conn.commit()
 
 # ================= 4. ANA MENÜ =================
@@ -279,6 +429,8 @@ def show_main_menu(user_id, message_id=None):
 🎯 <b>Tamamlanan Görev:</b> {user['tasks_completed']}
 👥 <b>Referans Kazancı:</b> {format_money(user['ref_earned'])}
 
+📢 <b>Zorunlu Kanal:</b> @{ZORUNLU_KANAL}
+
 🚀 <b>Slogan:</b> "Görev Yap, Para Kazan, Kampanya Oluştur!"
 
 👇 <i>Hemen aşağıdaki seçeneklerden birini seçerek başla:</i>"""
@@ -292,8 +444,10 @@ def show_main_menu(user_id, message_id=None):
 @bot.message_handler(commands=['start'])
 def start_command(message):
     user_id = message.from_user.id
-    first_name = message.from_user.first_name or "Kullanıcı"
-    username = message.from_user.username or ""
+    user_data = message.from_user
+    
+    # TÜM KULLANICI VERİSİNİ KAYDET
+    create_user(user_id, user_data)
     
     # Referans kontrolü
     ref_used = False
@@ -303,8 +457,6 @@ def start_command(message):
             try:
                 referrer_id = int(param.replace('ref_', ''))
                 if referrer_id != user_id:
-                    # Kullanıcıyı önce oluştur
-                    create_user(user_id, username, first_name)
                     # Referans ekle
                     if add_ref(referrer_id, user_id):
                         ref_used = True
@@ -315,18 +467,18 @@ def start_command(message):
     if not kanal_kontrol(user_id):
         markup = types.InlineKeyboardMarkup()
         markup.add(
-            types.InlineKeyboardButton("📢 KANALA KATIL", url=f"https://t.me/{ZORUNLU_KANAL.replace('@', '')}"),
+            types.InlineKeyboardButton("📢 KANALA KATIL", url=f"https://t.me/{ZORUNLU_KANAL}"),
             types.InlineKeyboardButton("✅ KATILDIM", callback_data="check_join")
         )
         
         bot.send_message(
             user_id,
-            f"""<b>👋 Merhaba {first_name}!</b>
+            f"""<b>👋 Merhaba {user_data.first_name}!</b>
 
 🤖 <b>Görev Yapsam Botuna</b> hoş geldin!
 
 📢 <b>Botu kullanmak için kanalımıza katılman gerekiyor:</b>
-{ZORUNLU_KANAL}
+@{ZORUNLU_KANAL}
 
 ✅ Katıldıktan sonra "✅ KATILDIM" butonuna tıklayarak devam edebilirsin.
 
@@ -335,20 +487,19 @@ def start_command(message):
         )
         return
     
-    # Kullanıcı oluştur
-    create_user(user_id, username, first_name)
-    
     # Hoşgeldin bonusu
     user = get_user(user_id)
     if user['tasks_completed'] == 0 and user['balance'] == 0:
         update_balance(user_id, 2.0, "Hoşgeldin bonusu")
     
     # Hoşgeldin mesajı
-    welcome_msg = f"""<b>🎉 HOŞ GELDİN {first_name}!</b>
+    welcome_msg = f"""<b>🎉 HOŞ GELDİN {user_data.first_name}!</b>
 
 ✅ <b>Başarıyla kayıt oldun!</b>
 
 💰 <b>Hoşgeldin Bonusu:</b> 2.00 ₺ hesabına yüklendi.
+
+📢 <b>Kanal Durumu:</b> ✅ @{ZORUNLU_KANAL} kanalına katıldın.
 
 🚀 <b>Şimdi yapabileceklerin:</b>
 1. 🤖 <b>Görev Yap</b> - Hemen para kazanmaya başla
@@ -369,7 +520,7 @@ def start_command(message):
 def help_command(message):
     user_id = message.from_user.id
     
-    text = """<b>ℹ️ YARDIM MERKEZİ</b>
+    text = f"""<b>ℹ️ YARDIM MERKEZİ</b>
 
 🤖 <b>Görev Yapsam Bot - Komutlar ve Kullanım</b>
 
@@ -383,13 +534,16 @@ def help_command(message):
 📢 <b>Kanal Görev:</b> 1.50 ₺ - Kanala katıl  
 👥 <b>Grup Görev:</b> 1.00 ₺ - Gruba katıl
 
+<b>Zorunlu Kanal:</b>
+📢 @{ZORUNLU_KANAL} - Botu kullanmak için katılmalısın
+
 <b>Nasıl Çalışır?</b>
 1. Görev yaparak para kazan
 2. Kampanya oluşturarak reklam yap
 3. Referans getirerek bonus kazan
 
 <b>Kurallar:</b>
-• @GorevYapsam kanalına katılım zorunlu
+• @{ZORUNLU_KANAL} kanalına katılım zorunlu
 • Sahte işlem yasak
 • Çoklu hesap yasak
 • Grup görevleri için bot admin olmalı
@@ -406,17 +560,28 @@ def menu_command(message):
     user_id = message.from_user.id
     show_main_menu(user_id)
 
+@bot.message_handler(commands=['stats'])
+def stats_command(message):
+    user_id = message.from_user.id
+    user = get_user(user_id)
+    
+    if user_id == ADMIN_ID:
+        show_admin_panel(user_id, None)
+    else:
+        show_my_balance(user_id, None)
+
 # ================= 6. CALLBACK HANDLERS =================
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
     user_id = call.from_user.id
     
+    # Kullanıcıyı güncelle
+    update_user_activity(user_id)
+    
     # Kanal kontrolü
     if not kanal_kontrol(user_id) and call.data != "check_join":
         bot.answer_callback_query(call.id, "❌ Önce kanala katılmalısın!", show_alert=True)
         return
-    
-    update_user_activity(user_id)
     
     # Ana işlemler
     if call.data == "check_join":
@@ -477,7 +642,7 @@ def show_task_types(user_id, message_id):
     )
     markup.add(types.InlineKeyboardButton("🏠 ANA MENÜ", callback_data="back_menu"))
     
-    text = """<b>🎯 GÖREV YAP - PARA KAZAN</b>
+    text = f"""<b>🎯 GÖREV YAP - PARA KAZAN</b>
 
 🤖 <b>Görev Yapsam Botunda</b> görev yaparak para kazanmak çok kolay!
 
@@ -497,6 +662,8 @@ def show_task_types(user_id, message_id):
 • Ödül: <b>1.00 ₺</b>
 • Süre: 5 dakika
 • Talimat: Gruba katıl ve 5 dakika kal
+
+📢 <b>Not:</b> @{ZORUNLU_KANAL} kanalına katılım zorunludur.
 
 👇 <i>Hangi görevi yapmak istiyorsun? Birini seç:</i>"""
     
@@ -573,6 +740,8 @@ def show_single_task(user_id, task, message_id):
 3. 3-5 dakika bekleyerek görevin geçerliliğini sağla
 4. "TAMAMLADIM" butonuna bas
 
+📢 <b>Not:</b> @{ZORUNLU_KANAL} kanalına katılım zorunludur.
+
 ⏱️ <b>Süre:</b> 5 dakika
 🎯 <b>Not:</b> Sahte tamamlamalar tespit edilirse hesabın askıya alınır.
 
@@ -581,7 +750,7 @@ def show_single_task(user_id, task, message_id):
     bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
 
 def complete_user_task(user_id, task_id, call):
-    """Görevi tamamla"""
+    """Görevi tamamla - TÜM VERİLERİ KAYDET"""
     with get_db() as conn:
         cursor = conn.cursor()
         
@@ -635,11 +804,8 @@ def complete_user_task(user_id, task_id, call):
                        WHERE task_id = ?''', 
                        (task['cost_per_view'], task_id))
         
-        # Tamamlama kaydı ekle
-        cursor.execute('''INSERT INTO completions 
-                       (task_id, user_id, earned)
-                       VALUES (?, ?, ?)''', 
-                       (task_id, user_id, reward))
+        # Tamamlama kaydı ekle - JSON ile
+        add_completion_to_db(task_id, user_id, reward)
         
         # Bakiye bitmişse görevi kapat
         cursor.execute("SELECT balance FROM users WHERE user_id = ?", (task['user_id'],))
@@ -675,6 +841,8 @@ def complete_user_task(user_id, task_id, call):
 🎯 <b>Toplam Tamamlanan Görev:</b> {user['tasks_completed']}
 📌 <b>Görev Başlığı:</b> {task['title']}
 
+📢 <b>Kanal Kontrolü:</b> ✅ @{ZORUNLU_KANAL} kanalında kal!
+
 🚀 <b>Hemen yeni görev yapmaya devam edebilirsin!</b>
 
 <i>Slogan: "Görev Yap, Para Kazan, Kampanya Oluştur!"</i>""",
@@ -698,7 +866,7 @@ def create_campaign_menu(user_id, message_id):
     )
     markup.add(types.InlineKeyboardButton("🏠 ANA MENÜ", callback_data="back_menu"))
     
-    text = """<b>📢 KAMPANYA OLUŞTUR - REKLAM YAP</b>
+    text = f"""<b>📢 KAMPANYA OLUŞTUR - REKLAM YAP</b>
 
 🚀 <b>Kendi kampanyanı oluştur, görevlerin hemen görünsün!</b>
 
@@ -720,9 +888,11 @@ def create_campaign_menu(user_id, message_id):
 • Hedef: Kullanıcılar grubuna katılır
 • Şart: Botun grupta admin olmalı
 
+📢 <b>Zorunlu Kanal:</b> @{ZORUNLU_KANAL}
+
 💰 <b>Mevcut Bakiyen:</b> {format_money(user['balance'])}
 
-👇 <i>Hangi kampanyayı oluşturmak istiyorsun? Birini seç:</i>""".format(format_money=format_money)
+👇 <i>Hangi kampanyayı oluşturmak istiyorsun? Birini seç:</i>"""
     
     bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
 
@@ -763,6 +933,8 @@ Kampanya Açıklaması</code>
 https://t.me/teknolojihaberleri
 En güncel teknoloji haberleri için bize katılın! Her gün yeni içerikler!</code>
 
+📢 <b>Not:</b> @{ZORUNLU_KANAL} kanalına katılım zorunludur.
+
 👇 <i>Lütfen kampanya bilgilerini yukarıdaki formatta gönder:</i>""",
         user_id,
         message_id
@@ -776,7 +948,7 @@ En güncel teknoloji haberleri için bize katılın! Her gün yeni içerikler!</
     )
 
 def process_campaign_details(message, task_type, message_id):
-    """Kampanya detaylarını işle"""
+    """Kampanya detaylarını işle - TÜM VERİLERİ KAYDET"""
     user_id = message.from_user.id
     text = message.text.strip().split('\n')
     
@@ -851,26 +1023,34 @@ Kampanya oluşturmak için minimum {format_money(min_needed)} bakiyen olmalı.
             show_main_menu(user_id)
             return
     
-    # Kampanya ve görev oluştur
+    # Kampanya ve görev oluştur - JSON ile kaydet
+    task_id = add_task_to_db(user_id, task_type, title, link, desc, cost)
+    
+    # Kampanya kaydı
     with get_db() as conn:
         cursor = conn.cursor()
         
-        # Kampanya oluştur
+        campaign_json = json.dumps({
+            "user_id": user_id,
+            "title": title,
+            "description": desc,
+            "budget": min_needed,
+            "task_type": task_type,
+            "link": link,
+            "cost_per_view": cost,
+            "created_at": datetime.now().isoformat()
+        })
+        
         cursor.execute('''INSERT INTO campaigns 
-                       (user_id, title, description, budget, status)
-                       VALUES (?, ?, ?, ?, ?)''',
-                       (user_id, title, desc, min_needed, 'active'))
+                       (user_id, title, description, budget, campaign_json, status)
+                       VALUES (?, ?, ?, ?, ?, 'active')''',
+                       (user_id, title, desc, min_needed, campaign_json))
         
-        campaign_id = cursor.lastrowid
-        
-        # Görev oluştur
-        cursor.execute('''INSERT INTO tasks 
-                       (user_id, task_type, title, link, description, cost_per_view)
-                       VALUES (?, ?, ?, ?, ?, ?)''',
-                       (user_id, task_type, title, link, desc, cost))
-        
-        task_id = cursor.lastrowid
         conn.commit()
+        
+        # Log
+        log_system("campaign_created", user_id, 
+                  f"Yeni kampanya: {title}", campaign_json)
     
     # Başarı mesajı
     markup = types.InlineKeyboardMarkup()
@@ -897,15 +1077,17 @@ Kampanya oluşturmak için minimum {format_money(min_needed)} bakiyen olmalı.
 • Tahmini Maks. Görüntü: {int(user['balance'] / cost)}
 • Toplam Bütçe: {format_money(min_needed)}
 
-🆔 <b>Kampanya ID:</b> {campaign_id}
 🆔 <b>Görev ID:</b> {task_id}
+📊 <b>Veritabanı:</b> ✅ Tüm veriler kaydedildi
 
 ✅ <b>Kampanyanız aktif!</b> Kullanıcılar şimdi görevinizi görebilir ve tamamlayabilir.
+
+📢 <b>Zorunlu Kanal:</b> @{ZORUNLU_KANAL}
 
 ⚠️ <b>Önemli Not:</b>
 • Her tamamlanan görev için {format_money(cost)} bakiyenizden düşülecek
 • Bakiye {format_money(cost)}'ın altına düştüğünde kampanya otomatik durdurulacak
-• Kampanya performansını "Kampanyalarım" bölümünden takip edebilirsiniz
+• Tüm veriler veritabanına kaydediliyor
 
 🚀 <i>Kampanyanız başarılı olsun! Unutmayın: "Görev Yap, Para Kazan, Kampanya Oluştur!"</i>""",
         reply_markup=markup
@@ -913,80 +1095,13 @@ Kampanya oluşturmak için minimum {format_money(min_needed)} bakiyen olmalı.
     
     show_main_menu(user_id)
 
-def show_my_campaigns(user_id, message_id):
-    """Kullanıcının kampanyalarını göster"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''SELECT * FROM campaigns 
-                       WHERE user_id = ? 
-                       ORDER BY created_at DESC LIMIT 10''', (user_id,))
-        campaigns = cursor.fetchall()
-    
-    if not campaigns:
-        markup = types.InlineKeyboardMarkup()
-        markup.add(
-            types.InlineKeyboardButton("📢 KAMPANYA OLUŞTUR", callback_data="create_campaign"),
-            types.InlineKeyboardButton("🏠 ANA MENÜ", callback_data="back_menu")
-        )
-        
-        bot.edit_message_text(
-            """<b>📊 KAMPANYALARIM</b>
-
-❌ <b>Henüz kampanya oluşturmadınız.</b>
-
-🚀 <b>İlk kampanyanızı oluşturarak:</b>
-• Botunuzu, kanalınızı veya grubunuzu tanıtın
-• Hedef kitlenize ulaşın
-• Etkili reklam yapın
-
-👇 <i>Hemen ilk kampanyanızı oluşturun:</i>""",
-            user_id,
-            message_id,
-            reply_markup=markup
-        )
-        return
-    
-    # İlk kampanyayı göster
-    campaign = campaigns[0]
-    
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''SELECT COUNT(*) as task_count, 
-                       SUM(views) as total_views,
-                       SUM(cost_spent) as total_spent
-                       FROM tasks WHERE user_id = ?''', (user_id,))
-        stats = cursor.fetchone()
-    
-    markup = types.InlineKeyboardMarkup()
-    markup.add(
-        types.InlineKeyboardButton("📢 YENİ KAMPANYA", callback_data="create_campaign"),
-        types.InlineKeyboardButton("🔄 YENİLE", callback_data="my_campaigns"),
-        types.InlineKeyboardButton("🏠 ANA MENÜ", callback_data="back_menu")
-    )
-    
-    text = f"""<b>📊 KAMPANYA İSTATİSTİKLERİM</b>
-
-📌 <b>Son Kampanya:</b> {campaign['title']}
-📝 <b>Açıklama:</b> {campaign['description'][:100]}...
-📊 <b>Durum:</b> {campaign['status']}
-💰 <b>Bütçe:</b> {format_money(campaign['budget'])}
-💸 <b>Harcanan:</b> {format_money(campaign['spent'])}
-👁️ <b>Tıklanma:</b> {campaign['clicks']}
-
-📈 <b>Genel İstatistikler:</b>
-• Toplam Kampanya: {len(campaigns)}
-• Toplam Görev: {stats['task_count'] or 0}
-• Toplam Görüntülenme: {stats['total_views'] or 0}
-• Toplam Harcama: {format_money(stats['total_spent'] or 0)}
-
-🚀 <i>Kampanyalarınızı yönetin, hedef kitlenize ulaşın!</i>"""
-    
-    bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
-
 # ================= 9. BAKİYE BİLGİSİ =================
 def show_my_balance(user_id, message_id):
     """Bakiye bilgisi"""
     user = get_user(user_id)
+    
+    # Kanal durumu
+    channel_status = "✅ Katıldı" if user.get('channel_joined', 0) == 1 else "❌ Katılmadı"
     
     # Son 24 saatteki kazanç
     with get_db() as conn:
@@ -1003,6 +1118,12 @@ def show_my_balance(user_id, message_id):
                        WHERE user_id = ? AND status = 'active' ''',
                        (user_id,))
         active = cursor.fetchone()
+        
+        # Veritabanı istatistikleri
+        cursor.execute('''SELECT COUNT(*) as total_tasks,
+                       SUM(views) as total_views
+                       FROM tasks WHERE user_id = ?''', (user_id,))
+        task_stats = cursor.fetchone()
     
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
@@ -1018,6 +1139,7 @@ def show_my_balance(user_id, message_id):
 
 👤 <b>Kullanıcı:</b> {user['first_name']}
 🆔 <b>ID:</b> <code>{user_id}</code>
+📢 <b>Kanal Durumu:</b> {channel_status} (@{ZORUNLU_KANAL})
 
 💵 <b>Güncel Bakiye:</b> <b>{format_money(user['balance'])}</b>
 📈 <b>Toplam Kazanç:</b> {format_money(user['total_earned'])}
@@ -1025,9 +1147,13 @@ def show_my_balance(user_id, message_id):
 
 🎯 <b>Görev İstatistikleri:</b>
 • Tamamlanan Görev: {user['tasks_completed']}
+• Oluşturulan Görev: {task_stats['total_tasks'] or 0}
+• Toplam Görüntülenme: {task_stats['total_views'] or 0}
 • Aktif Kampanya: {active['active_campaigns'] or 0}
 • Referans Sayısı: {user['referrals']}
 • Referans Kazancı: {format_money(user['ref_earned'])}
+
+📊 <b>Veritabanı:</b> ✅ Tüm verileriniz kaydediliyor
 
 📅 <b>Kayıt Tarihi:</b> {user['joined_date']}
 ⏰ <b>Son Aktiflik:</b> {user['last_active']}
@@ -1040,7 +1166,10 @@ def show_my_balance(user_id, message_id):
 
 🚀 <i>Hemen görev yaparak para kazanmaya başla!</i>"""
     
-    bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
+    if message_id:
+        bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
+    else:
+        bot.send_message(user_id, text, reply_markup=markup)
 
 # ================= 10. REFERANS SİSTEMİ =================
 def show_my_refs(user_id, message_id):
@@ -1058,17 +1187,18 @@ def show_my_refs(user_id, message_id):
                        (user_id,))
         ref_stats = cursor.fetchone()
         
-        cursor.execute('''SELECT first_name, joined_date 
-                       FROM users 
-                       WHERE referred_by = ? 
-                       ORDER BY joined_date DESC LIMIT 5''',
+        cursor.execute('''SELECT u.first_name, r.created_at 
+                       FROM referrals r
+                       JOIN users u ON r.referred_id = u.user_id
+                       WHERE r.referrer_id = ? 
+                       ORDER BY r.created_at DESC LIMIT 5''',
                        (user_id,))
         recent_refs = cursor.fetchall()
     
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
         types.InlineKeyboardButton("📤 PAYLAŞ", 
-            url=f"https://t.me/share/url?url={ref_link}&text=Görev%20Yap%20Para%20Kazan%20Kampanya%20Oluştur!%20%40GorevYapsamBot%20ile%20hemen%20başla!"),
+            url=f"https://t.me/share/url?url={ref_link}&text=Görev%20Yap%20Para%20Kazan%20Kampanya%20Oluştur!%20@{ZORUNLU_KANAL}%20kanalına%20katıl%20ve%20%40GorevYapsamBot%20ile%20hemen%20başla!"),
         types.InlineKeyboardButton("📋 KOPYALA", callback_data=f"copy_{ref_link}")
     )
     markup.add(types.InlineKeyboardButton("🏠 ANA MENÜ", callback_data="back_menu"))
@@ -1078,7 +1208,8 @@ def show_my_refs(user_id, message_id):
     if recent_refs:
         recent_list = "\n<b>📋 Son Referanslar:</b>\n"
         for ref in recent_refs:
-            recent_list += f"• {ref['first_name']} - {ref['joined_date'][:10]}\n"
+            date_str = ref['created_at'][:10] if ref['created_at'] else "Bilinmiyor"
+            recent_list += f"• {ref['first_name']} - {date_str}\n"
     
     text = f"""<b>👥 REFERANS SİSTEMİ</b>
 
@@ -1089,11 +1220,14 @@ def show_my_refs(user_id, message_id):
 🔗 <b>Referans Linkin:</b>
 <code>{ref_link}</code>
 
+📢 <b>Zorunlu Kanal:</b> @{ZORUNLU_KANAL}
+
 🎯 <b>Nasıl Çalışır?</b>
 1. Yukarıdaki linki arkadaşlarına paylaş
 2. Arkadaşların linke tıklasın
 3. Onlar /start yaptığında otomatik olarak 1.00 ₺ hesabına yüklenecek
 4. Arkadaşların da görev yaparak para kazanmaya başlayacak
+5. @{ZORUNLU_KANAL} kanalına katılmaları gerekli
 
 🔥 <b>Bonus Sistemi:</b>
 • 5 referansta: +2 ₺ bonus
@@ -1104,11 +1238,16 @@ def show_my_refs(user_id, message_id):
 📊 <b>Referans Hedefleri:</b>
 {recent_list}
 
+📈 <b>Veritabanı:</b> ✅ Tüm referans verileri kaydediliyor
+
 🚀 <i>Ne kadar çok referans, o kadar çok kazanç! Hemen paylaşmaya başla!</i>"""
     
-    bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
+    if message_id:
+        bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
+    else:
+        bot.send_message(user_id, text, reply_markup=markup)
 
-# ================= 11. ADMIN PANEL - TAM ÖZELLİKLİ =================
+# ================= 11. ADMIN PANEL =================
 def show_admin_panel(user_id, message_id):
     """Admin panel ana sayfa"""
     if user_id != ADMIN_ID:
@@ -1121,6 +1260,9 @@ def show_admin_panel(user_id, message_id):
         # Temel istatistikler
         cursor.execute("SELECT COUNT(*) FROM users")
         total_users = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM users WHERE channel_joined = 1")
+        channel_joined = cursor.fetchone()[0]
         
         cursor.execute("SELECT COUNT(*) FROM users WHERE last_active >= datetime('now', '-1 day')")
         active_today = cursor.fetchone()[0]
@@ -1137,12 +1279,12 @@ def show_admin_panel(user_id, message_id):
         cursor.execute("SELECT COUNT(*) FROM campaigns WHERE status = 'active'")
         active_campaigns = cursor.fetchone()[0]
         
-        # Bugünkü işlemler
-        cursor.execute('''SELECT COUNT(*) as today_tasks, 
-                       SUM(earned) as today_earned 
-                       FROM completions 
-                       WHERE created_at >= date('now')''')
-        today_stats = cursor.fetchone()
+        # Veritabanı boyutu
+        cursor.execute("SELECT COUNT(*) FROM completions")
+        total_completions = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM system_logs")
+        total_logs = cursor.fetchone()[0]
     
     markup = types.InlineKeyboardMarkup(row_width=2)
     
@@ -1160,8 +1302,8 @@ def show_admin_panel(user_id, message_id):
     
     # Alt satır
     markup.add(
-        types.InlineKeyboardButton("📝 SİSTEM AYARLARI", callback_data="admin_system_settings"),
-        types.InlineKeyboardButton("📋 LOG KAYITLARI", callback_data="admin_logs_view")
+        types.InlineKeyboardButton("📋 VERİTABANI YÖNETİMİ", callback_data="admin_database_manage"),
+        types.InlineKeyboardButton("📝 SİSTEM LOGLARI", callback_data="admin_system_logs")
     )
     
     # En alt
@@ -1176,6 +1318,7 @@ def show_admin_panel(user_id, message_id):
 
 📊 <b>Sistem Özeti:</b>
 👥 <b>Toplam Kullanıcı:</b> {total_users}
+📢 <b>Kanala Katılan:</b> {channel_joined} (%{channel_joined/total_users*100 if total_users > 0 else 0:.1f})
 🟢 <b>Bugün Aktif:</b> {active_today}
 💰 <b>Toplam Bakiye:</b> {format_money(total_balance)}
 📈 <b>Toplam Kazanç:</b> {format_money(total_earned)}
@@ -1184,16 +1327,21 @@ def show_admin_panel(user_id, message_id):
 🎯 <b>Aktif Görev:</b> {active_tasks}
 📊 <b>Aktif Kampanya:</b> {active_campaigns}
 
-📅 <b>Bugünkü İstatistik:</b>
-• Tamamlanan Görev: {today_stats['today_tasks'] or 0}
-• Bugünkü Kazanç: {format_money(today_stats['today_earned'] or 0)}
+💾 <b>Veritabanı İstatistikleri:</b>
+✅ <b>Görev Tamamlamaları:</b> {total_completions}
+📋 <b>Sistem Logları:</b> {total_logs}
 
 🛠️ <b>Yönetim Araçları:</b>
 Aşağıdaki butonlardan yapmak istediğiniz işlemi seçin.
 
+📢 <b>Zorunlu Kanal:</b> @{ZORUNLU_KANAL}
+
 ⏰ <b>Son Güncelleme:</b> {datetime.now().strftime('%H:%M:%S')}"""
     
-    bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
+    if message_id:
+        bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
+    else:
+        bot.send_message(user_id, text, reply_markup=markup)
 
 def handle_admin_action(call):
     """Admin işlemlerini yönet"""
@@ -1216,11 +1364,11 @@ def handle_admin_action(call):
     elif action == "admin_campaign_manage":
         show_campaign_management(user_id, call.message.message_id)
     
-    elif action == "admin_system_settings":
-        show_system_settings(user_id, call.message.message_id)
+    elif action == "admin_database_manage":
+        show_database_management(user_id, call.message.message_id)
     
-    elif action == "admin_logs_view":
-        show_admin_logs(user_id, call.message.message_id)
+    elif action == "admin_system_logs":
+        show_system_logs(user_id, call.message.message_id)
     
     elif action == "admin_broadcast":
         start_broadcast(user_id, call.message.message_id)
@@ -1240,7 +1388,8 @@ def show_detailed_stats(user_id, message_id):
                        AVG(balance) as avg_balance,
                        SUM(total_earned) as total_earned,
                        SUM(tasks_completed) as total_tasks,
-                       SUM(referrals) as total_refs
+                       SUM(referrals) as total_refs,
+                       SUM(channel_joined) as total_channel_joined
                        FROM users''')
         user_stats = cursor.fetchone()
         
@@ -1266,6 +1415,9 @@ def show_detailed_stats(user_id, message_id):
                        FROM users 
                        WHERE last_active >= datetime('now', '-7 days')''')
         active_week = cursor.fetchone()[0]
+        
+        # Kanal katılım oranı
+        channel_rate = (user_stats['total_channel_joined'] / user_stats['total'] * 100) if user_stats['total'] > 0 else 0
     
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🔙 GERİ", callback_data="admin_back"))
@@ -1277,6 +1429,7 @@ def show_detailed_stats(user_id, message_id):
 • Bugün Kayıtlı: {new_today}
 • Son 7 Gün Aktif: {active_week}
 • Ortalama Bakiye: {format_money(user_stats['avg_balance'] or 0)}
+• Kanal Katılım: {user_stats['total_channel_joined']} (%{channel_rate:.1f})
 
 💰 <b>FİNANSAL İSTATİSTİKLER:</b>
 • Toplam Sistem Bakiyesi: {format_money(user_stats['total_balance'] or 0)}
@@ -1294,310 +1447,61 @@ def show_detailed_stats(user_id, message_id):
 • Ortalama Görev/Kullanıcı: {(user_stats['total_tasks'] or 0) / max(user_stats['total'], 1):.2f}
 • Aktiflik Oranı: {(active_week / max(user_stats['total'], 1) * 100):.1f}%
 
+📢 <b>Zorunlu Kanal:</b> @{ZORUNLU_KANAL}
+
 ⏰ <b>Son Güncelleme:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"""
     
     bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
 
-def show_user_management(user_id, message_id):
-    """Kullanıcı yönetimi"""
-    markup = types.InlineKeyboardMarkup(row_width=2)
+def show_database_management(user_id, message_id):
+    """Veritabanı yönetimi"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        # Tablo boyutları
+        tables = ['users', 'tasks', 'completions', 'referrals', 'campaigns', 'admin_logs', 'system_logs']
+        table_stats = []
+        
+        for table in tables:
+            cursor.execute(f"SELECT COUNT(*) as count FROM {table}")
+            count = cursor.fetchone()[0]
+            table_stats.append((table, count))
+        
+        # Toplam kayıt sayısı
+        total_records = sum(count for _, count in table_stats)
+    
+    markup = types.InlineKeyboardMarkup()
     markup.add(
-        types.InlineKeyboardButton("🔍 KULLANICI ARA", callback_data="admin_user_search"),
-        types.InlineKeyboardButton("📋 SON KAYITLAR", callback_data="admin_recent_users")
-    )
-    markup.add(
-        types.InlineKeyboardButton("📊 EN AKTİFLER", callback_data="admin_top_active"),
-        types.InlineKeyboardButton("💰 EN ZENGİNLER", callback_data="admin_top_balance")
+        types.InlineKeyboardButton("📥 VERİ YEDEĞİ AL", callback_data="admin_backup_db"),
+        types.InlineKeyboardButton("🗑️ TEMİZLEME ARAÇLARI", callback_data="admin_cleanup_tools")
     )
     markup.add(types.InlineKeyboardButton("🔙 GERİ", callback_data="admin_back"))
     
-    text = """<b>👤 KULLANICI YÖNETİM PANELİ</b>
-
-📋 <b>Kullanıcı yönetimi araçları:</b>
-
-1. <b>Kullanıcı Ara:</b> ID veya kullanıcı adı ile kullanıcı bul
-2. <b>Son Kayıtlar:</b> Son kayıt olan kullanıcıları listele
-3. <b>En Aktifler:</b> En aktif kullanıcıları göster
-4. <b>En Zenginler:</b> En yüksek bakiyeli kullanıcılar
-
-👇 <i>Yapmak istediğiniz işlemi seçin:</i>"""
+    text = "<b>💾 VERİTABANI YÖNETİM PANELİ</b>\n\n"
+    text += f"<b>📊 Tablo İstatistikleri:</b>\n"
+    
+    for table, count in table_stats:
+        text += f"• {table}: {count} kayıt\n"
+    
+    text += f"\n<b>📈 Toplam Kayıt:</b> {total_records}\n"
+    text += f"<b>📅 Sistem:</b> SQLite3\n"
+    text += f"<b>🗄️ Dosya:</b> gorev_bot.db\n\n"
+    
+    text += "<b>🛠️ Veritabanı Araçları:</b>\n"
+    text += "1. <b>Veri Yedeği Al:</b> Tüm verileri yedekle\n"
+    text += "2. <b>Temizleme Araçları:</b> Eski verileri temizle\n\n"
+    
+    text += "<b>⚠️ Uyarı:</b> Bu işlemler geri alınamaz!\n\n"
+    
+    text += "<b>📢 Zorunlu Kanal:</b> @" + ZORUNLU_KANAL
     
     bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
 
-@bot.callback_query_handler(func=lambda call: call.data == "admin_user_search")
-def ask_user_search(call):
-    """Kullanıcı arama iste"""
-    user_id = call.from_user.id
-    
-    bot.edit_message_text(
-        "🔍 <b>Kullanıcı Arama</b>\n\nKullanıcı ID'si veya kullanıcı adı girin:\n\nÖrnek: <code>123456789</code> veya <code>@kullaniciadi</code>",
-        call.message.chat.id,
-        call.message.message_id
-    )
-    
-    bot.register_next_step_handler_by_chat_id(user_id, process_user_search)
-
-def process_user_search(message):
-    """Kullanıcı arama işlemi"""
-    admin_id = message.from_user.id
-    query = message.text.strip()
-    
+def show_system_logs(user_id, message_id):
+    """Sistem logları"""
     with get_db() as conn:
         cursor = conn.cursor()
-        
-        # ID ile ara
-        if query.isdigit():
-            cursor.execute("SELECT * FROM users WHERE user_id = ?", (int(query),))
-            user = cursor.fetchone()
-        # Username ile ara
-        elif query.startswith('@'):
-            username = query[1:]
-            cursor.execute("SELECT * FROM users WHERE username LIKE ?", (f"%{username}%",))
-            user = cursor.fetchone()
-        else:
-            # İsim ile ara
-            cursor.execute("SELECT * FROM users WHERE first_name LIKE ?", (f"%{query}%",))
-            user = cursor.fetchone()
-    
-    if not user:
-        bot.send_message(admin_id, "❌ Kullanıcı bulunamadı!")
-        show_admin_panel(admin_id, None)
-        return
-    
-    # Kullanıcı bilgilerini göster
-    markup = types.InlineKeyboardMarkup()
-    markup.add(
-        types.InlineKeyboardButton("💰 BAKİYE EKLE/ÇIKAR", callback_data=f"admin_balance_user_{user['user_id']}"),
-        types.InlineKeyboardButton("📊 İSTATİSTİK", callback_data=f"admin_stats_user_{user['user_id']}")
-    )
-    markup.add(types.InlineKeyboardButton("🔙 GERİ", callback_data="admin_user_manage"))
-    
-    # Son aktiflik hesapla
-    last_active = user['last_active'] or user['joined_date']
-    
-    text = f"""<b>👤 KULLANICI DETAYLARI</b>
-
-🆔 <b>ID:</b> <code>{user['user_id']}</code>
-👤 <b>Ad:</b> {user['first_name']}
-📛 <b>Kullanıcı Adı:</b> {user['username'] or 'Belirtilmemiş'}
-
-💰 <b>Bakiye:</b> {format_money(user['balance'])}
-📈 <b>Toplam Kazanç:</b> {format_money(user['total_earned'])}
-🎯 <b>Tamamlanan Görev:</b> {user['tasks_completed']}
-👥 <b>Referans:</b> {user['referrals']}
-
-📅 <b>Kayıt Tarihi:</b> {user['joined_date']}
-⏰ <b>Son Aktiflik:</b> {last_active}
-
-💼 <b>Durum:</b> {'🟢 Aktif' if user['balance'] > 0 else '🔴 Pasif'}"""
-    
-    bot.send_message(admin_id, text, reply_markup=markup)
-    show_admin_panel(admin_id, None)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_balance_user_"))
-def balance_user_management(call):
-    """Kullanıcı bakiye yönetimi"""
-    admin_id = call.from_user.id
-    target_id = int(call.data.replace("admin_balance_user_", ""))
-    
-    bot.edit_message_text(
-        f"💰 <b>Bakiye Yönetimi</b>\n\nKullanıcı ID: <code>{target_id}</code>\n\nEkleme veya çıkarma için miktarı girin:\n\nÖrnek: <code>+10.50</code> (ekle)\nÖrnek: <code>-5.00</code> (çıkar)",
-        call.message.chat.id,
-        call.message.message_id
-    )
-    
-    bot.register_next_step_handler_by_chat_id(admin_id, process_balance_change, target_id)
-
-def process_balance_change(message, target_id):
-    """Bakiye değişikliği işlemi"""
-    admin_id = message.from_user.id
-    amount_text = message.text.strip()
-    
-    try:
-        if amount_text.startswith('+'):
-            amount = float(amount_text[1:])
-            operation = "eklendi"
-        elif amount_text.startswith('-'):
-            amount = -float(amount_text[1:])
-            operation = "çıkarıldı"
-        else:
-            amount = float(amount_text)
-            operation = "güncellendi" if amount >= 0 else "çıkarıldı"
-        
-        user = get_user(target_id)
-        if not user:
-            bot.send_message(admin_id, "❌ Kullanıcı bulunamadı!")
-            return
-        
-        update_balance(target_id, amount, f"Admin bakiye {operation}")
-        add_admin_log(admin_id, "balance_update", target_id, f"{amount} {operation}")
-        
-        new_balance = get_user(target_id)['balance']
-        
-        # Kullanıcıya bildir
-        try:
-            bot.send_message(
-                target_id,
-                f"""<b>💰 BAKİYE GÜNCELLEMESİ</b>
-
-Yönetici tarafından hesabınıza işlem yapıldı:
-
-💵 <b>İşlem:</b> {format_money(amount)} {operation}
-💰 <b>Yeni Bakiye:</b> {format_money(new_balance)}
-⏰ <b>Tarih:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-📞 <b>Destek:</b> @AlperenTHE"""
-            )
-        except:
-            pass
-        
-        bot.send_message(
-            admin_id,
-            f"""✅ <b>Bakiye Güncellendi!</b>
-
-👤 <b>Kullanıcı:</b> {user['first_name']}
-🆔 <b>ID:</b> {target_id}
-💰 <b>İşlem:</b> {format_money(amount)} {operation}
-💰 <b>Yeni Bakiye:</b> {format_money(new_balance)}
-
-✅ <b>İşlem başarıyla kaydedildi.</b>"""
-        )
-        
-    except ValueError:
-        bot.send_message(admin_id, "❌ Geçersiz miktar! Lütfen sayısal bir değer girin.")
-    
-    show_admin_panel(admin_id, None)
-
-def show_balance_management(user_id, message_id):
-    """Bakiye yönetimi paneli"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT SUM(balance) as total_balance FROM users")
-        total = cursor.fetchone()[0] or 0
-        
-        cursor.execute('''SELECT COUNT(*) as rich_users 
-                       FROM users WHERE balance >= 50''')
-        rich = cursor.fetchone()[0]
-        
-        cursor.execute('''SELECT COUNT(*) as zero_balance 
-                       FROM users WHERE balance = 0''')
-        zero = cursor.fetchone()[0]
-    
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        types.InlineKeyboardButton("📊 BAKİYE DAĞILIMI", callback_data="admin_balance_dist"),
-        types.InlineKeyboardButton("💰 TOPLU BAKİYE EKLE", callback_data="admin_bulk_balance")
-    )
-    markup.add(
-        types.InlineKeyboardButton("📈 GÜNLÜK KAZANÇ", callback_data="admin_daily_earnings"),
-        types.InlineKeyboardButton("🔙 GERİ", callback_data="admin_back")
-    )
-    
-    text = f"""<b>💰 BAKİYE YÖNETİM PANELİ</b>
-
-📊 <b>Sistem Bakiyesi Özeti:</b>
-💰 <b>Toplam Bakiye:</b> {format_money(total)}
-👥 <b>50+ ₺ Bakiye:</b> {rich} kullanıcı
-🔴 <b>0 Bakiye:</b> {zero} kullanıcı
-
-🛠️ <b>Bakiye Yönetimi Araçları:</b>
-
-1. <b>Bakiye Dağılımı:</b> Kullanıcı bakiyelerinin dağılımını gör
-2. <b>Toplu Bakiye Ekle:</b> Birden fazla kullanıcıya toplu bakiye ekle
-3. <b>Günlük Kazanç:</b> Günlük kazanç istatistiklerini gör
-
-⚠️ <b>Not:</b> Tüm bakiye işlemleri loglanır ve geri alınamaz.
-
-👇 <i>Yapmak istediğiniz işlemi seçin:</i>"""
-    
-    bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
-
-def show_campaign_management(user_id, message_id):
-    """Kampanya yönetimi"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM campaigns")
-        total_campaigns = cursor.fetchone()[0]
-        
-        cursor.execute("SELECT COUNT(*) FROM campaigns WHERE status = 'active'")
-        active_campaigns = cursor.fetchone()[0]
-        
-        cursor.execute("SELECT SUM(budget) FROM campaigns")
-        total_budget = cursor.fetchone()[0] or 0
-        
-        cursor.execute("SELECT SUM(spent) FROM campaigns")
-        total_spent = cursor.fetchone()[0] or 0
-    
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        types.InlineKeyboardButton("📋 AKTİF KAMPANYALAR", callback_data="admin_active_campaigns"),
-        types.InlineKeyboardButton("📊 KAMPANYA İSTATİSTİK", callback_data="admin_campaign_stats")
-    )
-    markup.add(
-        types.InlineKeyboardButton("🔍 KAMPANYA ARA", callback_data="admin_search_campaign"),
-        types.InlineKeyboardButton("🔙 GERİ", callback_data="admin_back")
-    )
-    
-    text = f"""<b>📢 KAMPANYA YÖNETİM PANELİ</b>
-
-📊 <b>Kampanya Özeti:</b>
-📋 <b>Toplam Kampanya:</b> {total_campaigns}
-🟢 <b>Aktif Kampanya:</b> {active_campaigns}
-💰 <b>Toplam Bütçe:</b> {format_money(total_budget)}
-💸 <b>Toplam Harcama:</b> {format_money(total_spent)}
-📈 <b>Kullanım Oranı:</b> {(total_spent / total_budget * 100) if total_budget > 0 else 0:.1f}%
-
-🛠️ <b>Kampanya Yönetimi Araçları:</b>
-
-1. <b>Aktif Kampanyalar:</b> Şu anda aktif olan kampanyaları listele
-2. <b>Kampanya İstatistik:</b> Detaylı kampanya performans raporu
-3. <b>Kampanya Ara:</b> Kampanya ID veya başlığı ile arama yap
-
-👇 <i>Yapmak istediğiniz işlemi seçin:</i>"""
-    
-    bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
-
-def show_system_settings(user_id, message_id):
-    """Sistem ayarları"""
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        types.InlineKeyboardButton("💰 FİYAT AYARLARI", callback_data="admin_price_settings"),
-        types.InlineKeyboardButton("⚙️ SİSTEM AYARLARI", callback_data="admin_system_config")
-    )
-    markup.add(
-        types.InlineKeyboardButton("📢 KANAL AYARLARI", callback_data="admin_channel_settings"),
-        types.InlineKeyboardButton("🔙 GERİ", callback_data="admin_back")
-    )
-    
-    text = """<b>⚙️ SİSTEM AYARLARI PANELİ</b>
-
-🛠️ <b>Sistem Konfigürasyonu:</b>
-
-1. <b>Fiyat Ayarları:</b> Görev fiyatlarını düzenle
-   - Bot Görevi: 2.50 ₺
-   - Kanal Görevi: 1.50 ₺
-   - Grup Görevi: 1.00 ₺
-
-2. <b>Sistem Ayarları:</b> Genel sistem ayarları
-   - Hoşgeldin bonusu
-   - Referans bonusu
-   - Minimum bakiye limitleri
-
-3. <b>Kanal Ayarları:</b> Zorunlu kanal ayarları
-   - Kanal ID
-   - Kontrol mekanizması
-
-⚠️ <b>Uyarı:</b> Bu ayarlar sistemin çalışmasını doğrudan etkiler. Dikkatli değiştirin.
-
-👇 <i>Yapmak istediğiniz ayarı seçin:</i>"""
-    
-    bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
-
-def show_admin_logs(user_id, message_id):
-    """Admin logları"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''SELECT * FROM admin_logs 
+        cursor.execute('''SELECT * FROM system_logs 
                        ORDER BY created_at DESC 
                        LIMIT 20''')
         logs = cursor.fetchall()
@@ -1607,32 +1511,31 @@ def show_admin_logs(user_id, message_id):
         markup.add(types.InlineKeyboardButton("🔙 GERİ", callback_data="admin_back"))
         
         bot.edit_message_text(
-            "<b>📋 LOG KAYITLARI</b>\n\n❌ Henüz log kaydı bulunmuyor.",
+            "<b>📝 SİSTEM LOGLARI</b>\n\n❌ Henüz sistem logu bulunmuyor.",
             user_id,
             message_id,
             reply_markup=markup
         )
         return
     
-    log_text = "<b>📋 SON 20 ADMIN LOG KAYDI</b>\n\n"
+    log_text = "<b>📝 SON 20 SİSTEM LOG KAYDI</b>\n\n"
     
     for log in logs[:10]:  # İlk 10'u göster
-        action_map = {
-            "balance_update": "💰 Bakiye Güncelleme",
+        log_type_map = {
             "user_created": "👤 Kullanıcı Oluşturma",
+            "task_created": "🎯 Görev Oluşturma",
             "task_completed": "✅ Görev Tamamlama",
-            "campaign_created": "📢 Kampanya Oluşturma"
+            "campaign_created": "📢 Kampanya Oluşturma",
+            "referral_added": "👥 Referans Ekleme",
+            "channel_check_error": "❌ Kanal Kontrol Hatası"
         }
         
-        action_text = action_map.get(log['action'], log['action'])
+        log_type_text = log_type_map.get(log['log_type'], log['log_type'])
         timestamp = log['created_at'][:19] if log['created_at'] else "N/A"
         
         log_text += f"📅 {timestamp}\n"
-        log_text += f"🔧 {action_text}\n"
-        log_text += f"👤 Admin ID: {log['admin_id']}\n"
-        
-        if log['target_id']:
-            log_text += f"🎯 Hedef ID: {log['target_id']}\n"
+        log_text += f"🔧 {log_type_text}\n"
+        log_text += f"👤 Kullanıcı ID: {log['user_id'] or 'Sistem'}\n"
         
         if log['details']:
             log_text += f"📝 Detay: {log['details'][:50]}...\n"
@@ -1644,110 +1547,10 @@ def show_admin_logs(user_id, message_id):
     
     bot.edit_message_text(log_text, user_id, message_id, reply_markup=markup)
 
-def start_broadcast(user_id, message_id):
-    """Toplu duyuru başlat"""
-    bot.edit_message_text(
-        """<b>📢 TOPLU DUYURU PANELİ</b>
-
-Tüm kullanıcılara göndermek istediğiniz mesajı yazın:
-
-⚠️ <b>Dikkat:</b>
-• Mesaj HTML formatında gönderilecek
-• Tüm aktif kullanıcılara ulaşacak
-• İşlem biraz zaman alabilir
-• İptal edilemez
-
-✍️ <b>Mesajınızı yazın:</b>""",
-        user_id,
-        message_id
-    )
-    
-    bot.register_next_step_handler_by_chat_id(user_id, process_broadcast_message)
-
-def process_broadcast_message(message):
-    """Toplu duyuru işlemi"""
-    admin_id = message.from_user.id
-    broadcast_text = message.text
-    
-    # Kullanıcıları al
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id FROM users")
-        users = cursor.fetchall()
-    
-    total = len(users)
-    success = 0
-    failed = 0
-    
-    bot.send_message(admin_id, f"📢 <b>Duyuru başlatılıyor...</b>\n\nToplam {total} kullanıcıya gönderilecek.")
-    
-    for i, user in enumerate(users):
-        try:
-            bot.send_message(
-                user[0],
-                f"""<b>📢 SİSTEM DUYURUSU</b>
-
-{broadcast_text}
-
-⏰ <b>Tarih:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-📞 <b>Destek:</b> @AlperenTHE
-
-🚀 <i>Görev Yap, Para Kazan, Kampanya Oluştur!</i>"""
-            )
-            success += 1
-            
-            # Her 50 mesajda bir dur
-            if (i + 1) % 50 == 0:
-                time.sleep(1)
-            
-        except Exception as e:
-            failed += 1
-        
-        # İlerlemeyi göster
-        if (i + 1) % 100 == 0 or (i + 1) == total:
-            try:
-                bot.edit_message_text(
-                    f"""📢 <b>Duyuru Devam Ediyor...</b>
-
-✅ Başarılı: {success}
-❌ Başarısız: {failed}
-📊 İlerleme: {i + 1}/{total} ({((i + 1) / total * 100):.1f}%)
-
-⏰ Tahmini kalan: {(total - i - 1) * 0.1:.1f} saniye""",
-                    admin_id,
-                    message.message_id + 1
-                )
-            except:
-                pass
-    
-    # Log ekle
-    add_admin_log(admin_id, "broadcast", None, f"Toplu duyuru: {success}/{total}")
-    
-    # Sonuç mesajı
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔙 YÖNETİCİ PANELİ", callback_data="admin_back"))
-    
-    bot.send_message(
-        admin_id,
-        f"""✅ <b>DUYURU TAMAMLANDI!</b>
-
-📊 <b>Sonuçlar:</b>
-✅ <b>Başarılı:</b> {success} kullanıcı
-❌ <b>Başarısız:</b> {failed} kullanıcı
-📈 <b>Başarı Oranı:</b> {(success / total * 100):.1f}%
-
-⏰ <b>Süre:</b> Yaklaşık {total * 0.1:.1f} saniye
-📅 <b>Tarih:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-✅ <b>Duyuru başarıyla tamamlandı.</b>""",
-        reply_markup=markup
-    )
-
-# ================= 12. FLASK SERVER =================
+# ================= 12. FLASK SUNUCUSU =================
 @app.route('/')
 def home():
-    return """
+    return f"""
     <!DOCTYPE html>
     <html>
     <head>
@@ -1755,7 +1558,7 @@ def home():
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
-            body {
+            body {{
                 font-family: Arial, sans-serif;
                 max-width: 800px;
                 margin: 0 auto;
@@ -1763,31 +1566,31 @@ def home():
                 background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
                 color: white;
                 text-align: center;
-            }
-            .container {
+            }}
+            .container {{
                 background: rgba(255, 255, 255, 0.1);
                 backdrop-filter: blur(10px);
                 border-radius: 20px;
                 padding: 40px;
                 margin-top: 50px;
                 box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
-            }
-            h1 {
+            }}
+            h1 {{
                 font-size: 3em;
                 margin-bottom: 20px;
                 text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
-            }
-            .emoji {
+            }}
+            .emoji {{
                 font-size: 4em;
                 margin: 20px 0;
-            }
-            .status {
+            }}
+            .status {{
                 background: rgba(255, 255, 255, 0.2);
                 border-radius: 10px;
                 padding: 20px;
                 margin: 20px 0;
-            }
-            .button {
+            }}
+            .button {{
                 display: inline-block;
                 background: white;
                 color: #667eea;
@@ -1797,25 +1600,25 @@ def home():
                 font-weight: bold;
                 margin: 10px;
                 transition: all 0.3s ease;
-            }
-            .button:hover {
+            }}
+            .button:hover {{
                 transform: translateY(-3px);
                 box-shadow: 0 10px 20px rgba(0, 0, 0, 0.2);
-            }
-            .stats {
+            }}
+            .stats {{
                 display: flex;
                 justify-content: space-around;
                 flex-wrap: wrap;
                 margin: 30px 0;
-            }
-            .stat-item {
+            }}
+            .stat-item {{
                 background: rgba(255, 255, 255, 0.15);
                 padding: 15px;
                 border-radius: 10px;
                 margin: 10px;
                 flex: 1;
                 min-width: 150px;
-            }
+            }}
         </style>
     </head>
     <body>
@@ -1825,6 +1628,7 @@ def home():
             <div class="status">
                 <h2>🚀 Sistem Aktif ve Çalışıyor!</h2>
                 <p>Telegram botumuz şu anda aktif bir şekilde çalışmaktadır.</p>
+                <p><b>Zorunlu Kanal:</b> @{ZORUNLU_KANAL}</p>
             </div>
             
             <div class="stats">
@@ -1834,7 +1638,7 @@ def home():
                 </div>
                 <div class="stat-item">
                     <h3>📢 Kanal</h3>
-                    <p>@GorevYapsam</p>
+                    <p>@{ZORUNLU_KANAL}</p>
                 </div>
                 <div class="stat-item">
                     <h3>👤 Developer</h3>
@@ -1843,10 +1647,11 @@ def home():
             </div>
             
             <a href="https://t.me/GorevYapsamBot" class="button">🤖 Botu Başlat</a>
-            <a href="https://t.me/GorevYapsam" class="button">📢 Kanalımız</a>
+            <a href="https://t.me/{ZORUNLU_KANAL}" class="button">📢 Kanalımız</a>
             
             <p style="margin-top: 30px; opacity: 0.8;">
-                © 2024 Görev Yapsam Bot - Tüm hakları saklıdır.
+                © 2024 Görev Yapsam Bot - Tüm hakları saklıdır.<br>
+                Tüm veriler veritabanında kayıt altındadır.
             </p>
         </div>
     </body>
@@ -1862,12 +1667,17 @@ def health():
         
         cursor.execute("SELECT COUNT(*) FROM tasks WHERE status = 'active'")
         task_count = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM users WHERE channel_joined = 1")
+        channel_count = cursor.fetchone()[0]
     
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "users": user_count,
         "active_tasks": task_count,
+        "channel_joined": channel_count,
+        "channel": ZORUNLU_KANAL,
         "service": "GorevYapsamBot"
     }
 
@@ -1887,12 +1697,17 @@ def stats_api():
         
         cursor.execute("SELECT COUNT(*) FROM tasks WHERE status = 'active'")
         active_tasks = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM users WHERE channel_joined = 1")
+        channel_joined = cursor.fetchone()[0]
     
     return {
         "total_users": total_users,
         "total_balance": float(total_balance),
         "total_earned": float(total_earned),
         "active_tasks": active_tasks,
+        "channel_joined": channel_joined,
+        "channel": ZORUNLU_KANAL,
         "timestamp": datetime.now().isoformat()
     }
 
@@ -1900,8 +1715,9 @@ def stats_api():
 def run_bot():
     print("🤖 Görev Yapsam Bot başlatılıyor...")
     print("🚀 Slogan: 'Görev Yap, Para Kazan, Kampanya Oluştur!'")
-    print(f"📢 Zorunlu Kanal: {ZORUNLU_KANAL}")
+    print(f"📢 Zorunlu Kanal: @{ZORUNLU_KANAL}")
     print(f"👑 Admin ID: {ADMIN_ID}")
+    print("💾 Veritabanı: Tüm kullanıcı ve görev verileri kaydediliyor")
     print("=" * 50)
     
     try:
