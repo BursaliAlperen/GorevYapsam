@@ -2,205 +2,251 @@ import telebot
 from telebot import types
 import sqlite3
 import threading
+import time
 from flask import Flask
 
 # ================= AYARLAR =================
 TOKEN = "8465270393:AAGu8J5m8taovdjiffbU8LFc-9XbA1dv_co"
-ADMIN_USER = "@AlperenTHE"
 ADMIN_ID = 7904032877 
+ADMIN_USER = "@AlperenTHE"
+ZORUNLU_KANAL = "@GorevYapsam"
+
+# Botun görselliğini artırmak için (Bu linkleri kendi görsellerinle değiştirebilirsin)
+WELCOME_IMG = "https://i.ibb.co/vYV0YfL/welcome.jpg" 
+PACKETS_IMG = "https://i.ibb.co/m0fXm2s/packets.jpg"
+
 bot = telebot.TeleBot(TOKEN, threaded=False)
 app = Flask(__name__)
 
-# ================= DATABASE =================
+# ================= SİSTEM DURUMLARI =================
+MAINTENANCE_MODE = False
+setup_steps = {} # Reklamveren giriş takibi
+
+# ================= VERİTABANI =================
 class Database:
     def __init__(self):
-        self.conn = sqlite3.connect('gorev_onay_sistemi.db', check_same_thread=False)
+        self.conn = sqlite3.connect('gorev_final_ultra_v16.db', check_same_thread=False)
         self.c = self.conn.cursor()
         self.init_tables()
     
     def init_tables(self):
-        self.c.execute('CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, balance REAL DEFAULT 0.0)')
+        self.c.execute('''CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY, balance REAL DEFAULT 0.0, 
+            referred_by INTEGER DEFAULT 0, ref_count INTEGER DEFAULT 0
+        )''')
         self.c.execute('''CREATE TABLE IF NOT EXISTS sources (
             source_id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER UNIQUE,
-            title TEXT DEFAULT 'İsimsiz', description TEXT DEFAULT 'Yok',
-            link TEXT, reward REAL DEFAULT 0.5, budget REAL DEFAULT 0, owner_id INTEGER, is_active INTEGER DEFAULT 0
+            title TEXT DEFAULT 'İsimsiz Görev', description TEXT DEFAULT 'Açıklama Yok',
+            link TEXT, reward REAL DEFAULT 0.5, budget REAL DEFAULT 0, 
+            owner_id INTEGER, is_active INTEGER DEFAULT 0
         )''')
         self.c.execute('CREATE TABLE IF NOT EXISTS completed_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, source_id INTEGER)')
         self.conn.commit()
 
 db = Database()
 
-# ================= ADMİN BAKİYE YÜKLEME =================
-admin_state = {}
+# ================= ARA KATMANLAR (MIDDLEWARE) =================
 
-@bot.message_handler(commands=['admin'])
-def admin_panel(message):
-    if message.from_user.id != ADMIN_ID: return
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("💰 Kullanıcıya Bakiye Yükle", callback_data="adm_yukle"))
-    bot.send_message(message.chat.id, "👑 *Yönetici Paneli*", parse_mode="Markdown", reply_markup=markup)
+@bot.middleware_handler(update_types=['message'])
+def check_maintenance(bot_instance, message):
+    if MAINTENANCE_MODE and message.from_user.id != ADMIN_ID:
+        bot.send_message(message.chat.id, "🛠 **BAKIM MODU**\n\nBot şu an güncelleme aşamasındadır. Lütfen daha sonra tekrar deneyin.")
+        return False
 
-@bot.callback_query_handler(func=lambda call: call.data == "adm_yukle")
-def adm_start(call):
-    admin_state[call.from_user.id] = {"step": "id"}
-    bot.send_message(call.message.chat.id, "👤 Kullanıcı ID'sini yazın:")
+# ================= KONTROL FONKSİYONLARI =================
 
-# ================= SESSİZ KANAL ALGILAMA =================
-@bot.my_chat_member_handler()
-def silent_detect(message: types.ChatMemberUpdated):
-    if message.new_chat_member.status == 'administrator':
-        db.c.execute('INSERT OR IGNORE INTO sources (chat_id, owner_id) VALUES (?, ?)', (message.chat.id, message.from_user.id))
-        db.conn.commit()
+def kanal_kontrol(user_id):
+    try:
+        uye = bot.get_chat_member(ZORUNLU_KANAL, user_id)
+        return uye.status in ['member', 'administrator', 'creator']
+    except: return False
 
-# ================= ANA MENÜ =================
-def main_menu():
-    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    m.add("🎯 Görev Yap", "💰 Profilim", "💳 Bakiye Satın Al", "⚙️ Görevlerimi Yönet")
-    return m
+# ================= KOMUTLAR VE MENÜLER =================
 
 @bot.message_handler(commands=['start'])
 def start(message):
-    db.c.execute('INSERT OR IGNORE INTO users (user_id) VALUES (?)', (message.from_user.id,))
-    db.conn.commit()
-    bot.send_message(message.chat.id, "🚀 *Sisteme Hoş Geldin!*", parse_mode="Markdown", reply_markup=main_menu())
+    user_id = message.from_user.id
+    args = message.text.split()
+    
+    # Veritabanı Kayıt & Referans Sistemi
+    db.c.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+    if not db.c.fetchone():
+        ref_id = 0
+        if len(args) > 1 and args[1].startswith('ref_'):
+            try:
+                ref_id = int(args[1].replace('ref_', ''))
+                if ref_id != user_id:
+                    # Referans verene ödül ve bildirim
+                    db.c.execute("UPDATE users SET balance = balance + 0.10, ref_count = ref_count + 1 WHERE user_id = ?", (ref_id,))
+                    bot.send_message(ref_id, f"👥 **Yeni Referans!**\n\n{message.from_user.first_name} davetinizle katıldı. +0.10₺ kazandınız!")
+            except: ref_id = 0
+        
+        db.c.execute("INSERT INTO users (user_id, referred_by) VALUES (?, ?)", (user_id, ref_id))
+        db.conn.commit()
+
+    # Zorunlu Kanal Kontrolü
+    if not kanal_kontrol(user_id):
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("📢 Kanala Katıl", url=f"https://t.me/{ZORUNLU_KANAL.replace('@','')}"))
+        markup.add(types.InlineKeyboardButton("🔄 Kontrol Et", callback_data="check_sub"))
+        return bot.send_photo(user_id, WELCOME_IMG, caption=f"⚠️ Devam etmek için {ZORUNLU_KANAL} kanalımıza katılmalısın!", reply_markup=markup)
+
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add("🎯 Görev Yap", "💰 Profilim", "👥 Referanslarım")
+    markup.add("💸 Ödeme Talebi", "💳 Bakiye Satın Al", "⚙️ Görevlerimi Yönet")
+    bot.send_photo(message.chat.id, WELCOME_IMG, caption="🚀 **GÖREV YAPSAM** - Hoş Geldiniz!\nMenüden dilediğiniz işlemi seçebilirsiniz.", reply_markup=markup)
+
+@bot.message_handler(commands=['bakim'])
+def toggle_bakim(message):
+    if message.from_user.id == ADMIN_ID:
+        global MAINTENANCE_MODE
+        MAINTENANCE_MODE = not MAINTENANCE_MODE
+        bot.send_message(message.chat.id, f"⚙️ Bakım Modu: {'AKTİF' if MAINTENANCE_MODE else 'KAPALI'}")
+
+# ================= BUTON İŞLEMLERİ =================
 
 @bot.message_handler(func=lambda m: m.text == "💰 Profilim")
 def profile(message):
-    db.c.execute("SELECT balance FROM users WHERE user_id=?", (message.from_user.id,))
-    bal = db.c.fetchone()[0]
-    bot.send_message(message.chat.id, f"👤 *Profil*\n\nBakiyeniz: {bal:.2f}₺\nID: `{message.from_user.id}`", parse_mode="Markdown")
+    db.c.execute("SELECT balance, ref_count FROM users WHERE user_id=?", (message.from_user.id,))
+    d = db.c.fetchone()
+    bot.send_message(message.chat.id, f"👤 **PROFİL**\n\n💰 Bakiye: {d[0]:.2f}₺\n👥 Referanslar: {d[1]}\n🆔 ID: `{message.from_user.id}`")
 
 @bot.message_handler(func=lambda m: m.text == "💳 Bakiye Satın Al")
 def shop(message):
-    bot.send_message(message.chat.id, f"💳 Bakiye paketleri için {ADMIN_USER} ile iletişime geçin. Ödeme sonrası ID numaranıza bakiye eklenecektir.")
-
-# ================= GELİŞMİŞ GÖREV DÜZENLEME SİSTEMİ =================
-setup_data = {}
-
-@bot.message_handler(func=lambda m: m.text == "⚙️ Görevlerimi Yönet")
-def manage_list(message):
-    db.c.execute("SELECT chat_id, title FROM sources WHERE owner_id=?", (message.from_user.id,))
-    res = db.c.fetchall()
-    if not res:
-        bot.send_message(message.chat.id, "❌ Admin olduğunuz kanal bulunamadı.")
-        return
-    markup = types.InlineKeyboardMarkup()
-    for r in res:
-        markup.add(types.InlineKeyboardButton(f"📍 {r[1]}", callback_data=f"sel_{r[0]}"))
-    bot.send_message(message.chat.id, "Düzenlemek istediğiniz kanalı seçin:", reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("sel_"))
-def show_config(call):
-    cid = call.data.split("_")[1]
-    db.c.execute("SELECT title, description, link, budget FROM sources WHERE chat_id=?", (cid,))
-    d = db.c.fetchone()
-    
-    text = f"🛠 *GÖREV AYARLARI*\n\n" \
-           f"📝 *İsim:* {d[0]}\n" \
-           f"ℹ️ *Açıklama:* {d[1]}\n" \
-           f"🔗 *Link:* {d[2] if d[2] else 'Eksik'}\n" \
-           f"💰 *Kanal Bütçesi:* {d[3]}₺\n\n" \
-           f"Değiştirmek istediğiniz alanı seçin veya 'Onayla' diyerek yayına alın."
-    
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        types.InlineKeyboardButton("📝 İsim Yaz", callback_data=f"set_title_{cid}"),
-        types.InlineKeyboardButton("ℹ️ Açıklama Yaz", callback_data=f"set_desc_{cid}"),
-        types.InlineKeyboardButton("🔗 Link Ekle", callback_data=f"set_link_{cid}"),
-        types.InlineKeyboardButton("💰 Bütçe Aktar", callback_data=f"set_bud_{cid}")
+    text = (
+        "💎 **BAKİYE PAKETLERİ**\n\n"
+        "📦 BRONZ: 20₺ (1 TRC)\n"
+        "📦 GÜMÜŞ: 50₺ (2.5 TRX)\n"
+        "📦 ALTIN: 100₺ (5 TRX)\n"
+        "📦 ELMAS: 200₺ (10 TRX)\n\n"
+        "Satın almak için admin'e yazın."
     )
-    markup.add(types.InlineKeyboardButton("✅ HER ŞEYİ ONAYLA VE YAYINLA", callback_data=f"confirm_{cid}"))
-    markup.add(types.InlineKeyboardButton("❌ İPTAL ET / REDDET", callback_data="cancel_edit"))
-    
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=markup)
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("👤 Admin'e Mesaj At", url=f"https://t.me/{ADMIN_USER.replace('@','')}"))
+    bot.send_photo(message.chat.id, PACKETS_IMG, caption=text, reply_markup=markup)
 
-# Teker teker veri girişi
-@bot.callback_query_handler(func=lambda call: call.data.startswith("set_"))
-def ask_input(call):
-    _, field, cid = call.data.split("_")
-    setup_data[call.from_user.id] = {"f": field, "c": cid}
-    bot.send_message(call.message.chat.id, f"💬 Lütfen yeni *{field.upper()}* değerini yazıp gönderin:")
+@bot.message_handler(func=lambda m: m.text == "💸 Ödeme Talebi")
+def payout(message):
+    bot.send_message(message.chat.id, "⏳ **YAKINDA!**\n\nÖdeme talebi sistemi şu an hazırlanıyor. 20₺ bakiye sonrası admin'e yazabilirsiniz.")
 
-@bot.message_handler(func=lambda m: m.from_user.id in setup_data)
-def save_input(message):
-    data = setup_data[message.from_user.id]
-    f, c, val = data["f"], data["c"], message.text
-    
-    try:
-        if f == "bud":
-            db.c.execute("SELECT balance FROM users WHERE user_id=?", (message.from_user.id,))
-            user_bal = db.c.fetchone()[0]
-            if user_bal < float(val):
-                bot.send_message(message.chat.id, "❌ Profil bakiyeniz yetersiz!")
-            else:
-                db.c.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (float(val), message.from_user.id))
-                db.c.execute("UPDATE sources SET budget = budget + ? WHERE chat_id = ?", (float(val), c))
-                bot.send_message(message.chat.id, "✅ Bütçe kanala aktarıldı.")
-        else:
-            db.c.execute(f"UPDATE sources SET {f if f!='title' else 'title'} = ? WHERE chat_id = ?", (val, c))
-        db.conn.commit()
-        bot.send_message(message.chat.id, "✅ Bilgi kaydedildi. 'Görevlerimi Yönet' menüsünden kontrol edip onaylayabilirsiniz.")
-    except:
-        bot.send_message(message.chat.id, "❌ Hata oluştu.")
-    
-    del setup_data[message.from_user.id]
+@bot.message_handler(func=lambda m: m.text == "👥 Referanslarım")
+def ref_system(message):
+    bot_name = bot.get_me().username
+    link = f"https://t.me/{bot_name}?start=ref_{message.from_user.id}"
+    bot.send_message(message.chat.id, f"👥 **REFERANS LİNKİNİZ:**\n\n`{link}`\n\nHer yeni üye için 0.10₺ kazanırsınız!")
 
-# ONAYLAMA VE REDDETME (YAYINLAMA)
-@bot.callback_query_handler(func=lambda call: call.data.startswith("confirm_"))
-def final_confirm(call):
-    cid = call.data.split("_")[1]
-    db.c.execute("SELECT link, budget FROM sources WHERE chat_id=?", (cid,))
-    d = db.c.fetchone()
-    
-    if not d[0] or d[1] <= 0:
-        bot.answer_callback_query(call.id, "❌ Link veya bütçe olmadan onaylanamaz!", show_alert=True)
-    else:
-        db.c.execute("UPDATE sources SET is_active=1 WHERE chat_id=?", (cid,))
-        db.conn.commit()
-        bot.edit_message_text("🚀 *BAŞARILI!*\nGörev onaylandı ve şu an tüm kullanıcılara gösteriliyor.", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
-
-@bot.callback_query_handler(func=lambda call: call.data == "cancel_edit")
-def cancel(call):
-    bot.edit_message_text("❌ İşlem iptal edildi.", call.message.chat.id, call.message.message_id)
-
-# ================= GÖREV YAPMA VE ADMİN BAKİYE HANDLERS =================
-@bot.message_handler(func=lambda m: admin_state.get(m.from_user.id, {}).get("step") in ["id", "amount"])
-def handle_admin(message):
-    state = admin_state[message.from_user.id]
-    if state["step"] == "id":
-        admin_state[message.from_user.id] = {"step": "amount", "target": message.text}
-        bot.send_message(message.chat.id, "Tutar yazın:")
-    else:
-        db.c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (float(message.text), state["target"]))
-        db.conn.commit()
-        bot.send_message(message.chat.id, "Yüklendi.")
-        del admin_state[message.from_user.id]
+# ================= GÖREV SİSTEMİ (OTOMATİK BÜTÇE UYARISI) =================
 
 @bot.message_handler(func=lambda m: m.text == "🎯 Görev Yap")
-def do_task(message):
-    db.c.execute("SELECT * FROM sources WHERE is_active=1 AND budget >= reward AND source_id NOT IN (SELECT source_id FROM completed_tasks WHERE user_id=?)", (message.from_user.id,))
-    res = db.c.fetchall()
-    if not res: bot.send_message(message.chat.id, "Görev yok."); return
-    t = res[0]
+def tasks(message):
+    db.c.execute('''SELECT * FROM sources WHERE is_active=1 AND budget >= reward 
+                    AND source_id NOT IN (SELECT source_id FROM completed_tasks WHERE user_id=?)''', (message.from_user.id,))
+    t = db.c.fetchall()
+    if not t: return bot.send_message(message.chat.id, "❌ Şu an aktif görev bulunmuyor.")
+    
+    x = t[0]
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔗 Kanala Git", url=t[4]), types.InlineKeyboardButton("✅ Onayla", callback_data=f"v_{t[0]}_{t[5]}"))
-    bot.send_message(message.chat.id, f"📍 {t[2]}\nℹ️ {t[3]}\n💰 {t[5]}₺", reply_markup=markup)
+    markup.add(types.InlineKeyboardButton("🔗 Kanala Git", url=x[4]), types.InlineKeyboardButton("✅ Onayla", callback_data=f"v_{x[0]}_{x[5]}"))
+    bot.send_message(message.chat.id, f"📍 **{x[2]}**\n\n📝 {x[3]}\n💰 Ödül: {x[5]}₺", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("v_"))
 def verify(call):
     _, sid, rew = call.data.split("_")
-    db.c.execute("SELECT chat_id, budget FROM sources WHERE source_id=?", (sid,))
+    sid, rew = int(sid), float(rew)
+    db.c.execute("SELECT chat_id, budget, owner_id, title FROM sources WHERE source_id=?", (sid,))
     s = db.c.fetchone()
+
+    # Bütçe Kontrolü & Uyarı
+    if s[1] < rew:
+        bot.answer_callback_query(call.id, "❌ Görev bütçesi bitti!", show_alert=True)
+        db.c.execute("UPDATE sources SET is_active=0 WHERE source_id=?", (sid,))
+        bot.send_message(s[2], f"⚠️ **BÜTÇE UYARISI**\n\n'{s[3]}' görevinizin bütçesi bitti ve yayından kaldırıldı.")
+        return
+
     try:
-        if bot.get_chat_member(s[0], call.from_user.id).status in ['member', 'administrator', 'creator']:
-            db.c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (float(rew), call.from_user.id))
-            db.c.execute("UPDATE sources SET budget=budget-? WHERE source_id=?", (float(rew), sid))
+        status = bot.get_chat_member(s[0], call.from_user.id).status
+        if status in ['member', 'administrator', 'creator']:
+            db.c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (rew, call.from_user.id))
+            db.c.execute("UPDATE sources SET budget=budget-? WHERE source_id=?", (rew, sid))
             db.c.execute("INSERT INTO completed_tasks (user_id, source_id) VALUES (?, ?)", (call.from_user.id, sid))
             db.conn.commit()
             bot.delete_message(call.message.chat.id, call.message.message_id)
-            bot.answer_callback_query(call.id, "✅ Ödeme yapıldı!")
-    except: bot.answer_callback_query(call.id, "Hata!")
+            bot.answer_callback_query(call.id, "✅ Ödül verildi!")
+        else:
+            bot.answer_callback_query(call.id, "❌ Katılmamışsınız!", show_alert=True)
+    except: bot.answer_callback_query(call.id, "❌ Hata!")
+
+# ================= GÖREV YÖNETİMİ =================
+
+@bot.message_handler(func=lambda m: m.text == "⚙️ Görevlerimi Yönet")
+def manage(message):
+    db.c.execute("SELECT chat_id, title FROM sources WHERE owner_id=?", (message.from_user.id,))
+    res = db.c.fetchall()
+    if not res: return bot.send_message(message.chat.id, "❌ Önce botu kanalınıza admin yapın.")
+    
+    markup = types.InlineKeyboardMarkup()
+    for r in res: markup.add(types.InlineKeyboardButton(f"📡 {r[1]}", callback_data=f"cfg_{r[0]}"))
+    bot.send_message(message.chat.id, "Düzenlenecek görev:", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("cfg_"))
+def config(call):
+    cid = call.data.split("_")[1]
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("📝 İsim", callback_data=f"ed_title_{cid}"),
+        types.InlineKeyboardButton("ℹ️ Açıklama", callback_data=f"ed_desc_{cid}"),
+        types.InlineKeyboardButton("🔗 Link", callback_data=f"ed_link_{cid}"),
+        types.InlineKeyboardButton("💰 Bütçe Aktar", callback_data=f"ed_bud_{cid}"),
+        types.InlineKeyboardButton("✅ YAYINLA", callback_data=f"pub_{cid}")
+    )
+    bot.edit_message_text("🛠 Görev ayarlarını yapın:", call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("ed_"))
+def ed_input(call):
+    _, fld, cid = call.data.split("_")
+    setup_steps[call.from_user.id] = {"f": fld, "c": cid}
+    bot.send_message(call.message.chat.id, f"💬 Yeni {fld} bilgisini gönderin:")
+
+@bot.message_handler(func=lambda m: m.from_user.id in setup_steps)
+def save_ed(message):
+    data = setup_steps[message.from_user.id]
+    f, c, val = data["f"], data["c"], message.text
+    if f == "bud":
+        db.c.execute("SELECT balance FROM users WHERE user_id=?", (message.from_user.id,))
+        if db.c.fetchone()[0] < float(val): bot.send_message(message.chat.id, "❌ Yetersiz bakiye.")
+        else:
+            db.c.execute("UPDATE users SET balance=balance-? WHERE user_id=?", (float(val), message.from_user.id))
+            db.c.execute("UPDATE sources SET budget=budget+? WHERE chat_id=?", (float(val), c))
+            bot.send_message(message.chat.id, "✅ Bütçe yüklendi.")
+    else:
+        db.c.execute(f"UPDATE sources SET {f if f!='title' else 'title'}=? WHERE chat_id=?", (val, c))
+    db.conn.commit()
+    del setup_steps[message.from_user.id]
+    bot.send_message(message.chat.id, "✅ Başarıyla kaydedildi.")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("pub_"))
+def publish(call):
+    cid = call.data.split("_")[1]
+    db.c.execute("UPDATE sources SET is_active=1 WHERE chat_id=?", (cid,))
+    db.conn.commit()
+    bot.answer_callback_query(call.id, "🚀 Görev yayına girdi!", show_alert=True)
+
+# ================= ADMİN SESSİZ ALGILAMA =================
+
+@bot.my_chat_member_handler()
+def detect(message: types.ChatMemberUpdated):
+    if message.new_chat_member.status == 'administrator':
+        db.c.execute('INSERT OR IGNORE INTO sources (chat_id, owner_id, title) VALUES (?, ?, ?)', 
+                      (message.chat.id, message.from_user.id, message.chat.title))
+        db.conn.commit()
+
+# ================= RUN & HATA ÖNLEME =================
+
+def run():
+    while True:
+        try: bot.polling(none_stop=True, interval=2)
+        except: time.sleep(5)
 
 if __name__ == "__main__":
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5000)).start()
-    bot.infinity_polling(allowed_updates=['message', 'callback_query', 'my_chat_member'])
+    run()
