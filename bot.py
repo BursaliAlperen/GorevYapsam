@@ -1,5 +1,5 @@
 """
-🤖 GÖREV YAPSAM BOTU v11.0 - SADE & ETKİLİ
+🤖 GÖREV YAPSAM BOTU v12.0 - GELİŞMİŞ SİSTEM
 Telegram: @GorevYapsam
 Developer: Alperen
 Token: 8465270393:AAGu8J5m8taovdjiffbU8LFc-9XbA1dv_co
@@ -20,7 +20,7 @@ import json
 TOKEN = "8465270393:AAGu8J5m8taovdjiffbU8LFc-9XbA1dv_co"
 ADMIN_ID = 7904032877
 ADMIN_USER = "@AlperenTHE"
-ZORUNLU_KANAL = "GY_Refim"  # Güncellenmiş kanal
+ZORUNLU_KANAL = "GY_Refim"
 
 # FİYATLAR
 PRICES = {
@@ -49,6 +49,7 @@ def init_db():
             username TEXT,
             first_name TEXT,
             balance REAL DEFAULT 0.0,
+            ad_balance REAL DEFAULT 0.0,  -- Reklam bakiyesi
             total_earned REAL DEFAULT 0.0,
             tasks_completed INTEGER DEFAULT 0,
             referrals INTEGER DEFAULT 0,
@@ -57,7 +58,8 @@ def init_db():
             last_daily TIMESTAMP,
             last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             joined_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            channel_joined INTEGER DEFAULT 0
+            channel_joined INTEGER DEFAULT 0,
+            welcome_bonus INTEGER DEFAULT 0
         )''')
         
         # Görevler tablosu
@@ -69,6 +71,7 @@ def init_db():
             link TEXT,
             description TEXT,
             cost_per_view REAL,
+            max_views INTEGER,
             views INTEGER DEFAULT 0,
             cost_spent REAL DEFAULT 0.0,
             status TEXT DEFAULT 'active',
@@ -93,6 +96,26 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
         
+        # Bakiye yüklemeleri
+        cursor.execute('''CREATE TABLE IF NOT EXISTS deposits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount REAL,
+            method TEXT,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+        
+        # Reklam dönüşümleri
+        cursor.execute('''CREATE TABLE IF NOT EXISTS conversions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            from_balance REAL,
+            to_ad_balance REAL,
+            bonus REAL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+        
         conn.commit()
 
 init_db()
@@ -108,7 +131,6 @@ def kanal_kontrol(user_id):
         member = bot.get_chat_member("@" + ZORUNLU_KANAL, user_id)
         is_member = member.status in ['member', 'administrator', 'creator']
         
-        # Veritabanına kaydet
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute('''UPDATE users SET 
@@ -133,29 +155,49 @@ def create_user(user_id, username, first_name):
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute('''INSERT OR IGNORE INTO users 
-                       (user_id, username, first_name, balance) 
-                       VALUES (?, ?, ?, 0.0)''', 
+                       (user_id, username, first_name, balance, ad_balance) 
+                       VALUES (?, ?, ?, 0.0, 0.0)''', 
                        (user_id, username, first_name))
         conn.commit()
 
-def update_balance(user_id, amount):
+def update_balance(user_id, amount, balance_type='balance'):
     """Bakiye güncelle"""
     with get_db() as conn:
         cursor = conn.cursor()
-        if amount > 0:
-            cursor.execute('''UPDATE users SET 
-                           balance = balance + ?,
-                           total_earned = total_earned + ?,
-                           last_active = CURRENT_TIMESTAMP
-                           WHERE user_id = ?''', 
-                           (amount, amount, user_id))
+        
+        if balance_type == 'ad_balance':
+            if amount > 0:
+                cursor.execute('''UPDATE users SET 
+                               ad_balance = ad_balance + ?,
+                               last_active = CURRENT_TIMESTAMP
+                               WHERE user_id = ?''', 
+                               (amount, user_id))
+            else:
+                cursor.execute('''UPDATE users SET 
+                               ad_balance = ad_balance + ?,
+                               last_active = CURRENT_TIMESTAMP
+                               WHERE user_id = ?''', 
+                               (amount, user_id))
         else:
-            cursor.execute('''UPDATE users SET 
-                           balance = balance + ?,
-                           last_active = CURRENT_TIMESTAMP
-                           WHERE user_id = ?''', 
-                           (amount, user_id))
+            if amount > 0:
+                cursor.execute('''UPDATE users SET 
+                               balance = balance + ?,
+                               total_earned = total_earned + ?,
+                               last_active = CURRENT_TIMESTAMP
+                               WHERE user_id = ?''', 
+                               (amount, amount, user_id))
+            else:
+                cursor.execute('''UPDATE users SET 
+                               balance = balance + ?,
+                               last_active = CURRENT_TIMESTAMP
+                               WHERE user_id = ?''', 
+                               (amount, user_id))
         conn.commit()
+
+def get_total_balance(user_id):
+    """Toplam bakiye (normal + reklam)"""
+    user = get_user(user_id)
+    return user['balance'] + user['ad_balance']
 
 def update_user_activity(user_id):
     """Aktiflik güncelle"""
@@ -171,7 +213,6 @@ def add_ref(referrer_id, referred_id):
     with get_db() as conn:
         cursor = conn.cursor()
         
-        # Kontrol et
         cursor.execute('''SELECT * FROM referrals 
                        WHERE referrer_id = ? AND referred_id = ?''',
                        (referrer_id, referred_id))
@@ -179,12 +220,10 @@ def add_ref(referrer_id, referred_id):
         if cursor.fetchone():
             return False
         
-        # Referans kaydı oluştur
         cursor.execute('''INSERT INTO referrals 
                        (referrer_id, referred_id, earned)
                        VALUES (?, ?, ?)''', (referrer_id, referred_id, 1.0))
         
-        # Referrer'a bonus ver
         cursor.execute('''UPDATE users SET 
                        referrals = referrals + 1,
                        ref_earned = ref_earned + 1.0,
@@ -209,6 +248,9 @@ def get_active_tasks(task_type=None, limit=10):
                            ORDER BY created_at DESC LIMIT ?''', (limit,))
         return cursor.fetchall()
 
+# Kullanıcı durumları için sözlük
+user_states = {}
+
 # ================= 4. ANA MENÜ =================
 def show_main_menu(user_id, message_id=None):
     """Ana menü"""
@@ -219,17 +261,24 @@ def show_main_menu(user_id, message_id=None):
         create_user(user_id, "", "")
         user = get_user(user_id)
     
+    total_balance = get_total_balance(user_id)
+    
     markup = types.InlineKeyboardMarkup(row_width=2)
     
     # Ana butonlar
     markup.add(
         types.InlineKeyboardButton("🤖 GÖREV YAP", callback_data="do_task"),
-        types.InlineKeyboardButton("💰 " + format_money(user['balance']), callback_data="my_balance")
+        types.InlineKeyboardButton("💰 " + format_money(total_balance), callback_data="my_balance")
     )
     
     markup.add(
-        types.InlineKeyboardButton("📢 KAMPANYA OLUŞTUR", callback_data="create_task"),
+        types.InlineKeyboardButton("📢 GÖREV OLUŞTUR", callback_data="create_task_menu"),
         types.InlineKeyboardButton("👥 REFERANS", callback_data="my_refs")
+    )
+    
+    markup.add(
+        types.InlineKeyboardButton("💳 BAKİYE YÜKLE", callback_data="deposit_menu"),
+        types.InlineKeyboardButton("🔄 REKLAM BAKİYESİ", callback_data="ad_balance_menu")
     )
     
     # Admin butonu
@@ -240,9 +289,14 @@ def show_main_menu(user_id, message_id=None):
 
 Merhaba {user['first_name']}!
 
-Bakiye: <b>{format_money(user['balance'])}</b>
-Görev: {user['tasks_completed']}
-Ref: {user['referrals']}
+💰 <b>Toplam Bakiye:</b> {format_money(total_balance)}
+• Normal: {format_money(user['balance'])}
+• Reklam: {format_money(user['ad_balance'])}
+
+🎯 <b>Görev:</b> {user['tasks_completed']}
+👥 <b>Ref:</b> {user['referrals']}
+
+📢 <b>Kanal:</b> @{ZORUNLU_KANAL}
 
 Hemen başla!"""
     
@@ -257,19 +311,39 @@ def start_command(message):
     user_id = message.from_user.id
     first_name = message.from_user.first_name or "Kullanıcı"
     
+    # Kullanıcı oluştur veya kontrol et
+    create_user(user_id, message.from_user.username, first_name)
+    user = get_user(user_id)
+    
     # Referans kontrolü
     ref_used = False
+    ref_info = ""
     if len(message.text.split()) > 1:
         param = message.text.split()[1]
         if param.startswith('ref_'):
             try:
                 referrer_id = int(param.replace('ref_', ''))
                 if referrer_id != user_id:
-                    create_user(user_id, message.from_user.username, first_name)
                     if add_ref(referrer_id, user_id):
                         ref_used = True
+                        ref_user = get_user(referrer_id)
+                        ref_info = f"\n👥 <b>Referans:</b> {ref_user['first_name']} kazandı!"
             except:
                 pass
+    
+    # SADECE İLK KEZ GELİYORSA HOŞGELDİN BONUSU
+    welcome_bonus = 0
+    if user['welcome_bonus'] == 0:
+        welcome_bonus = 2.0
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''UPDATE users SET 
+                           welcome_bonus = 1,
+                           balance = balance + ?,
+                           total_earned = total_earned + ?
+                           WHERE user_id = ?''', 
+                           (welcome_bonus, welcome_bonus, user_id))
+            conn.commit()
     
     # Kanal kontrolü
     if not kanal_kontrol(user_id):
@@ -279,35 +353,33 @@ def start_command(message):
             types.InlineKeyboardButton("✅ KATILDIM", callback_data="check_join")
         )
         
-        bot.send_message(
-            user_id,
-            f"""Merhaba {first_name}!
+        welcome_text = f"""Merhaba {first_name}!
 
 Botu kullanmak için kanala katıl:
 
 @{ZORUNLU_KANAL}
 
-Katıldıktan sonra "✅ KATILDIM" butonuna bas.""",
-            reply_markup=markup
-        )
+Katıldıktan sonra "✅ KATILDIM" butonuna bas."""
+        
+        if welcome_bonus > 0:
+            welcome_text += f"\n\n💰 <b>Hoşgeldin bonusu:</b> {format_money(welcome_bonus)}"
+        
+        if ref_used:
+            welcome_text += ref_info
+        
+        bot.send_message(user_id, welcome_text, reply_markup=markup)
         return
-    
-    # Kullanıcı oluştur
-    create_user(user_id, message.from_user.username, first_name)
-    
-    # Hoşgeldin bonusu
-    user = get_user(user_id)
-    if user['tasks_completed'] == 0:
-        update_balance(user_id, 2.0)
     
     # Hoşgeldin mesajı
     welcome_msg = f"""Hoş geldin {first_name}!
 
-✅ Kaydın oluşturuldu.
-💰 Hoşgeldin bonusu: 2 ₺"""
+✅ Botu başarıyla kullanabilirsin."""
+    
+    if welcome_bonus > 0:
+        welcome_msg += f"\n💰 <b>Hoşgeldin bonusu:</b> {format_money(welcome_bonus)}"
     
     if ref_used:
-        welcome_msg += "\n👥 Referans bonusu: Arkadaşın 1 ₺ kazandı!"
+        welcome_msg += ref_info
     
     bot.send_message(user_id, welcome_msg)
     
@@ -326,7 +398,7 @@ def callback_handler(call):
     
     update_user_activity(user_id)
     
-    # Kanal kontrolü
+    # Kanal kontrolü (check_join hariç)
     if not kanal_kontrol(user_id) and call.data != "check_join":
         bot.answer_callback_query(call.id, "❌ Önce kanala katıl!", show_alert=True)
         return
@@ -344,11 +416,17 @@ def callback_handler(call):
     elif call.data == "my_balance":
         show_my_balance(user_id, call.message.message_id)
     
-    elif call.data == "create_task":
+    elif call.data == "create_task_menu":
         create_task_menu(user_id, call.message.message_id)
     
     elif call.data == "my_refs":
         show_my_refs(user_id, call.message.message_id)
+    
+    elif call.data == "deposit_menu":
+        show_deposit_menu(user_id, call.message.message_id)
+    
+    elif call.data == "ad_balance_menu":
+        show_ad_balance_menu(user_id, call.message.message_id)
     
     elif call.data == "admin_panel":
         if user_id == ADMIN_ID:
@@ -363,9 +441,19 @@ def callback_handler(call):
         task_type = call.data.replace("task_", "")
         show_available_task(user_id, task_type, call.message.message_id)
     
-    elif call.data.startswith("create_"):
+    # Görev oluşturma butonları
+    elif call.data in ["create_bot", "create_kanal", "create_grup"]:
         task_type = call.data.replace("create_", "")
-        ask_task_info(user_id, task_type, call.message.message_id)
+        start_task_creation(user_id, task_type, call.message.message_id)
+    
+    # Görev oluşturma adımları
+    elif call.data == "cancel_task":
+        show_main_menu(user_id, call.message.message_id)
+        bot.answer_callback_query(call.id, "❌ Görev oluşturma iptal edildi!")
+    
+    elif call.data.startswith("confirm_task_"):
+        task_type = call.data.replace("confirm_task_", "")
+        confirm_task_creation(user_id, task_type, call.message.message_id)
     
     elif call.data.startswith("complete_"):
         task_id = int(call.data.replace("complete_", ""))
@@ -375,10 +463,30 @@ def callback_handler(call):
         link = call.data.replace("copy_", "")
         bot.answer_callback_query(call.id, "✅ Link kopyalandı!")
     
+    # Bakiye yükleme
+    elif call.data.startswith("deposit_"):
+        amount = call.data.replace("deposit_", "")
+        if amount == "other":
+            ask_custom_deposit(user_id, call.message.message_id)
+        else:
+            confirm_deposit(user_id, float(amount), call.message.message_id)
+    
+    elif call.data == "confirm_deposit":
+        process_deposit(user_id, call.message.message_id)
+    
+    # Reklam bakiyesi
+    elif call.data.startswith("convert_"):
+        amount = float(call.data.replace("convert_", ""))
+        convert_to_ad_balance(user_id, amount, call.message.message_id)
+    
+    elif call.data == "convert_custom":
+        ask_custom_conversion(user_id, call.message.message_id)
+    
+    # Admin işlemleri
     elif call.data.startswith("admin_"):
         handle_admin_action(call)
 
-# ================= 7. GÖREV SİSTEMİ =================
+# ================= 7. GÖREV YAPMA SİSTEMİ =================
 def show_task_types(user_id, message_id):
     """Görev tipleri"""
     markup = types.InlineKeyboardMarkup(row_width=1)
@@ -409,7 +517,7 @@ def show_available_task(user_id, task_type, message_id):
         markup = types.InlineKeyboardMarkup()
         markup.add(
             types.InlineKeyboardButton("🔄 YENİLE", callback_data=f"task_{task_type}"),
-            types.InlineKeyboardButton("📢 KAMPANYA OLUŞTUR", callback_data="create_task"),
+            types.InlineKeyboardButton("📢 GÖREV OLUŞTUR", callback_data="create_task_menu"),
             types.InlineKeyboardButton("🏠 MENÜ", callback_data="back_menu")
         )
         
@@ -435,6 +543,8 @@ def show_single_task(user_id, task, message_id):
     type_emojis = {"bot": "🤖", "kanal": "📢", "grup": "👥"}
     type_names = {"bot": "BOT", "kanal": "KANAL", "grup": "GRUP"}
     
+    reward = PRICES[task['task_type']]
+    
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
         types.InlineKeyboardButton("🔗 GİT", url=task['link']),
@@ -445,15 +555,13 @@ def show_single_task(user_id, task, message_id):
         types.InlineKeyboardButton("🏠 MENÜ", callback_data="back_menu")
     )
     
-    reward = PRICES[task['task_type']]
-    
     text = f"""{type_emojis[task['task_type']]} <b>{type_names[task['task_type']]} GÖREV</b>
 
 <b>{task['title']}</b>
 {task['description']}
 
 💰 <b>Ödül:</b> {format_money(reward)}
-👁️ <b>Görüntü:</b> {task['views']}
+👁️ <b>Görüntü:</b> {task['views']}/{task['max_views']}
 
 1. "GİT" butonuna tıkla
 2. Görevi yap
@@ -475,21 +583,44 @@ def complete_user_task(user_id, task_id, call):
             bot.answer_callback_query(call.id, "❌ Görev bulunamadı!")
             return
         
-        # Görev sahibinin bakiyesini kontrol et
-        cursor.execute("SELECT balance FROM users WHERE user_id = ?", (task['user_id'],))
+        # Aynı görevi daha önce tamamladı mı?
+        cursor.execute('''SELECT * FROM completions 
+                       WHERE task_id = ? AND user_id = ?''',
+                       (task_id, user_id))
+        
+        if cursor.fetchone():
+            bot.answer_callback_query(call.id, "❌ Bu görevi zaten tamamladın!", show_alert=True)
+            return
+        
+        # Görev sahibinin reklam bakiyesini kontrol et
+        cursor.execute("SELECT ad_balance FROM users WHERE user_id = ?", (task['user_id'],))
         owner = cursor.fetchone()
         
-        if not owner or owner['balance'] < task['cost_per_view']:
+        if not owner or owner['ad_balance'] < task['cost_per_view']:
             cursor.execute("UPDATE tasks SET status = 'inactive' WHERE task_id = ?", (task_id,))
             conn.commit()
-            bot.answer_callback_query(call.id, "❌ Görev sahibinin parası yok!")
+            bot.answer_callback_query(call.id, "❌ Görev sahibinin reklam bakiyesi yetersiz!", show_alert=True)
+            return
+        
+        # Maksimum görüntü kontrolü
+        if task['views'] >= task['max_views']:
+            cursor.execute("UPDATE tasks SET status = 'completed' WHERE task_id = ?", (task_id,))
+            conn.commit()
+            bot.answer_callback_query(call.id, "❌ Görev kotası doldu!", show_alert=True)
             return
         
         reward = PRICES[task['task_type']]
         
-        # Ödemeleri yap
+        # Kullanıcıya ödeme yap
         update_balance(user_id, reward)
         
+        # Görev sahibinden reklam bakiyesinden düş
+        cursor.execute('''UPDATE users SET 
+                       ad_balance = ad_balance - ?
+                       WHERE user_id = ?''', 
+                       (task['cost_per_view'], task['user_id']))
+        
+        # İstatistikleri güncelle
         cursor.execute('''UPDATE users SET 
                        tasks_completed = tasks_completed + 1
                        WHERE user_id = ?''', (user_id,))
@@ -505,18 +636,9 @@ def complete_user_task(user_id, task_id, call):
                        VALUES (?, ?, ?)''', 
                        (task_id, user_id, reward))
         
-        # Görev sahibinden para düş
-        cursor.execute('''UPDATE users SET 
-                       balance = balance - ?
-                       WHERE user_id = ?''', 
-                       (task['cost_per_view'], task['user_id']))
-        
-        # Bakiye bitmişse görevi kapat
-        cursor.execute("SELECT balance FROM users WHERE user_id = ?", (task['user_id'],))
-        new_balance = cursor.fetchone()['balance']
-        
-        if new_balance < task['cost_per_view']:
-            cursor.execute("UPDATE tasks SET status = 'inactive' WHERE task_id = ?", (task_id,))
+        # Görüntü sayısı dolduysa görevi kapat
+        if task['views'] + 1 >= task['max_views']:
+            cursor.execute("UPDATE tasks SET status = 'completed' WHERE task_id = ?", (task_id,))
         
         conn.commit()
     
@@ -543,111 +665,362 @@ Tebrikler!""",
     
     bot.answer_callback_query(call.id, f"✅ +{format_money(reward)} kazandın!")
 
-# ================= 8. GÖREV OLUŞTURMA =================
+# ================= 8. GÖREV OLUŞTURMA SİSTEMİ (ADIM ADIM) =================
 def create_task_menu(user_id, message_id):
-    """Görev verme menüsü"""
+    """Görev oluşturma menüsü"""
     user = get_user(user_id)
     
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
-        types.InlineKeyboardButton("🤖 BOT GÖREV VER (2.50 ₺/görüntü)", callback_data="create_bot"),
-        types.InlineKeyboardButton("📢 KANAL GÖREV VER (1.50 ₺/görüntü)", callback_data="create_kanal"),
-        types.InlineKeyboardButton("👥 GRUP GÖREV VER (1.00 ₺/görüntü)", callback_data="create_grup")
+        types.InlineKeyboardButton("🤖 BOT GÖREV OLUŞTUR (2.50 ₺/görüntü)", callback_data="create_bot"),
+        types.InlineKeyboardButton("📢 KANAL GÖREV OLUŞTUR (1.50 ₺/görüntü)", callback_data="create_kanal"),
+        types.InlineKeyboardButton("👥 GRUP GÖREV OLUŞTUR (1.00 ₺/görüntü)", callback_data="create_grup")
     )
     markup.add(types.InlineKeyboardButton("🏠 MENÜ", callback_data="back_menu"))
     
-    text = """<b>GÖREV VER</b>
+    text = """<b>📢 GÖREV OLUŞTUR</b>
 
-Hangi görevi vermek istiyorsun?
+Hangi görevi oluşturmak istiyorsun?
 
-🤖 <b>BOT</b> - 2.50 ₺ / görüntü
-📢 <b>KANAL</b> - 1.50 ₺ / görüntü  
-👥 <b>GRUP</b> - 1.00 ₺ / görüntü
+🤖 <b>BOT GÖREV</b>
+• Maliyet: 2.50 ₺ / görüntü
+• Forward mesaj zorunlu
 
-⚠️ Grup görevi için bot grupta admin olmalı.
+📢 <b>KANAL GÖREV</b>
+• Maliyet: 1.50 ₺ / görüntü  
+• Forward mesaj zorunlu
+• Bot kanalda admin olmalı
+
+👥 <b>GRUP GÖREV</b>
+• Maliyet: 1.00 ₺ / görüntü
+• Forward mesaj zorunlu
+• Bot grupta admin olmalı
 
 Birini seç:"""
     
     bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
 
-def ask_task_info(user_id, task_type, message_id):
-    """Görev bilgilerini iste"""
+def start_task_creation(user_id, task_type, message_id):
+    """Görev oluşturmaya başla"""
+    # Kullanıcı durumunu sıfırla
+    if user_id in user_states:
+        del user_states[user_id]
+    
+    user_states[user_id] = {
+        'creating_task': True,
+        'task_type': task_type,
+        'step': 1,
+        'data': {}
+    }
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("❌ İPTAL", callback_data="cancel_task"))
+    
+    type_names = {"bot": "Bot", "kanal": "Kanal", "grup": "Grup"}
     cost = PRICES[task_type]
-    min_needed = cost * 5
+    
+    bot.edit_message_text(
+        f"""<b>📝 {type_names[task_type]} Görevi Oluştur</b>
+
+Adım 1/4: <b>Görev İsmi</b>
+
+Görevin için bir isim yaz:
+
+Örnek: <code>Yapay Zeka Asistanı</code>
+Örnek: <code>Teknoloji Haberleri</code>
+
+⚠️ <b>Not:</b> İptal etmek için "❌ İPTAL" butonuna bas.
+
+💰 <b>Maliyet:</b> {format_money(cost)} / görüntü""",
+        user_id,
+        message_id,
+        reply_markup=markup
+    )
+
+@bot.message_handler(func=lambda message: message.from_user.id in user_states and user_states[message.from_user.id].get('creating_task') and user_states[message.from_user.id]['step'] == 1)
+def process_task_name(message):
+    """Görev ismini işle"""
+    user_id = message.from_user.id
+    state = user_states[user_id]
+    
+    state['data']['title'] = message.text.strip()
+    state['step'] = 2
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("❌ İPTAL", callback_data="cancel_task"))
     
     type_names = {"bot": "Bot", "kanal": "Kanal", "grup": "Grup"}
     
-    bot.edit_message_text(
-        f"""<b>{type_names[task_type]} Görevi Oluştur</b>
-
-Görev bilgilerini şu şekilde gönder:
-
-<code>Başlık
-Link
-Açıklama</code>
-
-Örnek:
-<code>Teknoloji Haberleri
-https://t.me/teknolojihaber
-En güncel teknoloji haberleri!</code>
-
-💰 <b>Görüntü başına:</b> {format_money(cost)}
-💳 <b>Min bakiye:</b> {format_money(min_needed)}
-
-Gönder:""",
+    bot.send_message(
         user_id,
-        message_id
-    )
-    
-    bot.register_next_step_handler_by_chat_id(
-        user_id, 
-        save_task_info, 
-        task_type, 
-        message_id
+        f"""✅ <b>Adım 1 tamamlandı!</b>
+
+Adım 2/4: <b>Görev Linki</b>
+
+Görevin linkini yaz:
+
+Örnek: <code>https://t.me/bot_adi</code>
+Örnek: <code>https://t.me/kanal_adi</code>
+
+⚠️ <b>Format:</b> https://t.me/ ile başlamalı
+
+📌 <b>İsim:</b> {state['data']['title']}""",
+        reply_markup=markup
     )
 
-def save_task_info(message, task_type, message_id):
-    """Görev bilgilerini kaydet"""
+@bot.message_handler(func=lambda message: message.from_user.id in user_states and user_states[message.from_user.id].get('creating_task') and user_states[message.from_user.id]['step'] == 2)
+def process_task_link(message):
+    """Görev linkini işle"""
     user_id = message.from_user.id
-    text = message.text.strip().split('\n')
+    state = user_states[user_id]
     
-    if len(text) < 3:
-        bot.send_message(user_id, "❌ Hatalı format! 3 satır gönder.")
-        show_main_menu(user_id)
-        return
+    link = message.text.strip()
     
-    title = text[0].strip()
-    link = text[1].strip()
-    desc = text[2].strip()
-    
-    # Link kontrolü
     if not link.startswith('https://t.me/'):
-        bot.send_message(user_id, "❌ Link https://t.me/ ile başlamalı!")
-        show_main_menu(user_id)
+        bot.send_message(user_id, "❌ Link https://t.me/ ile başlamalı! Tekrar dene:")
         return
     
-    cost = PRICES[task_type]
-    min_needed = cost * 5
+    state['data']['link'] = link
+    state['step'] = 3
     
-    # Bakiye kontrolü
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("❌ İPTAL", callback_data="cancel_task"))
+    
+    type_names = {"bot": "Bot", "kanal": "Kanal", "grup": "Grup"}
+    
+    bot.send_message(
+        user_id,
+        f"""✅ <b>Adım 2 tamamlandı!</b>
+
+Adım 3/4: <b>Görev Açıklaması</b>
+
+Görevin için bir açıklama yaz:
+
+Örnek: <code>En gelişmiş AI asistanı!</code>
+Örnek: <code>Teknoloji haberleri için kanalımıza katılın!</code>
+
+📌 <b>İsim:</b> {state['data']['title']}
+🔗 <b>Link:</b> {state['data']['link']}""",
+        reply_markup=markup
+    )
+
+@bot.message_handler(func=lambda message: message.from_user.id in user_states and user_states[message.from_user.id].get('creating_task') and user_states[message.from_user.id]['step'] == 3)
+def process_task_description(message):
+    """Görev açıklamasını işle"""
+    user_id = message.from_user.id
+    state = user_states[user_id]
+    
+    state['data']['description'] = message.text.strip()
+    state['step'] = 4
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("❌ İPTAL", callback_data="cancel_task"))
+    
+    type_names = {"bot": "Bot", "kanal": "Kanal", "grup": "Grup"}
+    cost = PRICES[state['task_type']]
+    
+    bot.send_message(
+        user_id,
+        f"""✅ <b>Adım 3 tamamlandı!</b>
+
+Adım 4/4: <b>Kaç Kişi Tamamlayacak?</b>
+
+Görevin kaç kişi tarafından tamamlansın?
+
+Örnek: <code>10</code> (10 kişi)
+Örnek: <code>50</code> (50 kişi)
+
+📌 <b>İsim:</b> {state['data']['title']}
+🔗 <b>Link:</b> {state['data']['link']}
+📝 <b>Açıklama:</b> {state['data']['description']}
+
+💰 <b>Toplam Maliyet:</b> (kişi sayısı × {format_money(cost)})""",
+        reply_markup=markup
+    )
+
+@bot.message_handler(func=lambda message: message.from_user.id in user_states and user_states[message.from_user.id].get('creating_task') and user_states[message.from_user.id]['step'] == 4)
+def process_task_views(message):
+    """Görev görüntü sayısını işle"""
+    user_id = message.from_user.id
+    state = user_states[user_id]
+    
+    try:
+        max_views = int(message.text.strip())
+        if max_views < 1:
+            bot.send_message(user_id, "❌ En az 1 kişi olmalı! Tekrar dene:")
+            return
+    except:
+        bot.send_message(user_id, "❌ Sayı girmelisin! Örnek: 10")
+        return
+    
+    state['data']['max_views'] = max_views
+    
+    # Forward mesaj iste
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("❌ İPTAL", callback_data="cancel_task"))
+    
+    type_names = {"bot": "Bot", "kanal": "Kanal", "grup": "Grup"}
+    cost = PRICES[state['task_type']]
+    total_cost = cost * max_views
+    
+    bot.send_message(
+        user_id,
+        f"""✅ <b>Adım 4 tamamlandı!</b>
+
+📝 <b>GÖREV ÖZETİ</b>
+
+📌 <b>İsim:</b> {state['data']['title']}
+🔗 <b>Link:</b> {state['data']['link']}
+📝 <b>Açıklama:</b> {state['data']['description']}
+👥 <b>Kişi Sayısı:</b> {max_views}
+💰 <b>Kişi Başı:</b> {format_money(cost)}
+💰 <b>Toplam Maliyet:</b> {format_money(total_cost)}
+
+⚠️ <b>Şimdi bu mesajı FORWARD etmelisin!</b>
+
+<i>Bu mesajı bana forward et ki görev oluşturabileyim.</i>""",
+        reply_markup=markup
+    )
+    
+    # Forward mesaj beklemeye başla
+    state['step'] = 5
+
+@bot.message_handler(func=lambda message: message.from_user.id in user_states and user_states[message.from_user.id].get('creating_task') and user_states[message.from_user.id]['step'] == 5 and message.forward_from is not None)
+def process_forwarded_message(message):
+    """Forward edilen mesajı işle"""
+    user_id = message.from_user.id
+    state = user_states[user_id]
+    
+    type_names = {"bot": "Bot", "kanal": "Kanal", "grup": "Grup"}
+    cost = PRICES[state['task_type']]
+    total_cost = cost * state['data']['max_views']
+    
+    # Reklam bakiyesi kontrolü
     user = get_user(user_id)
-    if user['balance'] < min_needed:
+    if user['ad_balance'] < total_cost:
         bot.send_message(
             user_id,
-            f"❌ Yetersiz bakiye! Minimum {format_money(min_needed)} gerekli."
+            f"""❌ <b>Yetersiz Reklam Bakiyesi!</b>
+
+Gerekli: {format_money(total_cost)}
+Mevcut: {format_money(user['ad_balance'])}
+
+💡 <b>Çözüm:</b>
+1. "🔄 REKLAM BAKİYESİ" menüsüne git
+2. Normal bakiyenden reklam bakiyesine çevir
+3. %25 bonus kazan""",
+            reply_markup=types.InlineKeyboardMarkup().add(
+                types.InlineKeyboardButton("🔄 REKLAM BAKİYESİ", callback_data="ad_balance_menu")
+            )
         )
-        show_main_menu(user_id)
+        del user_states[user_id]
         return
     
-    # Görev oluştur
+    # Kanal/Grup görevi için admin kontrolü
+    if state['task_type'] in ['kanal', 'grup']:
+        try:
+            bot_id = bot.get_me().id
+            chat_username = state['data']['link'].replace('https://t.me/', '').replace('@', '')
+            
+            try:
+                chat = bot.get_chat('@' + chat_username)
+                chat_member = bot.get_chat_member(chat.id, bot_id)
+                
+                if chat_member.status not in ['administrator', 'creator']:
+                    bot.send_message(
+                        user_id,
+                        f"""❌ <b>Bot {type_names[state['task_type']]}da admin değil!</b>
+
+Lütfen botu {state['data']['link']} adresindeki {type_names[state['task_type']]}a admin yapın, sonra tekrar deneyin."""
+                    )
+                    del user_states[user_id]
+                    return
+            except:
+                bot.send_message(
+                    user_id,
+                    f"❌ {type_names[state['task_type']]} bulunamadı veya erişim yok!"
+                )
+                del user_states[user_id]
+                return
+        except Exception as e:
+            bot.send_message(
+                user_id,
+                f"❌ {type_names[state['task_type']]} kontrol hatası!"
+            )
+            del user_states[user_id]
+            return
+    
+    # Onay menüsü
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("✅ OLUŞTUR", callback_data=f"confirm_task_{state['task_type']}"),
+        types.InlineKeyboardButton("❌ İPTAL", callback_data="cancel_task")
+    )
+    
+    bot.send_message(
+        user_id,
+        f"""✅ <b>Forward Mesaj Alındı!</b>
+
+🎯 <b>GÖREV DETAYLARI</b>
+
+📌 <b>İsim:</b> {state['data']['title']}
+🔗 <b>Link:</b> {state['data']['link']}
+📝 <b>Açıklama:</b> {state['data']['description']}
+👥 <b>Kişi Sayısı:</b> {state['data']['max_views']}
+💰 <b>Kişi Başı:</b> {format_money(cost)}
+💰 <b>Toplam Maliyet:</b> {format_money(total_cost)}
+
+💳 <b>Reklam Bakiyen:</b> {format_money(user['ad_balance'])}
+💳 <b>Kalan Bakiye:</b> {format_money(user['ad_balance'] - total_cost)}
+
+<i>Görevi oluşturmak için "✅ OLUŞTUR" butonuna bas.</i>""",
+        reply_markup=markup
+    )
+
+def confirm_task_creation(user_id, task_type, message_id):
+    """Görevi onayla ve oluştur"""
+    if user_id not in user_states:
+        show_main_menu(user_id, message_id)
+        return
+    
+    state = user_states[user_id]
+    
+    cost = PRICES[task_type]
+    total_cost = cost * state['data']['max_views']
+    
+    # Reklam bakiyesi kontrolü
+    user = get_user(user_id)
+    if user['ad_balance'] < total_cost:
+        bot.edit_message_text(
+            "❌ Yetersiz reklam bakiyesi!",
+            user_id,
+            message_id
+        )
+        del user_states[user_id]
+        return
+    
+    # Görevi oluştur
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute('''INSERT INTO tasks 
-                       (user_id, task_type, title, link, description, cost_per_view)
-                       VALUES (?, ?, ?, ?, ?, ?)''',
-                       (user_id, task_type, title, link, desc, cost))
-        task_id = cursor.lastrowid
+                       (user_id, task_type, title, link, description, cost_per_view, max_views)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                       (user_id, task_type, 
+                        state['data']['title'],
+                        state['data']['link'],
+                        state['data']['description'],
+                        cost,
+                        state['data']['max_views']))
+        
+        # Reklam bakiyesinden düş
+        cursor.execute('''UPDATE users SET 
+                       ad_balance = ad_balance - ?
+                       WHERE user_id = ?''', 
+                       (total_cost, user_id))
+        
         conn.commit()
+    
+    task_id = cursor.lastrowid
     
     # Başarı mesajı
     markup = types.InlineKeyboardMarkup()
@@ -656,49 +1029,59 @@ def save_task_info(message, task_type, message_id):
         types.InlineKeyboardButton("🏠 MENÜ", callback_data="back_menu")
     )
     
-    bot.send_message(
-        user_id,
+    type_emojis = {"bot": "🤖", "kanal": "📢", "grup": "👥"}
+    
+    bot.edit_message_text(
         f"""<b>✅ GÖREV OLUŞTURULDU!</b>
 
-{get_task_emoji(task_type)} <b>{title}</b>
-🔗 {link}
-📝 {desc}
+{type_emojis[task_type]} <b>Görev Başlatıldı!</b>
 
-💰 <b>Görüntü başına:</b> {format_money(cost)}
-🆔 <b>ID:</b> {task_id}
+📌 <b>İsim:</b> {state['data']['title']}
+🔗 <b>Link:</b> {state['data']['link']}
+👥 <b>Kişi Sayısı:</b> {state['data']['max_views']}
+💰 <b>Toplam Maliyet:</b> {format_money(total_cost)}
+🆔 <b>Görev ID:</b> {task_id}
 
 ✅ Görevin aktif! Kullanıcılar görebilir.
 
-⚠️ Her görüntülemede {format_money(cost)} düşülecek. Para bitince görev durur.""",
+💡 <b>İpucu:</b> Görevlerini "GÖREV YAP" menüsünden takip edebilirsin.""",
+        user_id,
+        message_id,
         reply_markup=markup
     )
     
-    show_main_menu(user_id)
+    # Durumu temizle
+    del user_states[user_id]
 
-def get_task_emoji(task_type):
-    emojis = {"bot": "🤖", "kanal": "📢", "grup": "👥"}
-    return emojis.get(task_type, "🎯")
-
-# ================= 9. BAKİYE =================
+# ================= 9. BAKİYE SİSTEMİ =================
 def show_my_balance(user_id, message_id):
     """Bakiye bilgisi"""
     user = get_user(user_id)
+    total_balance = get_total_balance(user_id)
     
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
         types.InlineKeyboardButton("🤖 GÖREV YAP", callback_data="do_task"),
-        types.InlineKeyboardButton("📢 GÖREV VER", callback_data="create_task")
+        types.InlineKeyboardButton("📢 GÖREV OLUŞTUR", callback_data="create_task_menu")
+    )
+    markup.add(
+        types.InlineKeyboardButton("💳 BAKİYE YÜKLE", callback_data="deposit_menu"),
+        types.InlineKeyboardButton("🔄 REKLAM BAKİYESİ", callback_data="ad_balance_menu")
     )
     markup.add(types.InlineKeyboardButton("🏠 MENÜ", callback_data="back_menu"))
     
-    text = f"""<b>💰 BAKİYE</b>
+    text = f"""<b>💰 BAKİYE DETAYLARI</b>
 
 👤 {user['first_name']}
 
-💵 <b>Bakiye:</b> {format_money(user['balance'])}
-📈 <b>Toplam:</b> {format_money(user['total_earned'])}
+💵 <b>Toplam Bakiye:</b> {format_money(total_balance)}
+• Normal Bakiye: {format_money(user['balance'])}
+• Reklam Bakiyesi: {format_money(user['ad_balance'])}
+
+📈 <b>Toplam Kazanç:</b> {format_money(user['total_earned'])}
 🎯 <b>Görev:</b> {user['tasks_completed']}
 👥 <b>Ref:</b> {user['referrals']}
+💰 <b>Ref Kazanç:</b> {format_money(user['ref_earned'])}
 
 💸 <b>Para Çekim:</b>
 Min: 20 ₺
@@ -706,11 +1089,311 @@ Süre: 24 saat"""
     
     bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
 
-# ================= 10. REFERANS =================
+# ================= 10. BAKİYE YÜKLEME =================
+def show_deposit_menu(user_id, message_id):
+    """Bakiye yükleme menüsü"""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("10 ₺", callback_data="deposit_10"),
+        types.InlineKeyboardButton("25 ₺", callback_data="deposit_25"),
+        types.InlineKeyboardButton("50 ₺", callback_data="deposit_50"),
+        types.InlineKeyboardButton("100 ₺", callback_data="deposit_100")
+    )
+    markup.add(
+        types.InlineKeyboardButton("250 ₺", callback_data="deposit_250"),
+        types.InlineKeyboardButton("500 ₺", callback_data="deposit_500"),
+        types.InlineKeyboardButton("Diğer", callback_data="deposit_other"),
+        types.InlineKeyboardButton("🏠 MENÜ", callback_data="back_menu")
+    )
+    
+    text = """<b>💳 BAKİYE YÜKLE</b>
+
+Hangi miktarı yüklemek istiyorsun?
+
+👇 Bir miktar seç veya "Diğer" seçeneğiyle özel miktar gir.
+
+⚠️ <b>Not:</b> Bakiye yükleme işlemleri manuel onay gerektirir."""
+    
+    bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
+
+def ask_custom_deposit(user_id, message_id):
+    """Özel miktar sor"""
+    bot.edit_message_text(
+        """💳 <b>Özel Miktar</b>
+
+Yüklemek istediğin miktarı yaz:
+
+Örnek: <code>75</code> (75 ₺)
+Örnek: <code>150.50</code> (150.50 ₺)
+
+<i>Minimum: 10 ₺</i>""",
+        user_id,
+        message_id
+    )
+    
+    bot.register_next_step_handler_by_chat_id(user_id, process_custom_deposit)
+
+def process_custom_deposit(message):
+    """Özel miktarı işle"""
+    user_id = message.from_user.id
+    
+    try:
+        amount = float(message.text.strip())
+        if amount < 10:
+            bot.send_message(user_id, "❌ Minimum 10 ₺ yükleyebilirsin!")
+            show_deposit_menu(user_id, None)
+            return
+    except:
+        bot.send_message(user_id, "❌ Geçersiz miktar!")
+        show_deposit_menu(user_id, None)
+        return
+    
+    confirm_deposit(user_id, amount, None)
+
+def confirm_deposit(user_id, amount, message_id):
+    """Bakiye yüklemeyi onayla"""
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton("✅ ONAYLA", callback_data="confirm_deposit"),
+        types.InlineKeyboardButton("❌ İPTAL", callback_data="back_menu")
+    )
+    
+    if message_id:
+        bot.edit_message_text(
+            f"""💳 <b>BAKİYE YÜKLEME ONAYI</b>
+
+💰 <b>Miktar:</b> {format_money(amount)}
+
+ℹ️ <b>Bilgi:</b>
+1. "✅ ONAYLA" butonuna bas
+2. Admin onayı bekleyeceksin
+3. Onaylandığında bakiye yüklenecek
+
+⏰ <b>Süre:</b> 24 saat içinde onaylanır""",
+            user_id,
+            message_id,
+            reply_markup=markup
+        )
+    else:
+        bot.send_message(
+            user_id,
+            f"""💳 <b>BAKİYE YÜKLEME ONAYI</b>
+
+💰 <b>Miktar:</b> {format_money(amount)}
+
+ℹ️ <b>Bilgi:</b>
+1. "✅ ONAYLA" butonuna bas
+2. Admin onayı bekleyeceksin
+3. Onaylandığında bakiye yüklenecek
+
+⏰ <b>Süre:</b> 24 saat içinde onaylanır""",
+            reply_markup=markup
+        )
+    
+    # Geçici olarak kaydet
+    if user_id not in user_states:
+        user_states[user_id] = {}
+    user_states[user_id]['deposit_amount'] = amount
+
+def process_deposit(user_id, message_id):
+    """Bakiye yüklemeyi işle"""
+    if user_id not in user_states or 'deposit_amount' not in user_states[user_id]:
+        show_main_menu(user_id, message_id)
+        return
+    
+    amount = user_states[user_id]['deposit_amount']
+    
+    # Deposit kaydı oluştur
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''INSERT INTO deposits 
+                       (user_id, amount, method, status)
+                       VALUES (?, ?, ?, ?)''',
+                       (user_id, amount, 'manual', 'pending'))
+        conn.commit()
+    
+    # Admin'e bildir
+    try:
+        admin_text = f"""📥 <b>YENİ BAKİYE YÜKLEME TALEBI</b>
+
+👤 <b>Kullanıcı:</b> {get_user(user_id)['first_name']}
+🆔 <b>ID:</b> {user_id}
+💰 <b>Miktar:</b> {format_money(amount)}
+📅 <b>Tarih:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"""
+        
+        bot.send_message(ADMIN_ID, admin_text)
+    except:
+        pass
+    
+    bot.edit_message_text(
+        f"""✅ <b>BAKİYE YÜKLEME TALEBİ ALINDI</b>
+
+💰 <b>Miktar:</b> {format_money(amount)}
+📊 <b>Durum:</b> Admin onayı bekleniyor
+⏰ <b>Süre:</b> 24 saat içinde onaylanacak
+
+💡 <b>Bilgi:</b> Onaylandığında bildirim alacaksın.
+
+📞 <b>Destek:</b> @AlperenTHE""",
+        user_id,
+        message_id
+    )
+    
+    # Temizle
+    if user_id in user_states:
+        del user_states[user_id]
+
+# ================= 11. REKLAM BAKİYESİ =================
+def show_ad_balance_menu(user_id, message_id):
+    """Reklam bakiyesi menüsü"""
+    user = get_user(user_id)
+    
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("10 ₺", callback_data="convert_10"),
+        types.InlineKeyboardButton("25 ₺", callback_data="convert_25"),
+        types.InlineKeyboardButton("50 ₺", callback_data="convert_50"),
+        types.InlineKeyboardButton("100 ₺", callback_data="convert_100")
+    )
+    markup.add(
+        types.InlineKeyboardButton("Diğer", callback_data="convert_custom"),
+        types.InlineKeyboardButton("🏠 MENÜ", callback_data="back_menu")
+    )
+    
+    text = f"""<b>🔄 REKLAM BAKİYESİ</b>
+
+💰 <b>Normal Bakiye:</b> {format_money(user['balance'])}
+💰 <b>Reklam Bakiyesi:</b> {format_money(user['ad_balance'])}
+
+🎁 <b>%25 BONUS!</b> Normal bakiyeni reklam bakiyesine çevir, %25 bonus kazan!
+
+Örnek: 100 ₺ normal bakiye → 125 ₺ reklam bakiyesi
+
+👇 Çevirmek istediğin miktarı seç:"""
+    
+    bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
+
+def ask_custom_conversion(user_id, message_id):
+    """Özel dönüşüm miktarı sor"""
+    bot.edit_message_text(
+        """🔄 <b>Özel Miktar</b>
+
+Normal bakiyenden ne kadarını reklam bakiyesine çevirmek istiyorsun?
+
+Örnek: <code>75</code> (75 ₺)
+Örnek: <code>150.50</code> (150.50 ₺)
+
+<i>Minimum: 10 ₺</i>""",
+        user_id,
+        message_id
+    )
+    
+    bot.register_next_step_handler_by_chat_id(user_id, process_custom_conversion)
+
+def process_custom_conversion(message):
+    """Özel dönüşümü işle"""
+    user_id = message.from_user.id
+    
+    try:
+        amount = float(message.text.strip())
+        if amount < 10:
+            bot.send_message(user_id, "❌ Minimum 10 ₺ çevirebilirsin!")
+            show_ad_balance_menu(user_id, None)
+            return
+    except:
+        bot.send_message(user_id, "❌ Geçersiz miktar!")
+        show_ad_balance_menu(user_id, None)
+        return
+    
+    convert_to_ad_balance(user_id, amount, None)
+
+def convert_to_ad_balance(user_id, amount, message_id):
+    """Normal bakiyeden reklam bakiyesine çevir"""
+    user = get_user(user_id)
+    
+    if user['balance'] < amount:
+        text = f"""❌ <b>YETERSİZ BAKİYE!</b>
+
+💵 <b>Gerekli:</b> {format_money(amount)}
+💵 <b>Mevcut:</b> {format_money(user['balance'])}
+
+💡 <b>Öneri:</b> Önce bakiye yükle veya görev yap."""
+        
+        if message_id:
+            bot.edit_message_text(text, user_id, message_id)
+        else:
+            bot.send_message(user_id, text)
+        return
+    
+    bonus = amount * 0.25  # %25 bonus
+    total_ad = amount + bonus
+    
+    # İşlemi gerçekleştir
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        # Bakiyeleri güncelle
+        cursor.execute('''UPDATE users SET 
+                       balance = balance - ?,
+                       ad_balance = ad_balance + ?
+                       WHERE user_id = ?''', 
+                       (amount, total_ad, user_id))
+        
+        # Kayıt ekle
+        cursor.execute('''INSERT INTO conversions 
+                       (user_id, from_balance, to_ad_balance, bonus)
+                       VALUES (?, ?, ?, ?)''',
+                       (user_id, amount, total_ad, bonus))
+        
+        conn.commit()
+    
+    # Başarı mesajı
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton("📢 GÖREV OLUŞTUR", callback_data="create_task_menu"),
+        types.InlineKeyboardButton("🏠 MENÜ", callback_data="back_menu")
+    )
+    
+    text = f"""✅ <b>BAKIYE ÇEVİRİLDİ!</b>
+
+💰 <b>Çevrilen:</b> {format_money(amount)}
+🎁 <b>Bonus (%25):</b> {format_money(bonus)}
+💰 <b>Toplam Reklam Bakiyesi:</b> {format_money(total_ad)}
+
+💳 <b>Yeni Durum:</b>
+• Normal Bakiye: {format_money(user['balance'] - amount)}
+• Reklam Bakiyesi: {format_money(user['ad_balance'] + total_ad)}
+
+🎯 <b>Şimdi görev oluşturabilirsin!</b>"""
+    
+    if message_id:
+        bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
+    else:
+        bot.send_message(user_id, text, reply_markup=markup)
+
+# ================= 12. REFERANS SİSTEMİ =================
 def show_my_refs(user_id, message_id):
     """Referans bilgisi"""
     user = get_user(user_id)
     ref_link = f"https://t.me/{bot.get_me().username}?start=ref_{user_id}"
+    
+    # Referans geçmişi
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''SELECT COUNT(*) as total_refs,
+                       SUM(earned) as total_earned
+                       FROM referrals 
+                       WHERE referrer_id = ?''',
+                       (user_id,))
+        ref_stats = cursor.fetchone()
+        
+        cursor.execute('''SELECT u.first_name, r.created_at 
+                       FROM referrals r
+                       JOIN users u ON r.referred_id = u.user_id
+                       WHERE r.referrer_id = ? 
+                       ORDER BY r.created_at DESC LIMIT 10''',
+                       (user_id,))
+        recent_refs = cursor.fetchall()
     
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
@@ -720,27 +1403,38 @@ def show_my_refs(user_id, message_id):
     )
     markup.add(types.InlineKeyboardButton("🏠 MENÜ", callback_data="back_menu"))
     
-    text = f"""<b>👥 REFERANS</b>
+    # Referans geçmişi
+    ref_history = ""
+    if recent_refs:
+        ref_history = "\n<b>📋 Son Referanslar:</b>\n"
+        for i, ref in enumerate(recent_refs, 1):
+            date_str = ref['created_at'][:10] if ref['created_at'] else "???"
+            ref_history += f"{i}. {ref['first_name']} - {date_str}\n"
+    else:
+        ref_history = "\n📭 <i>Henüz referansın yok.</i>"
+    
+    text = f"""<b>👥 REFERANS SİSTEMİ</b>
 
 💰 <b>Her referans:</b> 1 ₺
-👤 <b>Toplam:</b> {user['referrals']}
-📈 <b>Kazanç:</b> {format_money(user['ref_earned'])}
+👤 <b>Toplam:</b> {ref_stats['total_refs'] or 0} kişi
+📈 <b>Kazanç:</b> {format_money(ref_stats['total_earned'] or 0)}
 
 🔗 <b>Linkin:</b>
 <code>{ref_link}</code>
 
-1. Linki paylaş
-2. Arkadaşların tıklasın
-3. Onlar start atınca +1 ₺
-4. Onlar da kazansın!
+{ref_history}
 
-🔥 10 referansta +5 ₺ bonus!"""
+🔥 <b>Bonus:</b>
+• 5 referans: +2 ₺
+• 10 referans: +5 ₺
+• 25 referans: +15 ₺
+• 50 referans: +35 ₺"""
     
     bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
 
-# ================= 11. ADMIN PANEL - TÜM BUTONLAR ÇALIŞIR =================
+# ================= 13. ADMIN PANEL =================
 def show_admin_panel(user_id, message_id):
-    """Admin panel ana sayfa"""
+    """Admin panel"""
     if user_id != ADMIN_ID:
         return
     
@@ -752,39 +1446,40 @@ def show_admin_panel(user_id, message_id):
         cursor.execute("SELECT SUM(balance) FROM users")
         total_balance = cursor.fetchone()[0] or 0
         
-        cursor.execute("SELECT SUM(total_earned) FROM users")
-        total_earned = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT SUM(ad_balance) FROM users")
+        total_ad_balance = cursor.fetchone()[0] or 0
+        
+        cursor.execute("SELECT COUNT(*) FROM deposits WHERE status = 'pending'")
+        pending_deposits = cursor.fetchone()[0]
     
     markup = types.InlineKeyboardMarkup(row_width=2)
     
     # Üst satır
     markup.add(
-        types.InlineKeyboardButton("📊 İSTATİSTİKLER", callback_data="admin_stats"),
+        types.InlineKeyboardButton("📊 İSTATİSTİK", callback_data="admin_stats"),
         types.InlineKeyboardButton("👤 KULLANICI", callback_data="admin_user")
     )
     
     # Orta satır
     markup.add(
         types.InlineKeyboardButton("💰 BAKİYE EKLE", callback_data="admin_add"),
-        types.InlineKeyboardButton("📢 DUYURU", callback_data="admin_broadcast")
+        types.InlineKeyboardButton("📥 DEPOZİTLER", callback_data=f"admin_deposits_{pending_deposits}")
     )
     
     # Alt satır
     markup.add(
-        types.InlineKeyboardButton("🗑️ VERİ TEMİZLE", callback_data="admin_clean"),
-        types.InlineKeyboardButton("📋 LOGLAR", callback_data="admin_logs")
+        types.InlineKeyboardButton("📢 DUYURU", callback_data="admin_broadcast"),
+        types.InlineKeyboardButton("🏠 MENÜ", callback_data="back_menu")
     )
-    
-    # En alt
-    markup.add(types.InlineKeyboardButton("🏠 MENÜ", callback_data="back_menu"))
     
     text = f"""<b>👑 ADMIN PANEL</b>
 
 Hoş geldin Admin!
 
-👥 Kullanıcı: {total_users}
-💰 Toplam Bakiye: {format_money(total_balance)}
-📈 Toplam Kazanç: {format_money(total_earned)}
+👥 <b>Kullanıcı:</b> {total_users}
+💰 <b>Normal Bakiye:</b> {format_money(total_balance)}
+💰 <b>Reklam Bakiyesi:</b> {format_money(total_ad_balance)}
+📥 <b>Bekleyen Depozit:</b> {pending_deposits}
 
 İşlem seç:"""
     
@@ -796,11 +1491,12 @@ Hoş geldin Admin!
 def handle_admin_action(call):
     """Admin işlemlerini yönet"""
     user_id = call.from_user.id
-    action = call.data
     
     if user_id != ADMIN_ID:
         bot.answer_callback_query(call.id, "❌ Yetkin yok!")
         return
+    
+    action = call.data
     
     if action == "admin_stats":
         show_admin_stats(user_id, call.message.message_id)
@@ -821,6 +1517,9 @@ def handle_admin_action(call):
         )
         bot.register_next_step_handler_by_chat_id(user_id, process_add_balance)
     
+    elif action.startswith("admin_deposits_"):
+        show_pending_deposits(user_id, call.message.message_id)
+    
     elif action == "admin_broadcast":
         bot.edit_message_text(
             "Tüm kullanıcılara gönderilecek mesajı yaz:",
@@ -828,12 +1527,6 @@ def handle_admin_action(call):
             call.message.message_id
         )
         bot.register_next_step_handler_by_chat_id(user_id, process_broadcast)
-    
-    elif action == "admin_clean":
-        show_clean_options(user_id, call.message.message_id)
-    
-    elif action == "admin_logs":
-        show_admin_logs(user_id, call.message.message_id)
     
     elif action == "admin_back":
         show_admin_panel(user_id, call.message.message_id)
@@ -849,6 +1542,9 @@ def show_admin_stats(user_id, message_id):
         cursor.execute("SELECT SUM(balance) FROM users")
         total_balance = cursor.fetchone()[0] or 0
         
+        cursor.execute("SELECT SUM(ad_balance) FROM users")
+        total_ad_balance = cursor.fetchone()[0] or 0
+        
         cursor.execute("SELECT SUM(total_earned) FROM users")
         total_earned = cursor.fetchone()[0] or 0
         
@@ -863,6 +1559,12 @@ def show_admin_stats(user_id, message_id):
         
         cursor.execute("SELECT COUNT(*) FROM users WHERE channel_joined = 1")
         channel_joined = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM conversions")
+        total_conversions = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT SUM(bonus) FROM conversions")
+        total_bonus = cursor.fetchone()[0] or 0
     
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🔙 GERİ", callback_data="admin_panel"))
@@ -871,11 +1573,52 @@ def show_admin_stats(user_id, message_id):
 
 👤 <b>Toplam Kullanıcı:</b> {total_users}
 📢 <b>Kanala Katılan:</b> {channel_joined}
-💰 <b>Toplam Bakiye:</b> {format_money(total_balance)}
+💰 <b>Toplam Normal Bakiye:</b> {format_money(total_balance)}
+💰 <b>Toplam Reklam Bakiyesi:</b> {format_money(total_ad_balance)}
 📈 <b>Toplam Kazanç:</b> {format_money(total_earned)}
 🎯 <b>Toplam Görev:</b> {total_tasks}
 📢 <b>Görev İlanı:</b> {total_task_ads}
-🟢 <b>Aktif Görev:</b> {active_tasks}"""
+🟢 <b>Aktif Görev:</b> {active_tasks}
+🔄 <b>Bakiye Çevrimi:</b> {total_conversions}
+🎁 <b>Toplam Bonus:</b> {format_money(total_bonus)}"""
+    
+    bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
+
+def show_pending_deposits(user_id, message_id):
+    """Bekleyen depozitler"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''SELECT d.*, u.first_name 
+                       FROM deposits d
+                       JOIN users u ON d.user_id = u.user_id
+                       WHERE d.status = 'pending'
+                       ORDER BY d.created_at DESC LIMIT 10''')
+        deposits = cursor.fetchall()
+    
+    if not deposits:
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🔙 GERİ", callback_data="admin_panel"))
+        
+        bot.edit_message_text(
+            "<b>📥 BEKLEYEN DEPOZİTLER</b>\n\n✅ Bekleyen depozit yok.",
+            user_id,
+            message_id,
+            reply_markup=markup
+        )
+        return
+    
+    text = "<b>📥 BEKLEYEN DEPOZİTLER</b>\n\n"
+    
+    for dep in deposits:
+        text += f"""👤 {dep['first_name']}
+🆔 ID: {dep['user_id']}
+💰 Miktar: {format_money(dep['amount'])}
+📅 Tarih: {dep['created_at'][:19]}
+━━━━━━━━━━━━━━━━━━━━━━
+"""
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🔙 GERİ", callback_data="admin_panel"))
     
     bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
 
@@ -901,7 +1644,8 @@ def process_user_admin(message):
 👤 Ad: {user['first_name']}
 📛 Username: {user['username'] or 'Yok'}
 
-💰 Bakiye: {format_money(user['balance'])}
+💰 Normal Bakiye: {format_money(user['balance'])}
+💰 Reklam Bakiyesi: {format_money(user['ad_balance'])}
 📈 Toplam: {format_money(user['total_earned'])}
 🎯 Görev: {user['tasks_completed']}
 👥 Ref: {user['referrals']}
@@ -932,7 +1676,6 @@ def process_add_balance(message):
         
         update_balance(target_id, amount)
         
-        # Kullanıcıya bildir
         try:
             bot.send_message(
                 target_id,
@@ -989,113 +1732,7 @@ def process_broadcast(message):
 👤 Toplam: {sent + failed}"""
     )
 
-def show_clean_options(user_id, message_id):
-    """Veri temizleme seçenekleri"""
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        types.InlineKeyboardButton("🗑️ ESKİ KAYITLARI TEMİZLE", callback_data="admin_clean_old"),
-        types.InlineKeyboardButton("🔄 SIFIR BAKİYELİLER", callback_data="admin_clean_zero"),
-        types.InlineKeyboardButton("🔙 GERİ", callback_data="admin_panel")
-    )
-    
-    text = """<b>🗑️ VERİ TEMİZLEME</b>
-
-⚠️ <b>Dikkat:</b> Bu işlemler geri alınamaz!
-
-<b>Seçenekler:</b>
-• Eski Kayıtları Temizle: 30 günden eski pasif kullanıcıları sil
-• Sıfır Bakiyeliler: 0 bakiye ve 0 görevi olanları temizle
-
-⚠️ <b>Yedek almanız önerilir!</b>"""
-    
-    bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_clean_old")
-def clean_old_users(call):
-    """Eski kullanıcıları temizle"""
-    user_id = call.from_user.id
-    
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''DELETE FROM users 
-                       WHERE last_active < datetime('now', '-30 days') 
-                       AND balance = 0 
-                       AND tasks_completed = 0''')
-        deleted = cursor.rowcount
-        conn.commit()
-    
-    bot.edit_message_text(
-        f"✅ {deleted} eski kullanıcı temizlendi!",
-        call.message.chat.id,
-        call.message.message_id
-    )
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_clean_zero")
-def clean_zero_users(call):
-    """Sıfır bakiye kullanıcıları temizle"""
-    user_id = call.from_user.id
-    
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''DELETE FROM users 
-                       WHERE balance = 0 
-                       AND tasks_completed = 0 
-                       AND referrals = 0''')
-        deleted = cursor.rowcount
-        conn.commit()
-    
-    bot.edit_message_text(
-        f"✅ {deleted} sıfır bakiye kullanıcı temizlendi!",
-        call.message.chat.id,
-        call.message.message_id
-    )
-
-def show_admin_logs(user_id, message_id):
-    """Admin logları"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''SELECT * FROM completions 
-                       ORDER BY created_at DESC 
-                       LIMIT 10''')
-        completions = cursor.fetchall()
-    
-    if not completions:
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🔙 GERİ", callback_data="admin_panel"))
-        
-        bot.edit_message_text(
-            "<b>📋 SON İŞLEMLER</b>\n\n❌ Henüz işlem bulunmuyor.",
-            user_id,
-            message_id,
-            reply_markup=markup
-        )
-        return
-    
-    log_text = "<b>📋 SON 10 GÖREV TAMAMLAMA</b>\n\n"
-    
-    for comp in completions:
-        cursor.execute("SELECT first_name FROM users WHERE user_id = ?", (comp['user_id'],))
-        user = cursor.fetchone()
-        
-        cursor.execute("SELECT title FROM tasks WHERE task_id = ?", (comp['task_id'],))
-        task = cursor.fetchone()
-        
-        username = user['first_name'] if user else f"ID:{comp['user_id']}"
-        taskname = task['title'][:20] + "..." if task and task['title'] else f"Görev:{comp['task_id']}"
-        timestamp = comp['created_at'][:19] if comp['created_at'] else "N/A"
-        
-        log_text += f"👤 {username}\n"
-        log_text += f"📌 {taskname}\n"
-        log_text += f"💰 {format_money(comp['earned'])}\n"
-        log_text += f"📅 {timestamp}\n"
-        log_text += "─" * 20 + "\n"
-    
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔙 GERİ", callback_data="admin_panel"))
-    
-    bot.edit_message_text(log_text, user_id, message_id, reply_markup=markup)
-
-# ================= 12. FLASK SUNUCUSU =================
+# ================= 14. FLASK SUNUCUSU =================
 @app.route('/')
 def home():
     return "🤖 Görev Yapsam Bot Aktif!"
@@ -1104,7 +1741,7 @@ def home():
 def health():
     return {"status": "ok"}
 
-# ================= 13. BOT ÇALIŞTIRMA =================
+# ================= 15. BOT ÇALIŞTIRMA =================
 def run_bot():
     print("🤖 Bot başlatılıyor...")
     try:
