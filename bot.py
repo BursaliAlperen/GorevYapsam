@@ -1,1167 +1,1312 @@
 """
-🤖 GÖREV YAPSAM BOT v13.0 - ÇOK DİLLİ & TRX OTOMATİK SİSTEM
-Telegram: @GorevYapsam
+🚀 GÖREV YAPSAM BOT PRO v16.0 - FIRESTORE v2 + ÇOK DİLLİ + MODERN SİSTEM
+Telegram: @GorevYapsamBot
 Developer: Alperen
-Token: 8465270393:AAGu8J5m8taovdjiffbU8LFc-9XbA1dv_co
-Dil Desteği: Türkçe & Azerbaycan Türkçesi
-TRX Ödeme: Tam Otomatik
+Database: Firebase Firestore v2
+Ödeme: Yakında (Papara & Kripto)
+Dil: Türkçe & Azerbaycan Türkçesi
 """
 
+import os
+import asyncio
 import telebot
 from telebot import types
-import sqlite3
+from telebot.async_telebot import AsyncTeleBot
 import threading
 import time
 from datetime import datetime, timedelta
-import random
 import requests
 import json
-import os
-from flask import Flask
+import pytz
+from dotenv import load_dotenv
+import cachetools
+import firebase_admin
+from firebase_admin import credentials, firestore
+import schedule
+import uuid
+from typing import Dict, List, Optional
 
-# ================= 1. KONFİGÜRASYON =================
-TOKEN = "8465270393:AAGu8J5m8taovdjiffbU8LFc-9XbA1dv_co"
-ADMIN_ID = 7904032877
-ZORUNLU_KANAL = "GY_Refim"
+# ================= 1. ÇEVRE DEĞİŞKENLERİ =================
+load_dotenv()
 
-# TRX CÜZDAN ADRESİ
-TRX_WALLET = "TVJKGbdBQrbvQzq6WZhb3kaGa3LYgVrMSK"
-TRONGRID_API_KEY = "YOUR_TRONGRID_API_KEY"  # TronGrid'den alınacak
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "7904032877"))
+MANDATORY_CHANNEL = os.getenv("MANDATORY_CHANNEL", "GY_Refim")
 
-# API URL'leri
-BINANCE_API = "https://api.binance.com/api/v3/ticker/price?symbol=TRXTRY"
-COINGECKO_API = "https://api.coingecko.com/api/v3/simple/price?ids=tron&vs_currencies=try"
+# ================= 2. FIREBASE FIRESTORE BAĞLANTISI =================
+try:
+    cred_path = os.getenv("FIREBASE_CREDENTIALS_PATH", "firebase-credentials.json")
+    
+    if os.path.exists(cred_path):
+        cred = credentials.Certificate(cred_path)
+        firebase_admin.initialize_app(cred, {
+            'projectId': 'gorev-yapsam-bot',
+        })
+        db = firestore.client()
+        print("✅ Firebase Firestore bağlantısı başarılı!")
+    else:
+        print(f"⚠️ Firebase credentials bulunamadı, local modda çalışıyor.")
+        db = None
+except Exception as e:
+    print(f"❌ Firebase bağlantı hatası: {e}")
+    db = None
 
-# FİYATLAR (TL cinsinden)
-PRICES = {
-    "bot": 2.50,    # 🤖 BOT GÖREV
-    "kanal": 1.50,  # 📢 KANAL GÖREV  
-    "grup": 1.00    # 👥 GRUP GÖREV
-}
+# ================= 3. BOT KONFİGÜRASYONU =================
+bot = AsyncTeleBot(TOKEN, parse_mode='HTML', threaded=True)
 
-# Bot nesnesi
-bot = telebot.TeleBot(TOKEN, parse_mode='HTML', threaded=True)
-app = Flask(__name__)
+# ================= 4. CACHE VE DURUM SİSTEMİ =================
+price_cache = cachetools.TTLCache(maxsize=100, ttl=30)  # 30 saniye
+user_cache = cachetools.TTLCache(maxsize=1000, ttl=60)  # 1 dakika
+user_states = {}
+task_cache = cachetools.TTLCache(maxsize=100, ttl=60)
 
-# ================= 2. DİL SİSTEMİ =================
+# ================= 5. FİYAT SİSTEMİ =================
+def get_trx_price():
+    """Canlı TRX/TRY fiyatını al"""
+    try:
+        if 'trx_price' in price_cache:
+            return price_cache['trx_price']
+        
+        # Binance API
+        response = requests.get(
+            "https://api.binance.com/api/v3/ticker/price?symbol=TRXTRY",
+            timeout=5
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            price = float(data['price'])
+            price_cache['trx_price'] = price
+            return price
+        
+        # CoinGecko fallback
+        response = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price?ids=tron&vs_currencies=try",
+            timeout=5
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            price = float(data['tron']['try'])
+            price_cache['trx_price'] = price
+            return price
+        
+    except Exception as e:
+        print(f"Fiyat çekme hatası: {e}")
+    
+    # Fallback değer
+    return 0.35
+
+# ================= 6. DİL SİSTEMİ =================
 TRANSLATIONS = {
     'tr': {
+        # Ana Menü
         'main_menu': {
-            'title': '🤖 GÖREV YAPSAM',
-            'welcome': 'Merhaba {name}!',
-            'total_balance': '💰 Toplam Bakiye:',
-            'normal_balance': '• Normal:',
-            'ad_balance': '• Reklam:',
-            'tasks_completed': '🎯 Görev:',
-            'refs': '👥 Ref:',
-            'channel': '📢 Kanal:',
-            'start_now': 'Hemen başla!'
+            'title': '🚀 <b>GÖREV YAPSAM BOT</b>',
+            'welcome': '👋 <b>Merhaba {name}!</b>',
+            'balance_section': '💰 <b>BAKİYE DURUMU</b>',
+            'stats_section': '📊 <b>İSTATİSTİKLER</b>',
+            'total_balance': '• Toplam Bakiye:',
+            'normal_balance': '• Normal Bakiye:',
+            'ad_balance': '• Reklam Bakiyesi:',
+            'tasks_completed': '• Tamamlanan Görev:',
+            'referrals': '• Referans Sayısı:',
+            'channel_info': '📢 <b>Zorunlu Kanal:</b>',
+            'start_action': '⚡ <i>Aşağıdaki butonlardan işlemini seç!</i>'
         },
+        
+        # Butonlar
         'buttons': {
             'do_task': '🤖 GÖREV YAP',
             'create_task': '📢 GÖREV OLUŞTUR',
-            'my_balance': '💰 BAKİYE',
-            'referrals': '👥 REFERANS',
+            'my_balance': '💰 BAKİYEM',
+            'referrals': '👥 REFERANSLARIM',
             'deposit': '💳 BAKİYE YÜKLE',
-            'ad_balance': '🔄 REKLAM BAKİYESİ',
+            'ad_balance': '🔄 ÇEVİRİ YAP',
             'withdraw': '💸 PARA ÇEK',
-            'support': '🛠 TEKNİK DESTEK',
-            'faq': '❓ FAQ',
+            'support': '🛠 DESTEK',
+            'faq': '❓ YARDIM',
             'language': '🌐 DİL',
-            'back_menu': '🏠 MENÜ',
-            'admin_panel': '👑 ADMIN'
+            'back_menu': '🏠 ANA MENÜ',
+            'refresh': '🔄 YENİLE',
+            'copy': '📋 KOPYALA',
+            'confirm': '✅ ONAYLA',
+            'cancel': '❌ İPTAL'
         },
-        'tasks': {
-            'select_task': 'GÖREV SEÇ',
-            'bot_task': '🤖 BOT ({price} ₺)',
-            'channel_task': '📢 KANAL ({price} ₺)',
-            'group_task': '👥 GRUP ({price} ₺)',
-            'choose_one': 'Birini seç:'
-        },
+        
+        # Bakiye Yükleme
         'deposit': {
-            'title': '💳 BAKİYE YÜKLE',
-            'select_amount': 'Hangi miktarı yüklemek istiyorsun?',
-            'custom_amount': '💳 Özel Miktar',
-            'enter_amount': 'Yüklemek istediğin TRX miktarını yaz:',
-            'min_amount': 'Minimum: 2 TRX',
-            'trx_address': 'TRX Cüzdan Adresi:',
-            'send_exact': 'Lütfen TAM {amount} TRX gönder:',
-            'enter_txid': 'İşlem tamamlandığında TXID/Hash numarasını buraya yaz:',
-            'verifying': '✅ Ödeme kontrol ediliyor...',
-            'success': '✅ Ödeme Onaylandı!',
-            'failed': '❌ Ödeme bulunamadı. TXID kontrol edin.'
+            'title': '💳 <b>BAKİYE YÜKLEME</b>',
+            'soon_title': '⏳ <b>YAKINDA AKTİF!</b>',
+            'soon_message': 'Bakiye yükleme sistemi çok yakında aktif edilecektir.\n\nÖdeme yöntemleri:\n• Papara\n• Kripto Para (TRX, USDT)\n• Banka Havalesi\n\nLütfen kısa bir süre bekleyin.',
+            'back_button': '🔙 Ana Menüye Dön'
         },
-        'ad_balance': {
-            'title': '🔄 REKLAM BAKİYESİ',
-            'normal_balance': '💰 Normal Bakiye:',
-            'ad_balance': '💰 Reklam Bakiyesi:',
-            'bonus_25': '🎁 %25 BONUS! Normal bakiyeni reklam bakiyesine çevir, %25 bonus kazan!',
-            'example': 'Örnek: 100 ₺ normal bakiye → 125 ₺ reklam bakiyesi',
-            'select_amount': 'Çevirmek istediğin miktarı seç:',
-            'custom': 'Diğer',
-            'converted': '✅ BAKİYE ÇEVRİLDİ!',
-            'converted_amount': '💰 Çevrilen:',
-            'bonus': '🎁 Bonus (%25):',
-            'total_ad': '💰 Toplam Reklam Bakiyesi:',
-            'new_status': '💳 Yeni Durum:',
-            'create_task_now': '🎯 Şimdi görev oluşturabilirsin!'
+        
+        # Görevler
+        'tasks': {
+            'select_type': '📋 <b>GÖREV TİPİ SEÇİMİ</b>',
+            'bot_task': '🤖 BOT GÖREVİ ({price} ₺)',
+            'channel_task': '📢 KANAL GÖREVİ ({price} ₺)',
+            'group_task': '👥 GRUP GÖREVİ ({price} ₺)',
+            'no_tasks': '📭 <b>Şu anda görev bulunmuyor</b>',
+            'create_your_own': '💡 Kendi görevini oluşturabilirsin!',
+            'instructions': '📌 <b>YÖNERGELER:</b>\n1. "GİT" butonuna tıkla\n2. Görevi tamamla\n3. 3 dakika bekle\n4. "TAMAMLA" butonuna bas'
         },
+        
+        # Destek
         'support': {
-            'title': '🛠 TEKNİK DESTEK',
-            'contact': 'Sorunlarınız için: @AlperenTHE',
-            'ticket_system': '📝 Bilet sistemi yakında aktif!',
-            'response_time': '⏰ Yanıt süresi: 24 saat'
+            'title': '🛠 <b>TEKNİK DESTEK</b>',
+            'contact': '📞 <b>İletişim:</b> @AlperenTHE',
+            'ticket_system': '🎫 <b>Bilet Sistemi:</b> Yakında aktif!',
+            'response_time': '⏰ <b>Yanıt Süresi:</b> 24 saat',
+            'user_id': '🆔 <b>Kullanıcı ID:</b>'
         },
+        
+        # SSS
         'faq': {
-            'title': '❓ SIKÇA SORULAN SORULAR',
-            'q1': '❓ <b>Bakiye nasıl yüklenir?</b>',
-            'a1': '💳 "BAKİYE YÜKLE" butonuna tıkla → TRX miktarını seç → TRX gönder → TXID gir.',
-            'q2': '❓ <b>Görev nasıl yapılır?</b>',
-            'a2': '🤖 "GÖREV YAP" butonu → görev seç → linke git → 3 dakika bekle → TAMAMLA.',
-            'q3': '❓ <b>Ödeme ne zaman gelir?</b>',
-            'a3': '⚡ TRX ödemeleri 1-5 dakika içinde otomatik onaylanır.',
-            'q4': '❓ <b>Reklam bakiyesi nedir?</b>',
-            'a4': '🔄 Görev oluşturmak için kullanılan özel bakiyedir. %25 bonusla çevrilir.',
-            'q5': '❓ <b>Minimum para çekme nedir?</b>',
-            'a5': '💸 Minimum para çekme: 20 ₺ (sistem yakında aktif).'
+            'title': '❓ <b>SIKÇA SORULAN SORULAR</b>',
+            'q1': '💰 <b>Bakiye nasıl yüklenir?</b>',
+            'a1': 'Bakiye yükleme sistemi çok yakında aktif olacak. Papara ve kripto para seçenekleriyle bakiye yükleyebileceksin.',
+            'q2': '🤖 <b>Görev nasıl yapılır?</b>',
+            'a2': '1. "GÖREV YAP" butonuna tıkla\n2. Görev seç\n3. Linke git ve görevi tamamla\n4. 3 dakika bekle ve tamamla',
+            'q3': '🎁 <b>Bonus sistemi nedir?</b>',
+            'a3': '• Her referans için 1 ₺\n• Görev tamamlayarak para kazan\n• Özel bonus kampanyaları',
+            'q4': '💸 <b>Para nasıl çekilir?</b>',
+            'a4': 'Minimum 20 ₺ ile para çekim sistemi yakında aktif olacak.',
+            'q5': '📢 <b>Kanal zorunluluğu nedir?</b>',
+            'a5': f'Botu kullanmak için @{MANDATORY_CHANNEL} kanalına katılmalısın.'
         },
+        
+        # Para Çekme
         'withdraw': {
-            'title': '💸 PARA ÇEK',
-            'coming_soon': '🛠 Para Çekme sistemi çok yakında aktif edilecektir!'
+            'title': '💸 <b>PARA ÇEKME</b>',
+            'soon_message': 'Para çekme sistemi çok yakında aktif edilecektir.\n\n• Minimum çekim: 20 ₺\n• İşlem süresi: 24 saat\n• Yöntemler: Papara, Banka Havalesi\n\nLütfen kısa bir süre bekleyin.'
+        },
+        
+        # Referans
+        'referral': {
+            'title': '👥 <b>REFERANS SİSTEMİ</b>',
+            'earn_per_ref': '💰 <b>Her referans:</b> 1 ₺',
+            'total_refs': '👤 <b>Toplam referans:</b>',
+            'total_earned': '📈 <b>Referans kazancı:</b>',
+            'your_link': '🔗 <b>Referans linkin:</b>',
+            'bonus_tiers': '🎁 <b>REFERANS BONUSLARI:</b>',
+            'bonus_5': '• 5 referans: +2 ₺',
+            'bonus_10': '• 10 referans: +5 ₺',
+            'bonus_25': '• 25 referans: +15 ₺',
+            'bonus_50': '• 50 referans: +35 ₺',
+            'how_it_works': '💡 <b>Nasıl çalışır?</b>',
+            'step1': '1. Linkini paylaş',
+            'step2': '2. Biri linkten katılır',
+            'step3': '3. 1 ₺ kazanırsın',
+            'step4': '4. Bonusları topla'
         }
     },
+    
     'az': {
+        # Ana Menü
         'main_menu': {
-            'title': '🤖 TAPŞIRIQ EDƏM',
-            'welcome': 'Salam {name}!',
-            'total_balance': '💰 Ümumi Balans:',
-            'normal_balance': '• Normal:',
-            'ad_balance': '• Reklam:',
-            'tasks_completed': '🎯 Tapşırıq:',
-            'refs': '👥 Ref:',
-            'channel': '📢 Kanal:',
-            'start_now': 'Dərhal başla!'
+            'title': '🚀 <b>TAPŞIRIQ EDƏM BOT</b>',
+            'welcome': '👋 <b>Salam {name}!</b>',
+            'balance_section': '💰 <b>BALANS VƏZİYYƏTİ</b>',
+            'stats_section': '📊 <b>STATİSTİKA</b>',
+            'total_balance': '• Ümumi Balans:',
+            'normal_balance': '• Normal Balans:',
+            'ad_balance': '• Reklam Balansı:',
+            'tasks_completed': '• Tamamlanan Tapşırıq:',
+            'referrals': '• Referans Sayı:',
+            'channel_info': '📢 <b>Məcburi Kanal:</b>',
+            'start_action': '⚡ <i>Aşağıdakı düymələrdən əməliyyatını seç!</i>'
         },
+        
+        # Butonlar
         'buttons': {
             'do_task': '🤖 TAPŞIRIQ ET',
             'create_task': '📢 TAPŞIRIQ YARAT',
-            'my_balance': '💰 BALANS',
-            'referrals': '👥 REFERANS',
+            'my_balance': '💰 BALANSIM',
+            'referrals': '👥 REFERANSLARIM',
             'deposit': '💳 BALANS ARTIR',
-            'ad_balance': '🔄 REKLAM BALANSI',
+            'ad_balance': '🔄 ÇEVİR ET',
             'withdraw': '💸 PUL ÇIXART',
-            'support': '🛠 TEKNİK DƏSTƏK',
-            'faq': '❓ MƏLUMAT',
+            'support': '🛠 DƏSTƏK',
+            'faq': '❓ KÖMƏK',
             'language': '🌐 DİL',
-            'back_menu': '🏠 MENYU',
-            'admin_panel': '👑 ADMIN'
+            'back_menu': '🏠 ƏSAS MENYU',
+            'refresh': '🔄 YENİLƏ',
+            'copy': '📋 KOPYALA',
+            'confirm': '✅ TƏSDİQLƏ',
+            'cancel': '❌ LƏĞV ET'
         },
-        'tasks': {
-            'select_task': 'TAPŞIRIQ SEÇ',
-            'bot_task': '🤖 BOT ({price} ₺)',
-            'channel_task': '📢 KANAL ({price} ₺)',
-            'group_task': '👥 QRUPPA ({price} ₺)',
-            'choose_one': 'Birini seç:'
-        },
+        
+        # Bakiye Yükleme
         'deposit': {
-            'title': '💳 BALANS ARTIR',
-            'select_amount': 'Hansı məbləği yükləmək istəyirsən?',
-            'custom_amount': '💳 Xüsusi Məbləğ',
-            'enter_amount': 'Yükləmək istədiyin TRX məbləğini yaz:',
-            'min_amount': 'Minimum: 2 TRX',
-            'trx_address': 'TRX Cüzdan Ünvanı:',
-            'send_exact': 'Zəhmət olmazsa TAM {amount} TRX göndər:',
-            'enter_txid': 'Əməliyyat tamamlandıqda TXID/Hash nömrəsini buraya yaz:',
-            'verifying': '✅ Ödəniş yoxlanılır...',
-            'success': '✅ Ödəniş Təsdiqləndi!',
-            'failed': '❌ Ödəniş tapılmadı. TXID-i yoxlayın.'
+            'title': '💳 <b>BALANS ARTIRMA</b>',
+            'soon_title': '⏳ <b>TEZLİKDA AKTİV!</b>',
+            'soon_message': 'Balans artırma sistemi tezlikdə aktiv ediləcək.\n\nÖdəniş üsulları:\n• Papara\n• Kripto Valyuta (TRX, USDT)\n• Bank köçürməsi\n\nZəhmət olmasa qısa müddət gözləyin.',
+            'back_button': '🔙 Əsas Menyaya Qayıt'
         },
-        'ad_balance': {
-            'title': '🔄 REKLAM BALANSI',
-            'normal_balance': '💰 Normal Balans:',
-            'ad_balance': '💰 Reklam Balansı:',
-            'bonus_25': '🎁 %25 BONUS! Normal balansını reklam balansına çevir, %25 bonus qazan!',
-            'example': 'Nümunə: 100 ₺ normal balans → 125 ₺ reklam balansı',
-            'select_amount': 'Çevirmək istədiyin məbləği seç:',
-            'custom': 'Digər',
-            'converted': '✅ BALANS ÇEVRİLDİ!',
-            'converted_amount': '💰 Çevrilən:',
-            'bonus': '🎁 Bonus (%25):',
-            'total_ad': '💰 Ümumi Reklam Balansı:',
-            'new_status': '💳 Yeni Vəziyyət:',
-            'create_task_now': '🎯 İndi tapşırıq yarada bilərsən!'
+        
+        # Görevler
+        'tasks': {
+            'select_type': '📋 <b>TAPŞIRIQ NÖVÜ SEÇİMİ</b>',
+            'bot_task': '🤖 BOT TAPŞIRIĞI ({price} ₺)',
+            'channel_task': '📢 KANAL TAPŞIRIĞI ({price} ₺)',
+            'group_task': '👥 QRUPPA TAPŞIRIĞI ({price} ₺)',
+            'no_tasks': '📭 <b>Hal-hazırda tapşırıq yoxdur</b>',
+            'create_your_own': '💡 Öz tapşırığını yarada bilərsən!',
+            'instructions': '📌 <b>TƏLİMATLAR:</b>\n1. "GET" düyməsinə toxun\n2. Tapşırığı tamamla\n3. 3 dəqiqə gözlə\n4. "TAMAMLA" düyməsinə bas'
         },
+        
+        # Destek
         'support': {
-            'title': '🛠 TEKNİK DƏSTƏK',
-            'contact': 'Problemleriniz üçün: @AlperenTHE',
-            'ticket_system': '📝 Bilet sistemi tezliklə aktiv!',
-            'response_time': '⏰ Cavab müddəti: 24 saat'
+            'title': '🛠 <b>TEKNİK DƏSTƏK</b>',
+            'contact': '📞 <b>Əlaqə:</b> @AlperenTHE',
+            'ticket_system': '🎫 <b>Bilet Sistemi:</b> Tezliklə aktiv!',
+            'response_time': '⏰ <b>Cavab Müddəti:</b> 24 saat',
+            'user_id': '🆔 <b>İstifadəçi ID:</b>'
         },
+        
+        # SSS
         'faq': {
-            'title': '❓ TEZ-TEZ VERİLƏN SUALLAR',
-            'q1': '❓ <b>Balans necə yüklənir?</b>',
-            'a1': '💳 "BALANS ARTIR" düyməsinə toxun → TRX məbləğini seç → TRX göndər → TXID yaz.',
-            'q2': '❓ <b>Tapşırıq necə edilir?</b>',
-            'a2': '🤖 "TAPŞIRIQ ET" düyməsi → tapşırıq seç → linkə get → 3 dəqiqə gözlə → TAMAMLA.',
-            'q3': '❓ <b>Ödəniş nə zaman gəlir?</b>',
-            'a3': '⚡ TRX ödənişləri 1-5 dəqiqə ərzində avtomatik təsdiqlənir.',
-            'q4': '❓ <b>Reklam balansı nədir?</b>',
-            'a4': '🔄 Tapşırıq yaratmaq üçün istifadə olunan xüsusi balansdır. %25 bonusla çevrilir.',
-            'q5': '❓ <b>Minimum pul çıxarma nədir?</b>',
-            'a5': '💸 Minimum pul çıxarma: 20 ₺ (sistem tezliklə aktiv).'
+            'title': '❓ <b>TEZ-TEZ VERİLƏN SUALLAR</b>',
+            'q1': '💰 <b>Balans necə yüklənir?</b>',
+            'a1': 'Balans artırma sistemi tezlikdə aktiv olacaq. Papara və kripto valyuta seçimləri ilə balans artıra biləcəksiniz.',
+            'q2': '🤖 <b>Tapşırıq necə edilir?</b>',
+            'a2': '1. "TAPŞIRIQ ET" düyməsinə toxun\n2. Tapşırıq seç\n3. Linkə get və tapşırığı tamamla\n4. 3 dəqiqə gözlə və tamamla',
+            'q3': '🎁 <b>Bonus sistemi nədir?</b>',
+            'a3': '• Hər referans üçün 1 ₺\n• Tapşırıq tamamlayaraq pul qazan\n• Xüsusi bonus kampaniyaları',
+            'q4': '💸 <b>Pul necə çıxarılır?</b>',
+            'a4': 'Minimum 20 ₺ ilə pul çıxarış sistemi tezlikdə aktiv olacaq.',
+            'q5': '📢 <b>Kanal məcburiyyəti nədir?</b>',
+            'a5': f'Botu istifadə etmək üçün @{MANDATORY_CHANNEL} kanalına qoşulmalısınız.'
         },
+        
+        # Para Çekme
         'withdraw': {
-            'title': '💸 PUL ÇIXART',
-            'coming_soon': '🛠 Pul çıxarışı sistemi tezliklə aktiv ediləcək!'
+            'title': '💸 <b>PUL ÇIXARTMA</b>',
+            'soon_message': 'Pul çıxarışı sistemi tezlikdə aktiv ediləcək.\n\n• Minimum çıxarma: 20 ₺\n• Əməliyyat müddəti: 24 saat\n• Üsullar: Papara, Bank köçürməsi\n\nZəhmət olmasa qısa müddət gözləyin.'
+        },
+        
+        # Referans
+        'referral': {
+            'title': '👥 <b>REFERANS SİSTEMİ</b>',
+            'earn_per_ref': '💰 <b>Hər referans:</b> 1 ₺',
+            'total_refs': '👤 <b>Ümumi referans:</b>',
+            'total_earned': '📈 <b>Referans qazancı:</b>',
+            'your_link': '🔗 <b>Referans linkin:</b>',
+            'bonus_tiers': '🎁 <b>REFERANS BONUSLARI:</b>',
+            'bonus_5': '• 5 referans: +2 ₺',
+            'bonus_10': '• 10 referans: +5 ₺',
+            'bonus_25': '• 25 referans: +15 ₺',
+            'bonus_50': '• 50 referans: +35 ₺',
+            'how_it_works': '💡 <b>Necə işləyir?</b>',
+            'step1': '1. Linkini paylaş',
+            'step2': '2. Biri linkdən qoşulur',
+            'step3': '3. 1 ₺ qazanırsan',
+            'step4': '4. Bonusları topla'
         }
     }
 }
 
-# ================= 3. VERİTABANI =================
-def get_db():
-    conn = sqlite3.connect('gorev_bot_v13.db', check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    with get_db() as conn:
-        cursor = conn.cursor()
-        
-        # Kullanıcılar tablosu (dil tercihi eklendi)
-        cursor.execute('''CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            language TEXT DEFAULT 'tr',
-            balance REAL DEFAULT 0.0,
-            ad_balance REAL DEFAULT 0.0,
-            total_earned REAL DEFAULT 0.0,
-            tasks_completed INTEGER DEFAULT 0,
-            referrals INTEGER DEFAULT 0,
-            ref_earned REAL DEFAULT 0.0,
-            daily_streak INTEGER DEFAULT 0,
-            last_daily TIMESTAMP,
-            last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            joined_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            channel_joined INTEGER DEFAULT 0,
-            welcome_bonus INTEGER DEFAULT 0
-        )''')
-        
-        # Görevler tablosu
-        cursor.execute('''CREATE TABLE IF NOT EXISTS tasks (
-            task_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            task_type TEXT,
-            title TEXT,
-            link TEXT,
-            description TEXT,
-            cost_per_view REAL,
-            max_views INTEGER,
-            views INTEGER DEFAULT 0,
-            cost_spent REAL DEFAULT 0.0,
-            status TEXT DEFAULT 'active',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )''')
-        
-        # Görev tamamlamalar
-        cursor.execute('''CREATE TABLE IF NOT EXISTS completions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            task_id INTEGER,
-            user_id INTEGER,
-            earned REAL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )''')
-        
-        # Referanslar
-        cursor.execute('''CREATE TABLE IF NOT EXISTS referrals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            referrer_id INTEGER,
-            referred_id INTEGER,
-            earned REAL DEFAULT 1.0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )''')
-        
-        # TRX Ödemeleri (YENİ)
-        cursor.execute('''CREATE TABLE IF NOT EXISTS trx_deposits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            trx_amount REAL,
-            try_amount REAL,
-            txid TEXT UNIQUE,
-            bonus_percent INTEGER DEFAULT 25,
-            bonus_amount REAL DEFAULT 0.0,
-            total_ad_balance REAL,
-            status TEXT DEFAULT 'pending',
-            verified_at TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )''')
-        
-        # Bakiye çevrimleri
-        cursor.execute('''CREATE TABLE IF NOT EXISTS conversions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            from_balance REAL,
-            to_ad_balance REAL,
-            bonus REAL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )''')
-        
-        conn.commit()
-
-init_db()
-
-# ================= 4. TRX SİSTEMİ FONKSİYONLARI =================
-def get_trx_price():
-    """Canlı TRX/TRY fiyatını al"""
-    try:
-        response = requests.get(BINANCE_API, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            return float(data['price'])
-    except:
-        try:
-            response = requests.get(COINGECKO_API, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                return float(data['tron']['try'])
-        except:
-            pass
-    
-    # Fallback değer
-    return 0.35  # Yaklaşık TRX/TRY fiyatı
-
-def calculate_trx_to_try(trx_amount):
-    """TRX miktarını TL'ye çevir"""
-    trx_price = get_trx_price()
-    return trx_amount * trx_price
-
-def calculate_bonus(trx_amount):
-    """Bonus hesapla"""
-    if trx_amount >= 15:
-        return 50  # %50 bonus
-    elif trx_amount >= 2:
-        return 25  # %25 bonus
-    return 0
-
-def verify_trx_transaction(txid):
-    """TRX işlemini doğrula (TronGrid API)"""
-    try:
-        # Bu kısım TronGrid API entegrasyonu gerektirir
-        # Şimdilik manuel onay simülasyonu
-        # Gerçek implementasyon için:
-        # 1. TronGrid API key alın
-        # 2. requests ile transaction verify edin
-        
-        # Geçici olarak her TXID'i doğru kabul et
-        return {
-            'verified': True,
-            'amount': 10,  # Örnek miktar
-            'to_address': TRX_WALLET
-        }
-    except:
-        return {'verified': False}
-
-# ================= 5. DİL FONKSİYONLARI =================
-def get_user_language(user_id):
-    """Kullanıcının dil tercihini getir"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT language FROM users WHERE user_id = ?", (user_id,))
-        result = cursor.fetchone()
-        return result['language'] if result else 'tr'
-
-def set_user_language(user_id, language):
-    """Kullanıcının dil tercihini ayarla"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE users SET language = ? WHERE user_id = ?", (language, user_id))
-        conn.commit()
-
-def t(user_id, key_path):
+def get_translation(lang: str, key_path: str) -> str:
     """Çeviri metnini getir"""
-    lang = get_user_language(user_id)
-    keys = key_path.split('.')
-    
-    current = TRANSLATIONS[lang]
-    for key in keys:
-        if key in current:
-            current = current[key]
-        else:
-            # Fallback to Turkish
-            current = TRANSLATIONS['tr']
-            for k in keys:
-                if k in current:
-                    current = current[k]
-                else:
-                    return f"[{key_path}]"
-            break
-    
-    return current if isinstance(current, str) else str(current)
-
-# ================= 6. TEMEL FONKSİYONLAR (GÜNCELLENDİ) =================
-def format_money(num):
-    """Para formatı"""
-    return f"{float(num):,.2f} ₺"
-
-def kanal_kontrol(user_id):
-    """Kanal üyeliği kontrolü"""
     try:
-        member = bot.get_chat_member("@" + ZORUNLU_KANAL, user_id)
-        is_member = member.status in ['member', 'administrator', 'creator']
+        keys = key_path.split('.')
+        current = TRANSLATIONS.get(lang, TRANSLATIONS['tr'])
         
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''UPDATE users SET 
-                           channel_joined = ?
-                           WHERE user_id = ?''', 
-                           (1 if is_member else 0, user_id))
-            conn.commit()
+        for key in keys:
+            current = current[key]
         
-        return is_member
+        return str(current) if not isinstance(current, dict) else str(current)
     except:
+        return f"[{key_path}]"
+
+# ================= 7. FIRESTORE İŞLEMLERİ =================
+async def get_user(user_id: int) -> Optional[Dict]:
+    """Kullanıcı bilgilerini getir"""
+    try:
+        # Cache kontrol
+        cache_key = f"user_{user_id}"
+        if cache_key in user_cache:
+            return user_cache[cache_key]
+        
+        if db:
+            user_ref = db.collection('users').document(str(user_id))
+            user_doc = await user_ref.get()
+            
+            if user_doc.exists:
+                user_data = user_doc.to_dict()
+                user_data['id'] = str(user_id)
+                user_cache[cache_key] = user_data
+                return user_data
+        else:
+            # Local data
+            user_data = {
+                'id': str(user_id),
+                'first_name': '',
+                'username': '',
+                'language': 'tr',
+                'balance': 0.0,
+                'ad_balance': 0.0,
+                'tasks_completed': 0,
+                'referrals': 0,
+                'ref_earned': 0.0,
+                'total_earned': 0.0,
+                'channel_joined': False,
+                'welcome_bonus': False
+            }
+            user_cache[cache_key] = user_data
+            return user_data
+            
+    except Exception as e:
+        print(f"Kullanıcı getirme hatası: {e}")
+        return None
+
+async def create_or_update_user(user_id: int, user_data: Dict) -> bool:
+    """Kullanıcı oluştur veya güncelle"""
+    try:
+        if db:
+            user_ref = db.collection('users').document(str(user_id))
+            await user_ref.set(user_data, merge=True)
+        else:
+            # Local storage
+            cache_key = f"user_{user_id}"
+            user_cache[cache_key] = user_data
+        
+        return True
+    except Exception as e:
+        print(f"Kullanıcı güncelleme hatası: {e}")
         return False
 
-def get_user(user_id):
-    """Kullanıcı bilgisi"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-        return cursor.fetchone()
-
-def create_user(user_id, username, first_name):
-    """Yeni kullanıcı oluştur"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''INSERT OR IGNORE INTO users 
-                       (user_id, username, first_name, balance, ad_balance) 
-                       VALUES (?, ?, ?, 0.0, 0.0)''', 
-                       (user_id, username, first_name))
-        conn.commit()
-
-def update_balance(user_id, amount, balance_type='balance'):
+async def update_balance(user_id: int, amount: float, balance_type: str = 'balance') -> bool:
     """Bakiye güncelle"""
-    with get_db() as conn:
-        cursor = conn.cursor()
+    try:
+        user = await get_user(user_id)
+        if not user:
+            return False
         
         if balance_type == 'ad_balance':
-            if amount > 0:
-                cursor.execute('''UPDATE users SET 
-                               ad_balance = ad_balance + ?,
-                               last_active = CURRENT_TIMESTAMP
-                               WHERE user_id = ?''', 
-                               (amount, user_id))
-            else:
-                cursor.execute('''UPDATE users SET 
-                               ad_balance = ad_balance + ?,
-                               last_active = CURRENT_TIMESTAMP
-                               WHERE user_id = ?''', 
-                               (amount, user_id))
+            new_balance = user.get('ad_balance', 0) + amount
+            update_data = {'ad_balance': new_balance}
         else:
-            if amount > 0:
-                cursor.execute('''UPDATE users SET 
-                               balance = balance + ?,
-                               total_earned = total_earned + ?,
-                               last_active = CURRENT_TIMESTAMP
-                               WHERE user_id = ?''', 
-                               (amount, amount, user_id))
-            else:
-                cursor.execute('''UPDATE users SET 
-                               balance = balance + ?,
-                               last_active = CURRENT_TIMESTAMP
-                               WHERE user_id = ?''', 
-                               (amount, user_id))
-        conn.commit()
+            new_balance = user.get('balance', 0) + amount
+            total_earned = user.get('total_earned', 0) + max(amount, 0)
+            update_data = {
+                'balance': new_balance,
+                'total_earned': total_earned
+            }
+        
+        await create_or_update_user(user_id, update_data)
+        
+        # Cache'i temizle
+        cache_key = f"user_{user_id}"
+        if cache_key in user_cache:
+            del user_cache[cache_key]
+        
+        return True
+    except Exception as e:
+        print(f"Bakiye güncelleme hatası: {e}")
+        return False
 
-def get_total_balance(user_id):
-    """Toplam bakiye (normal + reklam)"""
-    user = get_user(user_id)
-    return user['balance'] + user['ad_balance']
+# ================= 8. KANAL KONTROLÜ =================
+def check_channel_membership(user_id: int) -> bool:
+    """Kanal üyeliğini kontrol et"""
+    try:
+        from telebot import TeleBot
+        temp_bot = TeleBot(TOKEN)
+        member = temp_bot.get_chat_member(f"@{MANDATORY_CHANNEL}", user_id)
+        return member.status in ['member', 'administrator', 'creator']
+    except Exception as e:
+        print(f"Kanal kontrol hatası: {e}")
+        return False
 
-# ================= 7. ANA MENÜ (GÜNCELLENDİ) =================
-def show_main_menu(user_id, message_id=None):
-    """Ana menü"""
-    user = get_user(user_id)
-    
+# ================= 9. ANA MENÜ SİSTEMİ =================
+async def show_main_menu(user_id: int, message_id: int = None, edit: bool = True):
+    """Ana menü göster"""
+    user = await get_user(user_id)
     if not user:
-        create_user(user_id, "", "")
-        user = get_user(user_id)
+        # Varsayılan kullanıcı oluştur
+        user = {
+            'id': str(user_id),
+            'first_name': 'Kullanıcı',
+            'balance': 0.0,
+            'ad_balance': 0.0,
+            'tasks_completed': 0,
+            'referrals': 0,
+            'language': 'tr'
+        }
+        await create_or_update_user(user_id, user)
     
-    total_balance = get_total_balance(user_id)
-    lang = get_user_language(user_id)
+    lang = user.get('language', 'tr')
+    t = lambda key: get_translation(lang, key)
     
+    total_balance = user.get('balance', 0) + user.get('ad_balance', 0)
+    
+    # Modern buton düzeni
     markup = types.InlineKeyboardMarkup(row_width=2)
     
-    # Ana butonlar
+    # 1. Satır - Ana İşlemler
     markup.add(
-        types.InlineKeyboardButton(t(user_id, 'buttons.do_task'), callback_data="do_task"),
-        types.InlineKeyboardButton(t(user_id, 'buttons.my_balance') + " " + format_money(total_balance), callback_data="my_balance")
+        types.InlineKeyboardButton(t('buttons.do_task'), callback_data="do_task"),
+        types.InlineKeyboardButton(t('buttons.create_task'), callback_data="create_task_menu")
     )
     
+    # 2. Satır - Bakiye İşlemleri
     markup.add(
-        types.InlineKeyboardButton(t(user_id, 'buttons.create_task'), callback_data="create_task_menu"),
-        types.InlineKeyboardButton(t(user_id, 'buttons.referrals'), callback_data="my_refs")
+        types.InlineKeyboardButton(t('buttons.my_balance'), callback_data="my_balance"),
+        types.InlineKeyboardButton(t('buttons.deposit'), callback_data="deposit_menu")
     )
     
+    # 3. Satır - Ekstra İşlemler
     markup.add(
-        types.InlineKeyboardButton(t(user_id, 'buttons.deposit'), callback_data="deposit_menu"),
-        types.InlineKeyboardButton(t(user_id, 'buttons.ad_balance'), callback_data="ad_balance_menu")
+        types.InlineKeyboardButton(t('buttons.referrals'), callback_data="my_refs"),
+        types.InlineKeyboardButton(t('buttons.ad_balance'), callback_data="ad_balance_menu")
     )
     
-    # Alt butonlar
+    # 4. Satır - Yardım ve Ayarlar
     markup.add(
-        types.InlineKeyboardButton(t(user_id, 'buttons.withdraw'), callback_data="withdraw_menu"),
-        types.InlineKeyboardButton(t(user_id, 'buttons.support'), callback_data="support_menu")
+        types.InlineKeyboardButton(t('buttons.support'), callback_data="support_menu"),
+        types.InlineKeyboardButton(t('buttons.faq'), callback_data="faq_menu"),
+        types.InlineKeyboardButton(t('buttons.language'), callback_data="language_menu")
     )
     
+    # 5. Satır - Özel İşlemler
     markup.add(
-        types.InlineKeyboardButton(t(user_id, 'buttons.faq'), callback_data="faq_menu"),
-        types.InlineKeyboardButton(t(user_id, 'buttons.language'), callback_data="language_menu")
+        types.InlineKeyboardButton(t('buttons.withdraw'), callback_data="withdraw_menu"),
+        types.InlineKeyboardButton(t('buttons.refresh'), callback_data="refresh_main")
     )
     
-    # Admin butonu (sadece admin için)
+    # Admin butonu
     if user_id == ADMIN_ID:
-        markup.add(types.InlineKeyboardButton(t(user_id, 'buttons.admin_panel'), callback_data="admin_panel"))
+        markup.add(types.InlineKeyboardButton("👑 ADMIN", callback_data="admin_panel"))
     
-    text = f"""<b>{t(user_id, 'main_menu.title')}</b>
+    # Mesaj oluştur
+    message = f"""
+{t('main_menu.title')}
 
-{t(user_id, 'main_menu.welcome').format(name=user['first_name'])}
+{t('main_menu.welcome').format(name=user.get('first_name', 'Kullanıcı'))}
 
-💰 <b>{t(user_id, 'main_menu.total_balance')}</b> {format_money(total_balance)}
-• {t(user_id, 'main_menu.normal_balance')} {format_money(user['balance'])}
-• {t(user_id, 'main_menu.ad_balance')} {format_money(user['ad_balance'])}
+<b>─────────────────────</b>
 
-🎯 <b>{t(user_id, 'main_menu.tasks_completed')}</b> {user['tasks_completed']}
-👥 <b>{t(user_id, 'main_menu.refs')}</b> {user['referrals']}
+{t('main_menu.balance_section')}
+• {t('main_menu.total_balance')} <code>{total_balance:.2f} ₺</code>
+• {t('main_menu.normal_balance')} <code>{user.get('balance', 0):.2f} ₺</code>
+• {t('main_menu.ad_balance')} <code>{user.get('ad_balance', 0):.2f} ₺</code>
 
-📢 <b>{t(user_id, 'main_menu.channel')}</b> @{ZORUNLU_KANAL}
+<b>─────────────────────</b>
 
-{t(user_id, 'main_menu.start_now')}"""
+{t('main_menu.stats_section')}
+• {t('main_menu.tasks_completed')} <code>{user.get('tasks_completed', 0)}</code>
+• {t('main_menu.referrals')} <code>{user.get('referrals', 0)}</code>
+
+<b>─────────────────────</b>
+
+{t('main_menu.channel_info')} @{MANDATORY_CHANNEL}
+
+{t('main_menu.start_action')}
+"""
     
-    if message_id:
-        bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
-    else:
-        bot.send_message(user_id, text, reply_markup=markup)
+    try:
+        if edit and message_id:
+            await bot.edit_message_text(
+                chat_id=user_id,
+                message_id=message_id,
+                text=message,
+                reply_markup=markup
+            )
+        else:
+            await bot.send_message(
+                user_id,
+                message,
+                reply_markup=markup
+            )
+    except Exception as e:
+        print(f"Menü gönderme hatası: {e}")
 
-# ================= 8. START KOMUTU (GÜNCELLENDİ) =================
-@bot.message_handler(commands=['start'])
-def start_command(message):
+# ================= 10. START KOMUTU =================
+@bot.message_handler(commands=['start', 'menu', 'yardım', 'help'])
+async def handle_start(message):
     user_id = message.from_user.id
     first_name = message.from_user.first_name or "Kullanıcı"
-    
-    # Kullanıcı oluştur veya kontrol et
-    create_user(user_id, message.from_user.username, first_name)
-    user = get_user(user_id)
-    
-    # Referans kontrolü
-    ref_used = False
-    if len(message.text.split()) > 1:
-        param = message.text.split()[1]
-        if param.startswith('ref_'):
-            try:
-                referrer_id = int(param.replace('ref_', ''))
-                if referrer_id != user_id:
-                    # Referans ekleme fonksiyonu
-                    pass
-            except:
-                pass
+    username = message.from_user.username or ""
     
     # Kanal kontrolü
-    if not kanal_kontrol(user_id):
+    is_member = check_channel_membership(user_id)
+    
+    # Kullanıcı bilgilerini al/güncelle
+    user = await get_user(user_id)
+    if not user:
+        user_data = {
+            'first_name': first_name,
+            'username': username,
+            'channel_joined': is_member,
+            'language': 'tr',
+            'balance': 0.0,
+            'ad_balance': 0.0,
+            'welcome_bonus': False,
+            'created_at': datetime.now().isoformat()
+        }
+        await create_or_update_user(user_id, user_data)
+        user = await get_user(user_id)
+    
+    # Hoşgeldin bonusu (sadece ilk kez)
+    if user and not user.get('welcome_bonus', False):
+        await update_balance(user_id, 2.0)
+        await create_or_update_user(user_id, {'welcome_bonus': True})
+        
+        welcome_msg = f"""
+🎉 <b>Hoş Geldin {first_name}!</b>
+
+✅ <b>2 ₺ Hoşgeldin Bonusu</b> hesabına yüklendi!
+💰 <b>Yeni Bakiyen:</b> 2.00 ₺
+
+<i>Hemen görev yapmaya başlayabilirsin!</i>
+"""
+        await bot.send_message(user_id, welcome_msg)
+    
+    # Kanal kontrolü yap
+    if not is_member:
         markup = types.InlineKeyboardMarkup()
-        markup.add(
-            types.InlineKeyboardButton("📢 KANALA KATIL", url=f"https://t.me/{ZORUNLU_KANAL}"),
+        markup.row(
+            types.InlineKeyboardButton("📢 KANALA KATIL", url=f"https://t.me/{MANDATORY_CHANNEL}")
+        )
+        markup.row(
             types.InlineKeyboardButton("✅ KATILDIM", callback_data="check_join")
         )
         
-        welcome_text = f"""Merhaba {first_name}!
+        channel_msg = f"""
+👋 <b>Merhaba {first_name}!</b>
 
-Botu kullanmak için kanala katıl:
+Botu kullanabilmek için aşağıdaki kanala katılman gerekiyor:
 
-@{ZORUNLU_KANAL}
+👉 @{MANDATORY_CHANNEL}
 
-Katıldıktan sonra "✅ KATILDIM" butonuna bas."""
-        
-        bot.send_message(user_id, welcome_text, reply_markup=markup)
+<b>Katıldıktan sonra "✅ KATILDIM" butonuna bas.</b>
+
+⚠️ <i>Kanalı terk edersen botu kullanamazsın!</i>
+"""
+        await bot.send_message(user_id, channel_msg, reply_markup=markup)
         return
     
-    # Ana menü
-    show_main_menu(user_id)
+    # Ana menüyü göster
+    await show_main_menu(user_id)
 
-# ================= 9. DİL SEÇİMİ MENÜSÜ =================
-def show_language_menu(user_id, message_id):
+# ================= 11. CALLBACK HANDLER =================
+@bot.callback_query_handler(func=lambda call: True)
+async def handle_callback(call):
+    user_id = call.from_user.id
+    data = call.data
+    
+    try:
+        # Kanal kontrolü (bazı özel durumlar hariç)
+        if data not in ["check_join", "set_lang_tr", "set_lang_az"]:
+            if not check_channel_membership(user_id):
+                await bot.answer_callback_query(
+                    call.id,
+                    "❌ Önce kanala katıl! @{}".format(MANDATORY_CHANNEL),
+                    show_alert=True
+                )
+                return
+        
+        # Callback işlemleri
+        if data == "check_join":
+            if check_channel_membership(user_id):
+                await create_or_update_user(user_id, {'channel_joined': True})
+                await show_main_menu(user_id, call.message.message_id)
+                await bot.answer_callback_query(call.id, "✅ Başarılı!")
+            else:
+                await bot.answer_callback_query(
+                    call.id,
+                    "❌ Hala kanala katılmadın!",
+                    show_alert=True
+                )
+        
+        elif data == "refresh_main":
+            await show_main_menu(user_id, call.message.message_id)
+            await bot.answer_callback_query(call.id, "🔄 Yenilendi!")
+        
+        elif data == "back_menu":
+            await show_main_menu(user_id, call.message.message_id)
+        
+        elif data == "deposit_menu":
+            await show_deposit_menu(user_id, call.message.message_id)
+        
+        elif data == "withdraw_menu":
+            await show_withdraw_menu(user_id, call.message.message_id)
+        
+        elif data.startswith("set_lang_"):
+            lang = data.replace("set_lang_", "")
+            await create_or_update_user(user_id, {'language': lang})
+            await bot.answer_callback_query(call.id, f"✅ Dil {lang} olarak ayarlandı!")
+            await show_main_menu(user_id, call.message.message_id)
+        
+        elif data == "language_menu":
+            await show_language_menu(user_id, call.message.message_id)
+        
+        elif data == "support_menu":
+            await show_support_menu(user_id, call.message.message_id)
+        
+        elif data == "faq_menu":
+            await show_faq_menu(user_id, call.message.message_id)
+        
+        elif data == "my_balance":
+            await show_balance_details(user_id, call.message.message_id)
+        
+        elif data == "do_task":
+            await show_task_selection(user_id, call.message.message_id)
+        
+        elif data == "create_task_menu":
+            await show_create_task_menu(user_id, call.message.message_id)
+        
+        elif data == "my_refs":
+            await show_referral_info(user_id, call.message.message_id)
+        
+        elif data == "ad_balance_menu":
+            await show_ad_balance_conversion(user_id, call.message.message_id)
+        
+        elif data == "admin_panel" and user_id == ADMIN_ID:
+            await show_admin_panel(user_id, call.message.message_id)
+        
+        elif data.startswith("copy_"):
+            await bot.answer_callback_query(call.id, "✅ Kopyalandı!")
+        
+    except Exception as e:
+        print(f"Callback hatası: {e}")
+        await bot.answer_callback_query(call.id, "❌ Bir hata oluştu!")
+
+# ================= 12. BAKİYE YÜKLEME MENÜSÜ =================
+async def show_deposit_menu(user_id: int, message_id: int = None):
+    """Bakiye yükleme menüsü (yakında aktif)"""
+    user = await get_user(user_id)
+    lang = user.get('language', 'tr')
+    t = lambda key: get_translation(lang, key)
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton(t('buttons.back_menu'), callback_data="back_menu"))
+    
+    message = f"""
+{t('deposit.title')}
+
+<b>─────────────────────</b>
+
+{t('deposit.soon_title')}
+
+<b>─────────────────────</b>
+
+{t('deposit.soon_message')}
+
+<b>─────────────────────</b>
+
+💡 <b>Öneri:</b> Şimdilik görev yaparak para kazanabilirsin!
+"""
+    
+    try:
+        if message_id:
+            await bot.edit_message_text(
+                chat_id=user_id,
+                message_id=message_id,
+                text=message,
+                reply_markup=markup
+            )
+        else:
+            await bot.send_message(user_id, message, reply_markup=markup)
+    except Exception as e:
+        print(f"Deposit menu hatası: {e}")
+
+# ================= 13. PARA ÇEKME MENÜSÜ =================
+async def show_withdraw_menu(user_id: int, message_id: int = None):
+    """Para çekme menüsü (yakında aktif)"""
+    user = await get_user(user_id)
+    lang = user.get('language', 'tr')
+    t = lambda key: get_translation(lang, key)
+    
+    user_data = await get_user(user_id)
+    current_balance = user_data.get('balance', 0) if user_data else 0
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton(t('buttons.back_menu'), callback_data="back_menu"))
+    
+    message = f"""
+{t('withdraw.title')}
+
+<b>─────────────────────</b>
+
+💰 <b>Mevcut Bakiye:</b> <code>{current_balance:.2f} ₺</code>
+
+<b>─────────────────────</b>
+
+{t('withdraw.soon_message')}
+
+<b>─────────────────────</b>
+
+💡 <b>İpucu:</b> Bakiyeni reklam bakiyesine çevirip görev oluşturabilirsin!
+"""
+    
+    try:
+        if message_id:
+            await bot.edit_message_text(
+                chat_id=user_id,
+                message_id=message_id,
+                text=message,
+                reply_markup=markup
+            )
+        else:
+            await bot.send_message(user_id, message, reply_markup=markup)
+    except Exception as e:
+        print(f"Withdraw menu hatası: {e}")
+
+# ================= 14. DİL SEÇİM MENÜSÜ =================
+async def show_language_menu(user_id: int, message_id: int = None):
     """Dil seçim menüsü"""
-    current_lang = get_user_language(user_id)
+    user = await get_user(user_id)
+    current_lang = user.get('language', 'tr') if user else 'tr'
     
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
-        types.InlineKeyboardButton("🇹🇷 Türkçe" + (" ✅" if current_lang == 'tr' else ""), callback_data="set_lang_tr"),
-        types.InlineKeyboardButton("🇦🇿 Azərbaycan" + (" ✅" if current_lang == 'az' else ""), callback_data="set_lang_az")
+        types.InlineKeyboardButton(
+            "🇹🇷 Türkçe" + (" ✅" if current_lang == 'tr' else ""),
+            callback_data="set_lang_tr"
+        ),
+        types.InlineKeyboardButton(
+            "🇦🇿 Azərbaycan" + (" ✅" if current_lang == 'az' else ""),
+            callback_data="set_lang_az"
+        )
     )
-    markup.add(types.InlineKeyboardButton(t(user_id, 'buttons.back_menu'), callback_data="back_menu"))
+    markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="back_menu"))
     
-    text = """<b>🌐 DİL SEÇİMİ / DİL SEÇİMİ</b>
+    message = """
+🌐 <b>DİL SEÇİMİ</b>
+
+<b>─────────────────────</b>
 
 Aşağıdaki dillerden birini seçin:
 
 🇹🇷 <b>Türkçe</b> - Türkiye Türkçesi
 🇦🇿 <b>Azərbaycan</b> - Azerbaycan Türkçesi
 
-Seçiminiz tüm butonları ve mesajları değiştirecektir."""
-    
-    if message_id:
-        bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
-    else:
-        bot.send_message(user_id, text, reply_markup=markup)
+<b>─────────────────────</b>
 
-# ================= 10. TRX BAKİYE YÜKLEME SİSTEMİ =================
-def show_deposit_menu(user_id, message_id):
-    """TRX bakiye yükleme menüsü"""
-    trx_price = get_trx_price()
+<i>Seçiminiz tüm menüleri ve mesajları değiştirecektir.</i>
+"""
+    
+    try:
+        if message_id:
+            await bot.edit_message_text(
+                chat_id=user_id,
+                message_id=message_id,
+                text=message,
+                reply_markup=markup
+            )
+        else:
+            await bot.send_message(user_id, message, reply_markup=markup)
+    except Exception as e:
+        print(f"Language menu hatası: {e}")
+
+# ================= 15. DESTEK MENÜSÜ =================
+async def show_support_menu(user_id: int, message_id: int = None):
+    """Teknik destek menüsü"""
+    user = await get_user(user_id)
+    lang = user.get('language', 'tr') if user else 'tr'
+    t = lambda key: get_translation(lang, key)
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton(t('buttons.back_menu'), callback_data="back_menu"))
+    
+    message = f"""
+{t('support.title')}
+
+<b>─────────────────────</b>
+
+{t('support.contact')}
+{t('support.ticket_system')}
+{t('support.response_time')}
+
+<b>─────────────────────</b>
+
+{t('support.user_id')} <code>{user_id}</code>
+
+<b>─────────────────────</b>
+
+📝 <b>Destek talebi formatı:</b>
+1. Kullanıcı ID: {user_id}
+2. Sorun açıklaması
+3. Ekran görüntüsü (varsa)
+4. Tarih ve saat
+
+<b>─────────────────────</b>
+
+<i>Destek için @AlperenTHE adresine mesaj gönderin.</i>
+"""
+    
+    try:
+        if message_id:
+            await bot.edit_message_text(
+                chat_id=user_id,
+                message_id=message_id,
+                text=message,
+                reply_markup=markup
+            )
+        else:
+            await bot.send_message(user_id, message, reply_markup=markup)
+    except Exception as e:
+        print(f"Support menu hatası: {e}")
+
+# ================= 16. SSS MENÜSÜ =================
+async def show_faq_menu(user_id: int, message_id: int = None):
+    """Sıkça sorulan sorular menüsü"""
+    user = await get_user(user_id)
+    lang = user.get('language', 'tr') if user else 'tr'
+    t = lambda key: get_translation(lang, key)
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton(t('buttons.back_menu'), callback_data="back_menu"))
+    
+    message = f"""
+{t('faq.title')}
+
+<b>─────────────────────</b>
+
+{t('faq.q1')}
+{t('faq.a1')}
+
+<b>─────────────────────</b>
+
+{t('faq.q2')}
+{t('faq.a2')}
+
+<b>─────────────────────</b>
+
+{t('faq.q3')}
+{t('faq.a3')}
+
+<b>─────────────────────</b>
+
+{t('faq.q4')}
+{t('faq.a4')}
+
+<b>─────────────────────</b>
+
+{t('faq.q5')}
+{t('faq.a5')}
+
+<b>─────────────────────</b>
+
+💡 <b>Ek Bilgiler:</b>
+• Minimum görev ücreti: 1.00 ₺
+• Referans başına: 1.00 ₺
+• Minimum para çekme: 20.00 ₺
+• Kanal: @{MANDATORY_CHANNEL}
+"""
+    
+    try:
+        if message_id:
+            await bot.edit_message_text(
+                chat_id=user_id,
+                message_id=message_id,
+                text=message,
+                reply_markup=markup
+            )
+        else:
+            await bot.send_message(user_id, message, reply_markup=markup)
+    except Exception as e:
+        print(f"FAQ menu hatası: {e}")
+
+# ================= 17. BAKİYE DETAYLARI =================
+async def show_balance_details(user_id: int, message_id: int = None):
+    """Bakiye detaylarını göster"""
+    user = await get_user(user_id)
+    if not user:
+        await bot.answer_callback_query(call.id, "❌ Kullanıcı bulunamadı!")
+        return
+    
+    lang = user.get('language', 'tr')
+    t = lambda key: get_translation(lang, key)
+    
+    total_balance = user.get('balance', 0) + user.get('ad_balance', 0)
     
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
-        types.InlineKeyboardButton(f"2 TRX ({format_money(2*trx_price)})", callback_data="deposit_2"),
-        types.InlineKeyboardButton(f"5 TRX ({format_money(5*trx_price)})", callback_data="deposit_5"),
-        types.InlineKeyboardButton(f"10 TRX ({format_money(10*trx_price)})", callback_data="deposit_10"),
-        types.InlineKeyboardButton(f"15 TRX ({format_money(15*trx_price)})", callback_data="deposit_15")
+        types.InlineKeyboardButton(t('buttons.deposit'), callback_data="deposit_menu"),
+        types.InlineKeyboardButton(t('buttons.ad_balance'), callback_data="ad_balance_menu")
     )
-    markup.add(
-        types.InlineKeyboardButton(f"25 TRX ({format_money(25*trx_price)})", callback_data="deposit_25"),
-        types.InlineKeyboardButton(f"50 TRX ({format_money(50*trx_price)})", callback_data="deposit_50"),
-        types.InlineKeyboardButton(t(user_id, 'deposit.custom_amount'), callback_data="deposit_other"),
-        types.InlineKeyboardButton(t(user_id, 'buttons.back_menu'), callback_data="back_menu")
-    )
+    markup.add(types.InlineKeyboardButton(t('buttons.back_menu'), callback_data="back_menu"))
     
-    text = f"""<b>{t(user_id, 'deposit.title')}</b>
+    message = f"""
+💰 <b>BAKİYE DETAYLARI</b>
 
-{t(user_id, 'deposit.select_amount')}
+<b>─────────────────────</b>
 
-💰 <b>Güncel TRX/TRY:</b> 1 TRX = {format_money(trx_price)}
-🎁 <b>Bonuslar:</b>
-• 2-14 TRX: %25 Reklam Bakiyesi Bonusu
-• 15+ TRX: %50 Reklam Bakiyesi Bonusu + 350 ₺ Sabit
+👤 <b>Kullanıcı:</b> {user.get('first_name', 'Kullanıcı')}
+🆔 <b>ID:</b> <code>{user_id}</code>
 
-👇 Bir miktar seç veya "Diğer" seçeneğiyle özel miktar gir."""
-    
-    if message_id:
-        bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
-    else:
-        bot.send_message(user_id, text, reply_markup=markup)
+<b>─────────────────────</b>
 
-def process_trx_deposit_amount(user_id, trx_amount, message_id=None):
-    """TRX ödeme bilgilerini göster"""
-    trx_price = get_trx_price()
-    try_amount = trx_amount * trx_price
-    bonus_percent = calculate_bonus(trx_amount)
-    
-    if trx_amount >= 15:
-        bonus_text = f"🎁 <b>%{bonus_percent} Bonus + 350 ₺ Sabit</b>"
-        total_try = try_amount + 350
-    else:
-        bonus_text = f"🎁 <b>%{bonus_percent} Bonus</b>"
-        total_try = try_amount * (1 + bonus_percent/100)
-    
-    markup = types.InlineKeyboardMarkup()
-    markup.add(
-        types.InlineKeyboardButton("📋 Cüzdanı Kopyala", callback_data=f"copy_{TRX_WALLET}"),
-        types.InlineKeyboardButton("✅ ÖDEME YAPTIM", callback_data=f"verify_deposit_{trx_amount}")
-    )
-    markup.add(types.InlineKeyboardButton(t(user_id, 'buttons.back_menu'), callback_data="deposit_menu"))
-    
-    text = f"""<b>💳 TRX ÖDEME BİLGİLERİ</b>
+💵 <b>BAKİYE BİLGİLERİ:</b>
+• <b>Normal Bakiye:</b> <code>{user.get('balance', 0):.2f} ₺</code>
+• <b>Reklam Bakiyesi:</b> <code>{user.get('ad_balance', 0):.2f} ₺</code>
+• <b>Toplam Bakiye:</b> <code>{total_balance:.2f} ₺</code>
 
-{t(user_id, 'deposit.trx_address')}
-<code>{TRX_WALLET}</code>
+<b>─────────────────────</b>
 
-📊 <b>Ödeme Detayları:</b>
-• Göndereceğin TRX: <b>{trx_amount} TRX</b>
-• Anlık Kur: <b>{format_money(trx_price)}</b>
-• TL Değeri: <b>{format_money(try_amount)}</b>
-{bonus_text}
-• Alacağın Reklam Bakiyesi: <b>{format_money(total_try)}</b>
+📊 <b>İSTATİSTİKLER:</b>
+• <b>Toplam Kazanç:</b> <code>{user.get('total_earned', 0):.2f} ₺</code>
+• <b>Tamamlanan Görev:</b> <code>{user.get('tasks_completed', 0)}</code>
+• <b>Referans Sayısı:</b> <code>{user.get('referrals', 0)}</code>
+• <b>Referans Kazancı:</b> <code>{user.get('ref_earned', 0):.2f} ₺</code>
 
-⚠️ <b>ÖNEMLİ:</b>
-1. SADECE TRX (TRON) gönder
-2. <b>TAM {trx_amount} TRX</b> gönder
-3. Ağ ücretini unutma
-4. İşlem tamamlanınca TXID'yi bota yaz
+<b>─────────────────────</b>
 
-{t(user_id, 'deposit.send_exact').format(amount=trx_amount)}"""
-    
-    # Kullanıcı durumunu kaydet
-    if user_id not in user_states:
-        user_states[user_id] = {}
-    user_states[user_id]['pending_deposit'] = {
-        'trx_amount': trx_amount,
-        'try_amount': try_amount,
-        'bonus_percent': bonus_percent,
-        'total_try': total_try
-    }
-    
-    if message_id:
-        bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
-    else:
-        bot.send_message(user_id, text, reply_markup=markup)
-
-@bot.message_handler(func=lambda message: message.from_user.id in user_states and 'pending_deposit' in user_states[message.from_user.id] and message.text and len(message.text) > 20)
-def process_txid_input(message):
-    """TXID inputunu işle"""
-    user_id = message.from_user.id
-    txid = message.text.strip()
-    
-    if user_id not in user_states or 'pending_deposit' not in user_states[user_id]:
-        return
-    
-    deposit_data = user_states[user_id]['pending_deposit']
-    
-    # Kullanıcıya bilgi ver
-    bot.send_message(user_id, t(user_id, 'deposit.verifying'))
-    
-    # Ödemeyi doğrula
-    verification = verify_trx_transaction(txid)
-    
-    if verification['verified']:
-        # Ödeme başarılı
-        trx_amount = deposit_data['trx_amount']
-        total_try = deposit_data['total_try']
-        
-        # Reklam bakiyesine ekle
-        update_balance(user_id, total_try, 'ad_balance')
-        
-        # Veritabanına kaydet
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''INSERT INTO trx_deposits 
-                           (user_id, trx_amount, try_amount, txid, bonus_percent, total_ad_balance, status, verified_at)
-                           VALUES (?, ?, ?, ?, ?, ?, 'completed', CURRENT_TIMESTAMP)''',
-                           (user_id, trx_amount, deposit_data['try_amount'], txid,
-                            deposit_data['bonus_percent'], total_try))
-            conn.commit()
-        
-        # Başarı mesajı
-        markup = types.InlineKeyboardMarkup()
-        markup.add(
-            types.InlineKeyboardButton(t(user_id, 'buttons.create_task'), callback_data="create_task_menu"),
-            types.InlineKeyboardButton(t(user_id, 'buttons.my_balance'), callback_data="my_balance")
-        )
-        
-        text = f"""✅ <b>{t(user_id, 'deposit.success')}</b>
-
-💰 <b>Yüklenen:</b> {trx_amount} TRX
-💰 <b>TL Değeri:</b> {format_money(deposit_data['try_amount'])}
-🎁 <b>Bonus:</b> %{deposit_data['bonus_percent']}
-💰 <b>Reklam Bakiyesi:</b> +{format_money(total_try)}
-📊 <b>Yeni Reklam Bakiyesi:</b> {format_money(get_user(user_id)['ad_balance'])}
-
-⚡ <b>İşlem tamamlandı! Şimdi görev oluşturabilirsin.</b>"""
-        
-        bot.send_message(user_id, text, reply_markup=markup)
-        
-    else:
-        # Ödeme başarısız
-        text = f"""❌ <b>{t(user_id, 'deposit.failed')}</b>
-
-TXID: <code>{txid}</code>
-
-⚠️ <b>Olası Sebepler:</b>
-1. Yanlış TXID girdin
-2. Ödeme henüz onaylanmadı
-3. Yanlış miktar gönderdin
-4. Yanlış cüzdana gönderdin
-
-💰 <b>Doğru Cüzdan:</b> <code>{TRX_WALLET}</code>
-
-Lütfen kontrol edip tekrar dene."""
-        
-        bot.send_message(user_id, text)
-    
-    # Durumu temizle
-    if user_id in user_states and 'pending_deposit' in user_states[user_id]:
-        del user_states[user_id]['pending_deposit']
-
-# ================= 11. TEKNİK DESTEK MENÜSÜ =================
-def show_support_menu(user_id, message_id):
-    """Teknik destek menüsü"""
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton(t(user_id, 'buttons.back_menu'), callback_data="back_menu"))
-    
-    text = f"""<b>{t(user_id, 'support.title')}</b>
-
-{t(user_id, 'support.contact')}
-
-📞 {t(user_id, 'support.ticket_system')}
-⏰ {t(user_id, 'support.response_time')}
-
-<code>Kullanıcı ID: {user_id}</code>
-
-<b>Destek için mesaj formatı:</b>
-1. Kullanıcı ID: {user_id}
-2. Sorun açıklaması
-3. Ekran görüntüsü (varsa)"""
-    
-    if message_id:
-        bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
-    else:
-        bot.send_message(user_id, text, reply_markup=markup)
-
-# ================= 12. FAQ MENÜSÜ =================
-def show_faq_menu(user_id, message_id):
-    """SSS menüsü"""
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton(t(user_id, 'buttons.back_menu'), callback_data="back_menu"))
-    
-    text = f"""<b>{t(user_id, 'faq.title')}</b>
-
-{t(user_id, 'faq.q1')}
-{t(user_id, 'faq.a1')}
-
-{t(user_id, 'faq.q2')}
-{t(user_id, 'faq.a2')}
-
-{t(user_id, 'faq.q3')}
-{t(user_id, 'faq.a3')}
-
-{t(user_id, 'faq.q4')}
-{t(user_id, 'faq.a4')}
-
-{t(user_id, 'faq.q5')}
-{t(user_id, 'faq.a5')}
-
-💡 <b>Ek Bilgiler:</b>
-• TRX ödemeleri otomatik onaylanır
-• Minimum görev ücreti: 1.00 ₺
-• Referans başına: 1.00 ₺
-• Kanal zorunluluğu: @{ZORUNLU_KANAL}"""
-    
-    if message_id:
-        bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
-    else:
-        bot.send_message(user_id, text, reply_markup=markup)
-
-# ================= 13. PARA ÇEKME MENÜSÜ =================
-def show_withdraw_menu(user_id, message_id):
-    """Para çekme menüsü"""
-    user = get_user(user_id)
-    
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton(t(user_id, 'buttons.back_menu'), callback_data="back_menu"))
-    
-    text = f"""<b>{t(user_id, 'withdraw.title')}</b>
-
-{t(user_id, 'withdraw.coming_soon')}
-
-💰 <b>Mevcut Bakiye:</b> {format_money(user['balance'])}
-💳 <b>Minimum Çekim:</b> 20 ₺
-⏰ <b>Tahmini Süre:</b> 24 saat
-
-📢 <b>Duyuru:</b> Para çekme sistemi en kısa sürede aktif edilecektir.
-
-💡 <b>Öneri:</b> Bakiyeni reklam bakiyesine çevirip görev oluşturabilirsin!"""
-    
-    if message_id:
-        bot.edit_message_text(text, user_id, message_id, reply_markup=markup)
-    else:
-        bot.send_message(user_id, text, reply_markup=markup)
-
-# ================= 14. CALLBACK HANDLER (GÜNCELLENDİ) =================
-@bot.callback_query_handler(func=lambda call: True)
-def callback_handler(call):
-    user_id = call.from_user.id
-    
-    # Kanal kontrolü (check_join hariç)
-    if not kanal_kontrol(user_id) and call.data != "check_join" and not call.data.startswith("set_lang_"):
-        bot.answer_callback_query(call.id, "❌ Önce kanala katıl!", show_alert=True)
-        return
-    
-    # Dil değiştirme işlemleri
-    if call.data.startswith("set_lang_"):
-        lang = call.data.replace("set_lang_", "")
-        set_user_language(user_id, lang)
-        bot.answer_callback_query(call.id, f"✅ Dil {lang} olarak ayarlandı!")
-        show_main_menu(user_id, call.message.message_id)
-        return
-    
-    if call.data == "check_join":
-        if kanal_kontrol(user_id):
-            show_main_menu(user_id, call.message.message_id)
-            bot.answer_callback_query(call.id, "✅ Başarılı!")
-        else:
-            bot.answer_callback_query(call.id, "❌ Hala katılmadın!", show_alert=True)
-    
-    elif call.data == "back_menu":
-        show_main_menu(user_id, call.message.message_id)
-    
-    elif call.data == "do_task":
-        show_task_types(user_id, call.message.message_id)
-    
-    elif call.data == "my_balance":
-        show_my_balance(user_id, call.message.message_id)
-    
-    elif call.data == "create_task_menu":
-        create_task_menu(user_id, call.message.message_id)
-    
-    elif call.data == "my_refs":
-        show_my_refs(user_id, call.message.message_id)
-    
-    elif call.data == "deposit_menu":
-        show_deposit_menu(user_id, call.message.message_id)
-    
-    elif call.data == "ad_balance_menu":
-        show_ad_balance_menu(user_id, call.message.message_id)
-    
-    elif call.data == "withdraw_menu":
-        show_withdraw_menu(user_id, call.message.message_id)
-    
-    elif call.data == "support_menu":
-        show_support_menu(user_id, call.message.message_id)
-    
-    elif call.data == "faq_menu":
-        show_faq_menu(user_id, call.message.message_id)
-    
-    elif call.data == "language_menu":
-        show_language_menu(user_id, call.message.message_id)
-    
-    elif call.data == "admin_panel":
-        if user_id == ADMIN_ID:
-            show_admin_panel(user_id, call.message.message_id)
-        else:
-            bot.answer_callback_query(call.id, "❌ Yetkin yok!")
-    
-    # TRX Ödeme işlemleri
-    elif call.data.startswith("deposit_"):
-        amount_str = call.data.replace("deposit_", "")
-        if amount_str == "other":
-            ask_custom_trx_deposit(user_id, call.message.message_id)
-        else:
-            try:
-                trx_amount = float(amount_str)
-                process_trx_deposit_amount(user_id, trx_amount, call.message.message_id)
-            except:
-                pass
-    
-    elif call.data.startswith("verify_deposit_"):
-        trx_amount = float(call.data.replace("verify_deposit_", ""))
-        
-        # TXID girmesi için talimat
-        bot.edit_message_text(
-            t(user_id, 'deposit.enter_txid'),
-            call.message.chat.id,
-            call.message.message_id
-        )
-    
-    elif call.data.startswith("copy_"):
-        text_to_copy = call.data.replace("copy_", "")
-        bot.answer_callback_query(call.id, "✅ Kopyalandı!")
-    
-    # Diğer işlemler (eski kodun kalan kısımları)
-    elif call.data in ["task_bot", "task_kanal", "task_grup"]:
-        task_type = call.data.replace("task_", "")
-        show_available_task(user_id, task_type, call.message.message_id)
-    
-    elif call.data in ["create_bot", "create_kanal", "create_grup"]:
-        task_type = call.data.replace("create_", "")
-        start_task_creation(user_id, task_type, call.message.message_id)
-    
-    elif call.data == "cancel_task":
-        show_main_menu(user_id, call.message.message_id)
-        bot.answer_callback_query(call.id, "❌ Görev oluşturma iptal edildi!")
-
-# ================= 15. YARDIMCI FONKSİYONLAR =================
-def ask_custom_trx_deposit(user_id, message_id):
-    """Özel TRX miktarı sor"""
-    bot.edit_message_text(
-        t(user_id, 'deposit.enter_amount'),
-        user_id,
-        message_id
-    )
-    
-    def process_custom_trx(message):
-        try:
-            trx_amount = float(message.text.strip())
-            if trx_amount < 2:
-                bot.send_message(user_id, t(user_id, 'deposit.min_amount'))
-                show_deposit_menu(user_id, None)
-                return
-            
-            process_trx_deposit_amount(user_id, trx_amount, None)
-        except:
-            bot.send_message(user_id, "❌ Geçersiz miktar!")
-            show_deposit_menu(user_id, None)
-    
-    bot.register_next_step_handler_by_chat_id(user_id, process_custom_trx)
-
-# ================= 16. FLASK SUNUCUSU =================
-@app.route('/')
-def home():
-    return """
-    <html>
-        <head>
-            <title>🤖 Görev Yapsam Bot</title>
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <style>
-                body {
-                    font-family: Arial, sans-serif;
-                    max-width: 800px;
-                    margin: 0 auto;
-                    padding: 20px;
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    color: white;
-                    min-height: 100vh;
-                }
-                .container {
-                    background: rgba(255, 255, 255, 0.1);
-                    backdrop-filter: blur(10px);
-                    padding: 30px;
-                    border-radius: 20px;
-                    box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.37);
-                }
-                h1 {
-                    text-align: center;
-                    font-size: 2.5em;
-                    margin-bottom: 10px;
-                }
-                .status {
-                    background: rgba(76, 175, 80, 0.2);
-                    border: 2px solid #4CAF50;
-                    padding: 15px;
-                    border-radius: 10px;
-                    text-align: center;
-                    margin: 20px 0;
-                    font-size: 1.2em;
-                }
-                .features {
-                    display: grid;
-                    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-                    gap: 20px;
-                    margin: 30px 0;
-                }
-                .feature {
-                    background: rgba(255, 255, 255, 0.15);
-                    padding: 20px;
-                    border-radius: 10px;
-                    text-align: center;
-                }
-                .feature-icon {
-                    font-size: 2em;
-                    margin-bottom: 10px;
-                }
-                .stats {
-                    display: flex;
-                    justify-content: space-around;
-                    flex-wrap: wrap;
-                    margin-top: 30px;
-                }
-                .stat {
-                    text-align: center;
-                    margin: 10px;
-                }
-                .stat-value {
-                    font-size: 2em;
-                    font-weight: bold;
-                }
-                .telegram-btn {
-                    display: inline-block;
-                    background: #0088cc;
-                    color: white;
-                    padding: 15px 30px;
-                    border-radius: 10px;
-                    text-decoration: none;
-                    font-weight: bold;
-                    margin-top: 20px;
-                    transition: transform 0.3s;
-                }
-                .telegram-btn:hover {
-                    transform: translateY(-3px);
-                    background: #0077b3;
-                }
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>🤖 Görev Yapsam Bot v13.0</h1>
-                <div class="status">
-                    ✅ <strong>BOT AKTİF</strong> - Çok Dilli & TRX Otomatik Sistem
-                </div>
-                
-                <div class="features">
-                    <div class="feature">
-                        <div class="feature-icon">🌍</div>
-                        <h3>Çok Dilli</h3>
-                        <p>Türkçe & Azerbaycan Türkçesi</p>
-                    </div>
-                    <div class="feature">
-                        <div class="feature-icon">⚡</div>
-                        <h3>TRX Otomatik</h3>
-                        <p>Anlık ödeme onayı</p>
-                    </div>
-                    <div class="feature">
-                        <div class="feature-icon">💰</div>
-                        <h3>Bonus Sistem</h3>
-                        <p>%25-%50 bonus</p>
-                    </div>
-                </div>
-                
-                <div style="text-align: center;">
-                    <a href="https://t.me/GorevYapsamBot" class="telegram-btn" target="_blank">
-                        📱 Telegram'da Aç
-                    </a>
-                </div>
-                
-                <div class="stats">
-                    <div class="stat">
-                        <div class="stat-value">2</div>
-                        <div>Desteklenen Dil</div>
-                    </div>
-                    <div class="stat">
-                        <div class="stat-value">⚡</div>
-                        <div>Otomatik Ödeme</div>
-                    </div>
-                    <div class="stat">
-                        <div class="stat-value">🎁</div>
-                        <div>Bonus Sistemi</div>
-                    </div>
-                </div>
-            </div>
-        </body>
-    </html>
-    """
-
-@app.route('/health')
-def health():
-    return {"status": "ok", "version": "13.0", "features": ["multi_language", "trx_auto", "bonus_system"]}
-
-# ================= 17. BOT ÇALIŞTIRMA =================
-def run_bot():
-    print("🤖 Görev Yapsam Bot v13.0 başlatılıyor...")
-    print("🌍 Dil Desteği: Türkçe & Azerbaycan Türkçesi")
-    print("⚡ TRX Otomatik Ödeme Sistemi: AKTİF")
-    print("🎁 Bonus Sistem: %25-%50")
+💡 <b>Bilgi:</b>
+• Normal bakiyenle para çekebilirsin (yakında)
+• Reklam bakiyenle görev oluşturabilirsin
+• %25 bonusla reklam bakiyesine çevirebilirsin
+"""
     
     try:
-        bot.remove_webhook()
-        time.sleep(1)
-        
-        bot.polling(
-            none_stop=True,
-            interval=3,
-            timeout=60,
-            skip_pending=True
-        )
+        if message_id:
+            await bot.edit_message_text(
+                chat_id=user_id,
+                message_id=message_id,
+                text=message,
+                reply_markup=markup
+            )
+        else:
+            await bot.send_message(user_id, message, reply_markup=markup)
     except Exception as e:
-        print(f"Bot hatası: {e}")
-        time.sleep(10)
-        run_bot()
+        print(f"Balance details hatası: {e}")
 
-def run_flask():
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+# ================= 18. REFERANS SİSTEMİ =================
+async def show_referral_info(user_id: int, message_id: int = None):
+    """Referans bilgilerini göster"""
+    user = await get_user(user_id)
+    if not user:
+        return
+    
+    lang = user.get('language', 'tr')
+    t = lambda key: get_translation(lang, key)
+    
+    # Referans linki
+    ref_link = f"https://t.me/GorevYapsamBot?start=ref_{user_id}"
+    
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("📤 PAYLAŞ", 
+            url=f"https://t.me/share/url?url={ref_link}&text=Görev%20Yap%20Para%20Kazan!%20@GorevYapsamBot"),
+        types.InlineKeyboardButton("📋 KOPYALA", callback_data=f"copy_{ref_link}")
+    )
+    markup.add(types.InlineKeyboardButton(t('buttons.back_menu'), callback_data="back_menu"))
+    
+    message = f"""
+{t('referral.title')}
+
+<b>─────────────────────</b>
+
+{t('referral.earn_per_ref')} <code>1.00 ₺</code>
+{t('referral.total_refs')} <code>{user.get('referrals', 0)}</code>
+{t('referral.total_earned')} <code>{user.get('ref_earned', 0):.2f} ₺</code>
+
+<b>─────────────────────</b>
+
+{t('referral.your_link')}
+<code>{ref_link}</code>
+
+<b>─────────────────────</b>
+
+{t('referral.bonus_tiers')}
+{t('referral.bonus_5')}
+{t('referral.bonus_10')}
+{t('referral.bonus_25')}
+{t('referral.bonus_50')}
+
+<b>─────────────────────</b>
+
+{t('referral.how_it_works')}
+{t('referral.step1')}
+{t('referral.step2')}
+{t('referral.step3')}
+{t('referral.step4')}
+"""
+    
+    try:
+        if message_id:
+            await bot.edit_message_text(
+                chat_id=user_id,
+                message_id=message_id,
+                text=message,
+                reply_markup=markup
+            )
+        else:
+            await bot.send_message(user_id, message, reply_markup=markup)
+    except Exception as e:
+        print(f"Referral info hatası: {e}")
+
+# ================= 19. GÖREV SİSTEMİ =================
+async def show_task_selection(user_id: int, message_id: int = None):
+    """Görev seçim menüsü"""
+    user = await get_user(user_id)
+    lang = user.get('language', 'tr') if user else 'tr'
+    t = lambda key: get_translation(lang, key)
+    
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton(t('tasks.bot_task').format(price="2.50"), callback_data="task_bot"),
+        types.InlineKeyboardButton(t('tasks.channel_task').format(price="1.50"), callback_data="task_channel"),
+        types.InlineKeyboardButton(t('tasks.group_task').format(price="1.00"), callback_data="task_group")
+    )
+    markup.add(types.InlineKeyboardButton(t('buttons.back_menu'), callback_data="back_menu"))
+    
+    message = f"""
+{t('tasks.select_type')}
+
+<b>─────────────────────</b>
+
+{t('tasks.bot_task').format(price="2.50")}
+<i>Botlara katılma/start atma görevi</i>
+
+<b>─────────────────────</b>
+
+{t('tasks.channel_task').format(price="1.50")}
+<i>Kanallara katılma görevi</i>
+
+<b>─────────────────────</b>
+
+{t('tasks.group_task').format(price="1.00")}
+<i>Gruplara katılma görevi</i>
+
+<b>─────────────────────</b>
+
+💡 <b>Her görev için 3 dakika beklemen gerekiyor.</b>
+"""
+    
+    try:
+        if message_id:
+            await bot.edit_message_text(
+                chat_id=user_id,
+                message_id=message_id,
+                text=message,
+                reply_markup=markup
+            )
+        else:
+            await bot.send_message(user_id, message, reply_markup=markup)
+    except Exception as e:
+        print(f"Task selection hatası: {e}")
+
+async def show_create_task_menu(user_id: int, message_id: int = None):
+    """Görev oluşturma menüsü"""
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("🤖 BOT GÖREVİ OLUŞTUR (2.50 ₺/görüntü)", callback_data="create_bot"),
+        types.InlineKeyboardButton("📢 KANAL GÖREVİ OLUŞTUR (1.50 ₺/görüntü)", callback_data="create_channel"),
+        types.InlineKeyboardButton("👥 GRUP GÖREVİ OLUŞTUR (1.00 ₺/görüntü)", callback_data="create_group")
+    )
+    markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="back_menu"))
+    
+    message = """
+📢 <b>GÖREV OLUŞTURMA</b>
+
+<b>─────────────────────</b>
+
+🤖 <b>BOT GÖREVİ</b>
+• Maliyet: 2.50 ₺ / görüntü
+• Forward mesaj zorunlu
+
+<b>─────────────────────</b>
+
+📢 <b>KANAL GÖREVİ</b>
+• Maliyet: 1.50 ₺ / görüntü
+• Forward mesaj zorunlu
+• Bot kanalda admin olmalı
+
+<b>─────────────────────</b>
+
+👥 <b>GRUP GÖREVİ</b>
+• Maliyet: 1.00 ₺ / görüntü
+• Forward mesaj zorunlu
+• Bot grupta admin olmalı
+
+<b>─────────────────────</b>
+
+💡 <b>İpucu:</b> Görev oluşturmak için Reklam Bakiyen olmalı.
+"""
+    
+    try:
+        if message_id:
+            await bot.edit_message_text(
+                chat_id=user_id,
+                message_id=message_id,
+                text=message,
+                reply_markup=markup
+            )
+        else:
+            await bot.send_message(user_id, message, reply_markup=markup)
+    except Exception as e:
+        print(f"Create task menu hatası: {e}")
+
+# ================= 20. REKLAM BAKİYESİ ÇEVİRİMİ =================
+async def show_ad_balance_conversion(user_id: int, message_id: int = None):
+    """Reklam bakiyesi çevirim menüsü"""
+    user = await get_user(user_id)
+    if not user:
+        return
+    
+    lang = user.get('language', 'tr')
+    t = lambda key: get_translation(lang, key)
+    
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("10 ₺", callback_data="convert_10"),
+        types.InlineKeyboardButton("25 ₺", callback_data="convert_25"),
+        types.InlineKeyboardButton("50 ₺", callback_data="convert_50"),
+        types.InlineKeyboardButton("100 ₺", callback_data="convert_100")
+    )
+    markup.add(
+        types.InlineKeyboardButton("250 ₺", callback_data="convert_250"),
+        types.InlineKeyboardButton("500 ₺", callback_data="convert_500"),
+        types.InlineKeyboardButton("Özel Miktar", callback_data="convert_custom"),
+        types.InlineKeyboardButton(t('buttons.back_menu'), callback_data="back_menu")
+    )
+    
+    message = f"""
+🔄 <b>REKLAM BAKİYESİ ÇEVİRİMİ</b>
+
+<b>─────────────────────</b>
+
+💰 <b>Normal Bakiyen:</b> <code>{user.get('balance', 0):.2f} ₺</code>
+💰 <b>Reklam Bakiyen:</b> <code>{user.get('ad_balance', 0):.2f} ₺</code>
+
+<b>─────────────────────</b>
+
+🎁 <b>%25 BONUS!</b>
+Normal bakiyeni reklam bakiyesine çevir, %25 bonus kazan!
+
+<i>Örnek: 100 ₺ normal bakiye → 125 ₺ reklam bakiyesi</i>
+
+<b>─────────────────────</b>
+
+👇 <b>Çevirmek istediğin miktarı seç:</b>
+"""
+    
+    try:
+        if message_id:
+            await bot.edit_message_text(
+                chat_id=user_id,
+                message_id=message_id,
+                text=message,
+                reply_markup=markup
+            )
+        else:
+            await bot.send_message(user_id, message, reply_markup=markup)
+    except Exception as e:
+        print(f"Ad balance conversion hatası: {e}")
+
+# ================= 21. ADMIN PANEL =================
+async def show_admin_panel(user_id: int, message_id: int = None):
+    """Admin paneli"""
+    if user_id != ADMIN_ID:
+        return
+    
+    # İstatistikleri topla
+    total_users = 0
+    total_balance = 0
+    total_ad_balance = 0
+    
+    try:
+        if db:
+            users_ref = db.collection('users')
+            users = users_ref.limit(1000).stream()
+            
+            for user in users:
+                user_data = user.to_dict()
+                total_balance += user_data.get('balance', 0)
+                total_ad_balance += user_data.get('ad_balance', 0)
+                total_users += 1
+    except Exception as e:
+        print(f"Admin istatistik hatası: {e}")
+    
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("📊 İSTATİSTİKLER", callback_data="admin_stats"),
+        types.InlineKeyboardButton("👤 KULLANICI BUL", callback_data="admin_find_user")
+    )
+    markup.add(
+        types.InlineKeyboardButton("💰 BAKİYE EKLE", callback_data="admin_add_balance"),
+        types.InlineKeyboardButton("📢 DUYURU GÖNDER", callback_data="admin_broadcast")
+    )
+    markup.add(types.InlineKeyboardButton("🏠 ANA MENÜ", callback_data="back_menu"))
+    
+    message = f"""
+👑 <b>ADMIN PANEL</b>
+
+<b>─────────────────────</b>
+
+📊 <b>GENEL İSTATİSTİKLER:</b>
+• Toplam Kullanıcı: <code>{total_users}</code>
+• Toplam Normal Bakiye: <code>{total_balance:.2f} ₺</code>
+• Toplam Reklam Bakiye: <code>{total_ad_balance:.2f} ₺</code>
+
+<b>─────────────────────</b>
+
+⚡ <b>HIZLI İŞLEMLER:</b>
+
+<i>Altaki butonlardan işlem seçebilirsin.</i>
+"""
+    
+    try:
+        if message_id:
+            await bot.edit_message_text(
+                chat_id=user_id,
+                message_id=message_id,
+                text=message,
+                reply_markup=markup
+            )
+        else:
+            await bot.send_message(user_id, message, reply_markup=markup)
+    except Exception as e:
+        print(f"Admin panel hatası: {e}")
+
+# ================= 22. FİYAT GÜNCELLEME =================
+def update_prices():
+    """TRX fiyatlarını güncelle"""
+    get_trx_price()
+
+# Schedule görevleri
+schedule.every(30).seconds.do(update_prices)
+
+def schedule_runner():
+    """Schedule görevlerini çalıştır"""
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+# ================= 23. ANA ÇALIŞTIRMA =================
+async def run_bot_async():
+    """Async bot'u çalıştır"""
+    print(f"""
+    🚀 GÖREV YAPSAM BOT PRO v16.0
+    ═══════════════════════════════════════════
+    📅 Başlatılıyor: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    🔧 Database: {'Firebase Firestore v2 ✅' if db else 'Local Cache ⚠️'}
+    🌍 Dil Desteği: Türkçe & Azerbaycan
+    💰 Ödeme Sistemi: Yakında (Papara & Kripto)
+    🛡️ Veri Güvenliği: {'FIREBASE' if db else 'LOCAL'}
+    ═══════════════════════════════════════════
+    """)
+    
+    try:
+        await bot.polling(non_stop=True, interval=3, timeout=60)
+    except Exception as e:
+        print(f"❌ Bot hatası: {e}")
+        await asyncio.sleep(10)
+        await run_bot_async()
+
+def main():
+    """Ana çalıştırma fonksiyonu"""
+    # Schedule thread'i başlat
+    schedule_thread = threading.Thread(target=schedule_runner, daemon=True)
+    schedule_thread.start()
+    
+    # Bot'u çalıştır
+    asyncio.run(run_bot_async())
 
 if __name__ == "__main__":
-    # Kullanıcı durumları için sözlük
-    user_states = {}
-    
-    # Flask thread
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    
-    # Ana thread'de botu çalıştır
-    run_bot()
+    main()
