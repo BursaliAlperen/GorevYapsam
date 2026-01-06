@@ -1,15 +1,30 @@
+# Telegram Bot
 pyTelegramBotAPI==4.16.0
-python-dotenv==1.0.0
-requests==2.31.0
-pytz==2023.3
-cachetools==5.3.2
-firebase-admin==6.2.0
-schedule==1.2.0
+
+# HTTP ve async
 aiohttp==3.9.1
-cryptography==46.0.3
-pycparser==2.23
+requests==2.31.0
+
+# Firebase
+firebase-admin==6.2.0
+
+# Çevre değişkenleri
+python-dotenv==1.0.0
+
+# Zaman ve tarih
+pytz==2023.3
+
+# Cache
+cachetools==5.3.2
+
+# Schedule
+schedule==1.2.0
+
+# Diğer bağımlılıklar (versiyon çakışmalarını önlemek için)
 Jinja2==3.1.6
 MarkupSafe==3.0.3
-typing-extensions==4.8.0
-pyasn1==0.5.1
 urllib3==2.0.7
+pycparser==2.23
+cffi==2.0.0
+pyasn1==0.5.1
+cryptography==46.0.3
