@@ -35,10 +35,13 @@ MANDATORY_CHANNEL = os.getenv("MANDATORY_CHANNEL", "GY_Refim")
 
 # ================= 2. FIREBASE FIRESTORE BAĞLANTISI =================
 try:
-    cred_path = os.getenv("FIREBASE_CREDENTIALS_PATH", "firebase-credentials.json")
+    # Environment variable'dan Firebase credentials al
+    firebase_creds_json = os.getenv("FIREBASE_CREDENTIALS")
     
-    if os.path.exists(cred_path):
-        cred = credentials.Certificate(cred_path)
+    if firebase_creds_json:
+        # JSON string'ini dictionary'e çevir
+        cred_dict = json.loads(firebase_creds_json)
+        cred = credentials.Certificate(cred_dict)
         firebase_admin.initialize_app(cred, {
             'projectId': 'gorev-yapsam-bot',
         })
@@ -52,7 +55,8 @@ except Exception as e:
     db = None
 
 # ================= 3. BOT KONFİGÜRASYONU =================
-bot = AsyncTeleBot(TOKEN, parse_mode='HTML', threaded=True)
+# DÜZELTME: 'threaded' parametresi kaldırıldı
+bot = AsyncTeleBot(TOKEN, parse_mode='HTML')
 
 # ================= 4. CACHE VE DURUM SİSTEMİ =================
 price_cache = cachetools.TTLCache(maxsize=100, ttl=30)  # 30 saniye
@@ -274,11 +278,11 @@ TRANSLATIONS = {
             'q2': '🤖 <b>Tapşırıq necə edilir?</b>',
             'a2': '1. "TAPŞIRIQ ET" düyməsinə toxun\n2. Tapşırıq seç\n3. Linkə get və tapşırığı tamamla\n4. 3 dəqiqə gözlə və tamamla',
             'q3': '🎁 <b>Bonus sistemi nədir?</b>',
-            'a3': '• Hər referans üçün 1 ₺\n• Tapşırıq tamamlayaraq pul qazan\n• Xüsusi bonus kampaniyaları',
+            'a3': '• Hər referans üçün 1 ₺\n• Tapşırıq tamamlayaraq pul qazan\n• Xüsusi bonus kampanyaları',
             'q4': '💸 <b>Pul necə çıxarılır?</b>',
             'a4': 'Minimum 20 ₺ ilə pul çıxarış sistemi tezlikdə aktiv olacaq.',
             'q5': '📢 <b>Kanal məcburiyyəti nədir?</b>',
-            'a5': f'Botu istifadə etmək üçün @{MANDATORY_CHANNEL} kanalına qoşulmalısınız.'
+            'a5': f'Botu istifadə etmek üçün @{MANDATORY_CHANNEL} kanalına qoşulmalısınız.'
         },
         
         # Para Çekme
@@ -332,7 +336,7 @@ async def get_user(user_id: int) -> Optional[Dict]:
         
         if db:
             user_ref = db.collection('users').document(str(user_id))
-            user_doc = await user_ref.get()
+            user_doc = user_ref.get()
             
             if user_doc.exists:
                 user_data = user_doc.to_dict()
@@ -367,7 +371,7 @@ async def create_or_update_user(user_id: int, user_data: Dict) -> bool:
     try:
         if db:
             user_ref = db.collection('users').document(str(user_id))
-            await user_ref.set(user_data, merge=True)
+            user_ref.set(user_data, merge=True)
         else:
             # Local storage
             cache_key = f"user_{user_id}"
@@ -409,12 +413,10 @@ async def update_balance(user_id: int, amount: float, balance_type: str = 'balan
         return False
 
 # ================= 8. KANAL KONTROLÜ =================
-def check_channel_membership(user_id: int) -> bool:
+async def check_channel_membership(user_id: int) -> bool:
     """Kanal üyeliğini kontrol et"""
     try:
-        from telebot import TeleBot
-        temp_bot = TeleBot(TOKEN)
-        member = temp_bot.get_chat_member(f"@{MANDATORY_CHANNEL}", user_id)
+        member = await bot.get_chat_member(f"@{MANDATORY_CHANNEL}", user_id)
         return member.status in ['member', 'administrator', 'creator']
     except Exception as e:
         print(f"Kanal kontrol hatası: {e}")
@@ -531,7 +533,7 @@ async def handle_start(message):
     username = message.from_user.username or ""
     
     # Kanal kontrolü
-    is_member = check_channel_membership(user_id)
+    is_member = await check_channel_membership(user_id)
     
     # Kullanıcı bilgilerini al/güncelle
     user = await get_user(user_id)
@@ -600,17 +602,17 @@ async def handle_callback(call):
     try:
         # Kanal kontrolü (bazı özel durumlar hariç)
         if data not in ["check_join", "set_lang_tr", "set_lang_az"]:
-            if not check_channel_membership(user_id):
+            if not await check_channel_membership(user_id):
                 await bot.answer_callback_query(
                     call.id,
-                    "❌ Önce kanala katıl! @{}".format(MANDATORY_CHANNEL),
+                    f"❌ Önce kanala katıl! @{MANDATORY_CHANNEL}",
                     show_alert=True
                 )
                 return
         
         # Callback işlemleri
         if data == "check_join":
-            if check_channel_membership(user_id):
+            if await check_channel_membership(user_id):
                 await create_or_update_user(user_id, {'channel_joined': True})
                 await show_main_menu(user_id, call.message.message_id)
                 await bot.answer_callback_query(call.id, "✅ Başarılı!")
@@ -1293,7 +1295,8 @@ async def run_bot_async():
     """)
     
     try:
-        await bot.polling(non_stop=True, interval=3, timeout=60)
+        print("🤖 Bot polling başlatılıyor...")
+        await bot.infinity_polling(timeout=60, long_polling_timeout=60)
     except Exception as e:
         print(f"❌ Bot hatası: {e}")
         await asyncio.sleep(10)
