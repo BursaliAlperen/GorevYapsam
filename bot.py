@@ -7,6 +7,9 @@ import threading
 import sqlite3
 from flask import Flask, jsonify
 import hashlib
+
+# pytz alternatifi - datetime kullanımı
+from datetime import timezone
 import pytz
 
 # Telegram Ayarları
@@ -19,8 +22,16 @@ if not TOKEN:
 
 BASE_URL = f"https://api.telegram.org/bot{TOKEN}/"
 
-# Türkiye saati için
-TURKEY_TZ = pytz.timezone('Europe/Istanbul')
+# Türkiye saati için (pytz olmadan alternatif)
+def get_turkey_time():
+    """Türkiye saatini döndür"""
+    try:
+        # pytz varsa kullan
+        import pytz
+        return datetime.now(pytz.timezone('Europe/Istanbul'))
+    except:
+        # pytz yoksa UTC+3 kullan
+        return datetime.now(timezone(timedelta(hours=3)))
 
 # TRX Ayarları
 TRX_ADDRESS = "TVJKGbdBQrbvQzq6WZhb3kaGa3LYgVrMSK"
@@ -37,11 +48,7 @@ app = Flask(__name__)
 def home():
     return jsonify({"status": "online", "bot": "Görev Yapsam Bot v15.0"})
 
-def get_turkey_time():
-    """Türkiye saatini döndür"""
-    return datetime.now(TURKEY_TZ)
-
-# Database
+# Database - pytz bağımlılığını kaldırdık
 class Database:
     def __init__(self):
         self.conn = sqlite3.connect('bot.db', check_same_thread=False)
@@ -74,7 +81,7 @@ class Database:
             )
         ''')
         
-        # Kampanyalar - OTOMATİK ONAY İÇİN admin_approved ve admin_checked KALDIRILDI
+        # Kampanyalar
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS campaigns (
                 campaign_id TEXT PRIMARY KEY,
@@ -89,7 +96,7 @@ class Database:
                 price_per_task REAL,
                 max_participants INTEGER,
                 current_participants INTEGER DEFAULT 0,
-                status TEXT DEFAULT 'active', -- OTOMATİK AKTİF
+                status TEXT DEFAULT 'active',
                 created_at TEXT,
                 forward_message_id TEXT,
                 forward_chat_id TEXT,
@@ -668,7 +675,8 @@ class BotSystem:
                 data = response.json()
                 self.trx_price = data.get('tron', {}).get('try', 12.61)
                 print(f"₿ TRX Fiyatı: {self.trx_price:.2f}₺")
-        except: pass
+        except: 
+            pass
     
     def set_user_state(self, user_id, state, data=None):
         self.user_states[user_id] = {'state': state, 'data': data or {}, 'step': 1}
@@ -981,6 +989,63 @@ class BotSystem:
 
 <code>/cancel</code> {get_translation(user_id, 'cancel_text')}
 """)
+        
+        # TXID BEKLEME
+        elif state == 'waiting_txid':
+            txid = message['text'].strip()
+            deposit_id = data.get('deposit_id')
+            
+            # TXID format kontrolü
+            if len(txid) < 10 or len(txid) > 100:
+                send_message(user_id, f"❌ <b>{get_translation(user_id, 'error_occurred')}: TXID formatı geçersiz!</b>\n\n<i>Geçerli TXID girin veya /cancel ile iptal edin</i>")
+                return
+            
+            # Depoziti güncelle
+            try:
+                self.db.cursor.execute('''
+                    UPDATE deposits 
+                    SET txid = ?, status = 'completed', completed_at = ?
+                    WHERE deposit_id = ? AND user_id = ?
+                ''', (txid, get_turkey_time().isoformat(), deposit_id, user_id))
+                
+                # Kullanıcı bakiyesini güncelle
+                user = self.db.get_user(user_id)
+                amount = data['amount']
+                bonus = data['bonus']
+                
+                # Normal bakiye güncelle
+                new_balance = user.get('balance', 0) + amount + bonus
+                self.db.update_user(user_id, {
+                    'balance': new_balance,
+                    'total_deposited': user.get('total_deposited', 0) + amount,
+                    'deposit_count': user.get('deposit_count', 0) + 1,
+                    'total_bonus': user.get('total_bonus', 0) + bonus
+                })
+                
+                self.db.conn.commit()
+                
+                # Başarı mesajı
+                send_message(user_id, f"""
+<b>✅ {get_translation(user_id, 'success')}</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<b>💰 {get_translation(user_id, 'deposit')} tamamlandı!</b>
+<b>💳 Tutar:</b> {amount:.2f}₺
+<b>🎁 Bonus:</b> {bonus:.2f}₺ (%{DEPOSIT_BONUS_PERCENT})
+<b>💰 Toplam:</b> {amount + bonus:.2f}₺
+<b>📊 Yeni bakiye:</b> {new_balance:.2f}₺
+<b>🔗 TXID:</b> <code>{txid[:20]}...</code>
+
+<i>Bakiye başarıyla yüklendi. Hemen görev yapmaya başlayabilirsin!</i>
+""")
+                
+                self.clear_user_state(user_id)
+                time.sleep(2)
+                self.show_main_menu(user_id)
+                
+            except Exception as e:
+                print(f"❌ TXID hatası: {e}")
+                send_message(user_id, f"❌ <b>{get_translation(user_id, 'error_occurred')}: İşlem kaydedilemedi! Lütfen admin ile iletişime geçin.</b>")
     
     def process_callback(self, callback):
         try:
@@ -2087,6 +2152,101 @@ Suallarınız üçün admin ilə əlaqə saxlayın.
         except Exception as e:
             print(f"❌ Reddetme hatası: {e}")
             send_message(ADMIN_ID, f"❌ <b>Kampanya reddedilemedi:</b> {campaign_id}")
+
+    def show_admin_campaigns(self, user_id):
+        """Admin için kampanya listesi"""
+        if user_id != ADMIN_ID:
+            send_message(user_id, f"<b>{get_translation(user_id, 'admin_no_permission')}</b>")
+            return
+        
+        self.db.cursor.execute('''
+            SELECT * FROM campaigns 
+            ORDER BY created_at DESC 
+            LIMIT 20
+        ''')
+        campaigns = self.db.cursor.fetchall()
+        
+        if not campaigns:
+            send_message(user_id, "<b>📭 Hiç kampanya bulunamadı!</b>")
+            return
+        
+        message = "<b>📢 TÜM KAMPANYALAR</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        
+        for i, camp in enumerate(campaigns, 1):
+            status = camp['status']
+            status_icon = "🟢" if status == 'active' else "🟡" if status == 'pending' else "🔴"
+            
+            message += f"""{status_icon} <b>{camp['name'][:20]}</b>
+├ <b>ID:</b> <code>{camp['campaign_id']}</code>
+├ <b>Durum:</b> {status}
+├ <b>Oluşturan:</b> {camp['creator_name']}
+├ <b>Bütçe:</b> {camp['budget']:.1f}₺
+└ <b>Katılım:</b> {camp['current_participants']}/{camp['max_participants']}
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+        
+        message += f"\n<b>Toplam: {len(campaigns)} kampanya</b>"
+        
+        markup = {
+            'inline_keyboard': [[
+                {'text': get_translation(user_id, 'back'), 'callback_data': 'admin_panel'}
+            ]]
+        }
+        
+        send_message(user_id, message, markup)
+    
+    def show_admin_users(self, user_id):
+        """Admin için kullanıcı listesi"""
+        if user_id != ADMIN_ID:
+            send_message(user_id, f"<b>{get_translation(user_id, 'admin_no_permission')}</b>")
+            return
+        
+        self.db.cursor.execute('''
+            SELECT * FROM users 
+            ORDER BY created_at DESC 
+            LIMIT 20
+        ''')
+        users = self.db.cursor.fetchall()
+        
+        if not users:
+            send_message(user_id, "<b>👥 Hiç kullanıcı bulunamadı!</b>")
+            return
+        
+        message = "<b>👥 TÜM KULLANICILAR</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        
+        for i, usr in enumerate(users, 1):
+            message += f"""👤 <b>{usr['name'][:15]}</b>
+├ <b>ID:</b> <code>{usr['user_id']}</code>
+├ <b>Bakiye:</b> {usr['balance']:.1f}₺
+├ <b>Referans:</b> {usr['referrals']}
+└ <b>Kayıt:</b> {usr['created_at'][:10]}
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+        
+        message += f"\n<b>Toplam: {len(users)} kullanıcı</b>"
+        
+        markup = {
+            'inline_keyboard': [[
+                {'text': get_translation(user_id, 'back'), 'callback_data': 'admin_panel'}
+            ]]
+        }
+        
+        send_message(user_id, message, markup)
+    
+    def start_broadcast(self, user_id):
+        """Yayın başlat"""
+        if user_id != ADMIN_ID:
+            send_message(user_id, f"<b>{get_translation(user_id, 'admin_no_permission')}</b>")
+            return
+        
+        send_message(user_id, "📣 <b>Yayın sistemi</b>\n\nBu özellik henüz tamamlanmadı. Yakında eklenecek!")
+    
+    # Diğer admin fonksiyonları için placeholder'lar
+    def show_admin_deposits(self, user_id):
+        send_message(user_id, "💰 <b>Depozit Yönetimi</b>\n\nBu özellik henüz tamamlanmadı. Yakında eklenecek!")
+    
+    def show_admin_settings(self, user_id):
+        send_message(user_id, "⚙️ <b>Ayarlar</b>\n\nBu özellik henüz tamamlanmadı. Yakında eklenecek!")
 
 # Ana Program
 def main():
