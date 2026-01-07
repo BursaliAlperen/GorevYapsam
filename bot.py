@@ -1,6 +1,6 @@
 """
-🚀 GÖREV YAPSAM BOT - RENDER UYUMLU VERSİYON
-Render için PORT binding eklendi
+🚀 GÖREV YAPSAM BOT - PRODUCTION VERSION (gunicorn compatible)
+Render için production WSGI server desteği eklendi
 """
 
 import os
@@ -8,14 +8,13 @@ import time
 import json
 import requests
 from datetime import datetime
-from dotenv import load_dotenv
 import signal
 import sys
 import threading
 import re
-from flask import Flask, jsonify  # Flask eklendi
+from flask import Flask, jsonify, request
 
-# ================= 1. FLASK WEB SERVER (RENDER İÇİN) =================
+# ================= 1. FLASK APP (WSGI COMPATIBLE) =================
 app = Flask(__name__)
 
 @app.route('/')
@@ -23,13 +22,23 @@ def home():
     return jsonify({
         "status": "online",
         "bot": "Görev Yapsam Bot",
-        "version": "3.0",
-        "timestamp": datetime.now().isoformat()
+        "version": "3.1",
+        "timestamp": datetime.now().isoformat(),
+        "endpoints": ["/health", "/stats", "/webhook"]
     })
 
 @app.route('/health')
 def health():
-    return jsonify({"status": "healthy"}), 200
+    return jsonify({
+        "status": "healthy",
+        "bot_running": bot_running,
+        "database": {
+            "users": len(users),
+            "tasks": len(tasks),
+            "active_tasks": len(active_tasks),
+            "withdrawals": len(withdrawals)
+        }
+    }), 200
 
 @app.route('/stats')
 def stats():
@@ -37,47 +46,65 @@ def stats():
         "users": len(users),
         "tasks": len(tasks),
         "active_tasks": len(active_tasks),
-        "withdrawals": len(withdrawals)
+        "withdrawals": len(withdrawals),
+        "uptime": time.time() - start_time if 'start_time' in globals() else 0
     })
 
-# ================= 2. AYARLAR =================
-load_dotenv()
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Webhook endpoint (future use)"""
+    try:
+        data = request.get_json()
+        return jsonify({"status": "received"}), 200
+    except:
+        return jsonify({"error": "Invalid data"}), 400
 
+# ================= 2. AYARLAR =================
+# Environment variables
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7904032877"))
 MANDATORY_CHANNEL = os.getenv("MANDATORY_CHANNEL", "GY_Refim")
 BASE_URL = f"https://api.telegram.org/bot{TOKEN}/"
 
-# Render port ayarı
-PORT = int(os.environ.get('PORT', 8080))
+# Global değişkenler
+bot_running = False
+start_time = time.time()
 
 print("=" * 60)
-print("🤖 GÖREV YAPSAM BOT - RENDER VERSİYON")
+print("🤖 GÖREV YAPSAM BOT - PRODUCTION VERSION")
 print(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-print(f"🔌 Port: {PORT}")
 print("=" * 60)
 
-# ================= 3. VERİTABANLARI =================
+# ================= 3. VERİTABANI SİSTEMİ =================
 USERS_DB = "users.json"
 TASKS_DB = "tasks.json"
 ACTIVE_TASKS_DB = "active_tasks.json"
 WITHDRAWALS_DB = "withdrawals.json"
 
 def load_json(filename):
+    """JSON dosyasını yükle"""
     try:
         if os.path.exists(filename):
             with open(filename, 'r', encoding='utf-8') as f:
                 return json.load(f)
-    except:
-        pass
-    return {}
+        return {}
+    except Exception as e:
+        print(f"❌ {filename} yükleme hatası: {e}")
+        return {}
 
 def save_json(filename, data):
+    """JSON dosyasına kaydet"""
     try:
-        with open(filename, 'w', encoding='utf-8') as f:
+        # Atomik kayıt için geçici dosya kullan
+        temp_file = filename + '.tmp'
+        with open(temp_file, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        
+        # Geçici dosyayı asıl dosyaya taşı
+        os.replace(temp_file, filename)
         return True
-    except:
+    except Exception as e:
+        print(f"❌ {filename} kaydetme hatası: {e}")
         return False
 
 # Veritabanlarını yükle
@@ -86,9 +113,11 @@ tasks = load_json(TASKS_DB)
 active_tasks = load_json(ACTIVE_TASKS_DB)
 withdrawals = load_json(WITHDRAWALS_DB)
 
+print(f"📊 Veritabanı yüklendi: {len(users)} kullanıcı, {len(tasks)} görev")
+
 # ================= 4. TELEGRAM API FONKSİYONLARI =================
 def send_message(chat_id, text, reply_markup=None, parse_mode='HTML'):
-    """Mesaj gönder"""
+    """Telegram'a mesaj gönder"""
     url = BASE_URL + "sendMessage"
     data = {
         'chat_id': chat_id,
@@ -104,11 +133,11 @@ def send_message(chat_id, text, reply_markup=None, parse_mode='HTML'):
         response = requests.post(url, json=data, timeout=10)
         return response.json()
     except Exception as e:
-        print(f"Mesaj gönderme hatası: {e}")
+        print(f"❌ Mesaj gönderme hatası: {e}")
         return None
 
 def answer_callback(callback_id, text=None, show_alert=False):
-    """Callback cevabı"""
+    """Callback query'ye cevap ver"""
     url = BASE_URL + "answerCallbackQuery"
     data = {'callback_query_id': callback_id}
     
@@ -158,44 +187,54 @@ def get_chat_member(chat_id, user_id):
         pass
     return False
 
-# ================= 5. POLLING SİSTEMİ (409 FIX) =================
-def manual_polling():
-    """Manuel polling - 409 hatasını çözer"""
-    print("🔄 Manuel polling başlatıldı...")
+# ================= 5. POLLING SİSTEMİ (PRODUCTION) =================
+def telegram_polling():
+    """Production için polling sistemi"""
+    global bot_running
+    
+    print("🔄 Telegram polling başlatıldı...")
+    bot_running = True
     
     offset = 0
-    polling_active = True
+    error_count = 0
+    max_errors = 10
     
-    while polling_active:
+    while bot_running:
         try:
             # GetUpdates isteği
             url = BASE_URL + "getUpdates"
             params = {
                 'offset': offset,
-                'timeout': 30,
+                'timeout': 25,  # Production için daha kısa timeout
                 'allowed_updates': ['message', 'callback_query']
             }
             
-            response = requests.get(url, params=params, timeout=35)
+            response = requests.get(url, params=params, timeout=30)
             
+            # 409 Conflict kontrolü
             if response.status_code == 409:
-                print("⚠️ 409 Conflict - 5 saniye bekleniyor...")
-                time.sleep(5)
+                print("⚠️ 409 Conflict - Diğer bot instance'ı tespit edildi!")
+                print("⏳ 10 saniye bekleniyor...")
+                time.sleep(10)
                 offset = 0
+                error_count += 1
                 continue
             
             if response.status_code != 200:
-                print(f"⚠️ HTTP {response.status_code} - 3 saniye bekleniyor...")
-                time.sleep(3)
+                print(f"⚠️ HTTP {response.status_code} - 5 saniye bekleniyor...")
+                time.sleep(5)
+                error_count += 1
                 continue
             
             data = response.json()
             
             if not data.get('ok'):
-                print(f"⚠️ API Error: {data}")
+                print(f"⚠️ Telegram API error: {data}")
                 time.sleep(2)
+                error_count += 1
                 continue
             
+            # Update'leri işle
             if data.get('result'):
                 updates = data['result']
                 
@@ -204,31 +243,55 @@ def manual_polling():
                     
                     # Mesaj işleme
                     if 'message' in update:
-                        handle_update_message(update['message'])
+                        threading.Thread(
+                            target=handle_update_message,
+                            args=(update['message'],),
+                            daemon=True
+                        ).start()
                     
                     # Callback işleme
                     elif 'callback_query' in update:
-                        handle_callback_query(update['callback_query'])
+                        threading.Thread(
+                            target=handle_callback_query,
+                            args=(update['callback_query'],),
+                            daemon=True
+                        ).start()
+                
+                # Başarılı işlem
+                error_count = 0
+            
+            # Çok fazla hata kontrolü
+            if error_count >= max_errors:
+                print(f"🚨 Çok fazla hata ({error_count}), yeniden başlatılıyor...")
+                time.sleep(30)
+                offset = 0
+                error_count = 0
             
         except requests.exceptions.Timeout:
             print("⏱️ Timeout - Yeniden deniyor...")
+            error_count += 1
             continue
             
         except requests.exceptions.ConnectionError:
-            print("🔌 Connection error - 5 saniye bekleniyor...")
-            time.sleep(5)
+            print("🔌 Connection error - 10 saniye bekleniyor...")
+            time.sleep(10)
+            error_count += 1
             continue
             
         except KeyboardInterrupt:
             print("\n⏹️ Polling durduruluyor...")
-            polling_active = False
+            bot_running = False
             break
             
         except Exception as e:
-            print(f"❌ Hata: {e}")
+            print(f"❌ Polling hatası: {e}")
+            error_count += 1
             time.sleep(2)
         
+        # CPU kullanımını azaltmak için kısa bekleme
         time.sleep(0.1)
+    
+    print("📴 Telegram polling durduruldu.")
 
 # ================= 6. MESAJ HANDLER =================
 def handle_update_message(message):
@@ -305,46 +368,49 @@ def handle_update_message(message):
                     "📢 <b>Kanal:</b> @GY_Refim"
                 )
                 return
+                
+            elif text.startswith('/iptal'):
+                cancel_task_creation(user_id)
+                return
+        
+        # Forward mesaj kontrolü
+        if 'forward_from_chat' in message and user.get('state') == 'waiting_forward':
+            user['forward_msg'] = {
+                'chat_id': message['forward_from_chat']['id'],
+                'message_id': message['message_id'],
+                'chat_title': message['forward_from_chat'].get('title', '')
+            }
+            user['state'] = 'waiting_link'
+            save_json(USERS_DB, users)
+            
+            send_message(
+                user_id,
+                "✅ <b>Forward mesaj alındı!</b>\n\n"
+                "🔗 Şimdi görev linkini gönderin:\n"
+                "(Örnek: https://t.me/OrnekKanal)\n\n"
+                "❌ İptal: /iptal"
+            )
+            return
         
         show_main_menu(user_id)
             
     except Exception as e:
-        print(f"Mesaj işleme hatası: {e}")
+        print(f"❌ Mesaj işleme hatası: {e}")
 
 def handle_user_state(user_id, message):
     """Kullanıcı state'ini işle"""
     user = users.get(user_id, {})
     state = user.get('state')
-    task_type = user.get('task_type')
     
     if state == 'waiting_forward':
         if 'text' in message and message['text'] == '/iptal':
             cancel_task_creation(user_id)
             return
             
-        if 'forward_from_chat' not in message:
-            send_message(
-                user_id,
-                "❌ <b>Lütfen bir mesaj FORWARD edin!</b>\n\n"
-                "Görev oluşturmak için öncelikle mesajı forward etmelisiniz.\n\n"
-                "❌ İptal: /iptal"
-            )
-            return
-        
-        # Forward mesajı kaydet
-        user['forward_msg'] = {
-            'chat_id': message['forward_from_chat']['id'],
-            'message_id': message['message_id'],
-            'chat_title': message['forward_from_chat'].get('title', '')
-        }
-        user['state'] = 'waiting_link'
-        save_json(USERS_DB, users)
-        
         send_message(
             user_id,
-            "✅ <b>Forward mesaj alındı!</b>\n\n"
-            "🔗 Şimdi görev linkini gönderin:\n"
-            "(Örnek: https://t.me/OrnekKanal)\n\n"
+            "❌ <b>Lütfen bir mesaj FORWARD edin!</b>\n\n"
+            "Görev oluşturmak için öncelikle mesajı forward etmelisiniz.\n\n"
             "❌ İptal: /iptal"
         )
     
@@ -495,7 +561,7 @@ def handle_user_state(user_id, message):
                     "❌ İptal: /iptal"
                 )
 
-# ================= 7. START KOMUTU =================
+# ================= 7. ANA KOMUTLAR =================
 def handle_start_command(user_id, first_name, text):
     """Start komutunu işle"""
     # Kanal kontrolü
@@ -570,19 +636,15 @@ Botu kullanabilmek için kanala katılmalısın:
     # Ana menü
     show_main_menu(user_id)
 
-# ================= 8. CALLBACK HANDLER =================
 def handle_callback_query(callback):
     """Callback query işle"""
     try:
         user_id = str(callback['from']['id'])
         data = callback['data']
         callback_id = callback['id']
-        message_id = callback['message']['message_id'] if 'message' in callback else None
         
         # Cevap gönder
         answer_callback(callback_id)
-        
-        user = users.get(user_id, {})
         
         if data == "joined":
             in_channel = get_chat_member(MANDATORY_CHANNEL, int(user_id))
@@ -601,7 +663,7 @@ def handle_callback_query(callback):
                 answer_callback(callback_id, f"❌ Önce kanala katıl! @{MANDATORY_CHANNEL}", True)
                 return
         
-        if data == "refresh" or data == "menu":
+        if data in ["refresh", "menu"]:
             show_main_menu(user_id)
         
         elif data == "do_task":
@@ -617,14 +679,14 @@ def handle_callback_query(callback):
             show_withdraw_menu(user_id)
         
         elif data == "request_withdraw":
-            request_withdrawal(user_id, message_id)
+            request_withdrawal(user_id)
         
         elif data.startswith("create_type_"):
             task_type = data.replace("create_type_", "")
             start_create_task_flow(user_id, task_type)
         
         elif data == "confirm_task":
-            confirm_and_create_task(user_id, message_id)
+            confirm_and_create_task(user_id)
         
         elif data == "cancel_create":
             cancel_task_creation(user_id)
@@ -633,9 +695,9 @@ def handle_callback_query(callback):
             show_main_menu(user_id)
             
     except Exception as e:
-        print(f"Callback hatası: {e}")
+        print(f"❌ Callback hatası: {e}")
 
-# ================= 9. GÖREV OLUŞTURMA SİSTEMİ =================
+# ================= 8. GÖREV OLUŞTURMA =================
 def check_bot_in_channel(user_id):
     """Görev oluşturma başlangıç"""
     markup = {
@@ -655,13 +717,9 @@ def check_bot_in_channel(user_id):
     
     msg = """📢 <b>GÖREV OLUŞTURMA</b>
 
-══════════════════════════════
-
 🤖 <b>BOT GÖREVİ</b> - 2.5₺/görev
 📢 <b>KANAL GÖREVİ</b> - 1.5₺/görev
 👥 <b>GRUP GÖREVİ</b> - 1₺/görev
-
-══════════════════════════════
 
 👇 <b>Görev tipini seçin:</b>"""
     
@@ -671,7 +729,6 @@ def start_create_task_flow(user_id, task_type):
     """Görev oluşturma akışını başlat"""
     user = users.get(user_id, {})
     
-    # Görev tipini kaydet
     user['task_type'] = task_type
     
     if task_type == 'bot':
@@ -679,8 +736,6 @@ def start_create_task_flow(user_id, task_type):
         save_json(USERS_DB, users)
         
         msg = """📝 <b>BOT GÖREVİ OLUŞTURMA</b>
-
-══════════════════════════════
 
 📤 <b>ADIM 1: FORWARD MESAJ</b>
 
@@ -695,8 +750,6 @@ Lütfen mesajı <b>forward</b> edin.
         task_type_text = "KANAL GÖREVİ" if task_type == 'channel' else "GRUP GÖREVİ"
         
         msg = f"""📝 <b>{task_type_text} OLUŞTURMA</b>
-
-══════════════════════════════
 
 🔗 <b>ADIM 1: LİNK GÖNDERME</b>
 
@@ -730,47 +783,31 @@ def show_task_confirmation(user_id, task_count):
     
     msg = f"""🎯 <b>GÖREV ÖZETİ</b>
 
-══════════════════════════════
-
 📋 <b>Tip:</b> {task_type_text}
 🔗 <b>Link:</b> {user.get('task_link', 'Belirtilmedi')}
 📝 <b>İsim:</b> {user.get('task_name', 'Belirtilmedi')}
-📄 <b>Açıklama:</b> {user.get('task_desc', 'Belirtilmedi')}
 
-══════════════════════════════
-
-💰 <b>BÜTÇE DETAYI</b>
+💰 <b>BÜTÇE</b>
 • Toplam: {user.get('task_budget', 0):.2f}₺
 • Görev Başı: {price_per_task}₺
 • Görev Sayısı: {task_count} adet
 
-══════════════════════════════
-
-💸 <b>BAKİYE DURUMU</b>
+💸 <b>BAKİYE</b>
 • Mevcut: {user.get('balance', 0):.2f}₺
 • Kalan: {user.get('balance', 0) - user.get('task_budget', 0):.2f}₺
-
-══════════════════════════════
 
 ⚠️ <b>Onaylıyor musunuz?</b>"""
     
     send_message(user_id, msg, markup)
 
-def confirm_and_create_task(user_id, message_id):
+def confirm_and_create_task(user_id):
     """Görevi onayla ve oluştur"""
     user = users.get(user_id, {})
     
     # Bakiye kontrolü
     budget = user.get('task_budget', 0)
     if user.get('balance', 0) < budget:
-        if message_id:
-            edit_message(
-                user_id,
-                message_id,
-                f"❌ <b>Yetersiz bakiye!</b>\n\n"
-                f"💸 Mevcut: {user.get('balance', 0):.2f}₺\n"
-                f"💰 Gerekli: {budget:.2f}₺"
-            )
+        send_message(user_id, f"❌ <b>Yetersiz bakiye!</b>\n\n💸 Mevcut: {user.get('balance', 0):.2f}₺")
         return
     
     task_type = user.get('task_type', 'channel')
@@ -823,29 +860,17 @@ def confirm_and_create_task(user_id, message_id):
     markup = {
         'inline_keyboard': [
             [
-                {'text': '🤖 YENİ GÖREV OLUŞTUR', 'callback_data': 'create_task'},
-                {'text': '🏠 ANA MENÜ', 'callback_data': 'menu'}
+                {'text': '🤖 YENİ GÖREV', 'callback_data': 'create_task'},
+                {'text': '🏠 MENÜ', 'callback_data': 'menu'}
             ]
         ]
     }
     
-    # Kota mesajı
-    if price_per_task == 1.0:
-        kota_msg = f"100₺ = {task_count} görev"
-    elif price_per_task == 1.5:
-        kota_msg = f"100₺ = {int(100/1.5)} görev"
-    else:
-        kota_msg = f"100₺ = {int(100/2.5)} görev"
-    
     msg = f"""🎉 <b>GÖREV OLUŞTURULDU!</b>
 
-══════════════════════════════
-
-📌 <b>Görev ID:</b> <code>{task_id}</code>
+📌 <b>ID:</b> <code>{task_id}</code>
 📋 <b>Tip:</b> {task_type.upper()}
 🔗 <b>Link:</b> {task_data['link']}
-
-══════════════════════════════
 
 💰 <b>BÜTÇE</b>
 • Toplam: {budget:.2f}₺
@@ -853,16 +878,9 @@ def confirm_and_create_task(user_id, message_id):
 • Görev Sayısı: {task_count} adet
 • Kalan Bakiye: {user.get('balance', 0):.2f}₺
 
-══════════════════════════════
-
-📊 <b>KOTA:</b> {kota_msg}
-
 ✅ <b>Göreviniz aktif!</b>"""
     
-    if message_id:
-        edit_message(user_id, message_id, msg, markup)
-    else:
-        send_message(user_id, msg, markup)
+    send_message(user_id, msg, markup)
 
 def cancel_task_creation(user_id):
     """Görev oluşturmayı iptal et"""
@@ -887,7 +905,7 @@ def cancel_task_creation(user_id):
     time.sleep(1)
     show_main_menu(user_id)
 
-# ================= 10. ÖDEME SİSTEMİ =================
+# ================= 9. ÖDEME SİSTEMİ =================
 def show_withdraw_menu(user_id):
     """Para çekme menüsü"""
     user = users.get(user_id, {})
@@ -913,26 +931,15 @@ def show_withdraw_menu(user_id):
     
     msg = f"""💸 <b>PARA ÇEKME</b>
 
-══════════════════════════════
-
 💰 <b>Mevcut Bakiye:</b> {balance:.2f}₺
 📊 <b>Minimum Çekim:</b> {min_withdraw}₺
 ⏰ <b>İşlem Süresi:</b> 24-48 saat
-
-══════════════════════════════
-
-🎯 <b>YAKINDA AKTİF:</b>
-• ₿ Kripto Para
-• 📱 Papara
-• 🏦 Banka
-
-══════════════════════════════
 
 ⚠️ <i>"ÖDEME TALEP ET" butonuna basın.</i>"""
     
     send_message(user_id, msg, markup)
 
-def request_withdrawal(user_id, message_id):
+def request_withdrawal(user_id):
     """Para çekme talebi oluştur"""
     user = users.get(user_id, {})
     balance = user.get('balance', 0)
@@ -986,18 +993,14 @@ def request_withdrawal(user_id, message_id):
 ⏳ <b>DURUM:</b> Admin onayı bekleniyor...
 🕐 <b>Süre:</b> 24-48 saat"""
     
-    if message_id:
-        edit_message(user_id, message_id, msg, markup)
-    else:
-        send_message(user_id, msg, markup)
+    send_message(user_id, msg, markup)
 
-# ================= 11. DİĞER MENÜ FONKSİYONLARI =================
+# ================= 10. MENÜ FONKSİYONLARI =================
 def show_main_menu(user_id):
     """Ana menü göster"""
     user = users.get(user_id, {})
     name = user.get('name', 'Kullanıcı')
     balance = user.get('balance', 0.0)
-    tasks_done = user.get('tasks_completed', 0)
     
     markup = {
         'inline_keyboard': [
@@ -1025,14 +1028,7 @@ def show_main_menu(user_id):
 
 👋 <b>Merhaba {name}!</b>
 
-══════════════════════════════
-
 💰 <b>BAKİYE:</b> {balance:.2f}₺
-📊 <b>Görevler:</b> {tasks_done}
-👥 <b>Referans:</b> {user.get('referrals', 0)}
-
-══════════════════════════════
-
 📢 <b>Kanal:</b> @{MANDATORY_CHANNEL}"""
     
     send_message(user_id, msg, markup)
@@ -1057,12 +1053,7 @@ def show_balance_menu(user_id):
 
 💵 <b>BAKİYE</b>
 • Mevcut: {user.get('balance', 0):.2f}₺
-• Minimum Çekim: 20₺
-
-📊 <b>İSTATİSTİK</b>
-• Tamamlanan Görev: {user.get('tasks_completed', 0)}
-• Oluşturulan Görev: {user.get('tasks_created', 0)}
-• Referans Sayısı: {user.get('referrals', 0)}"""
+• Minimum Çekim: 20₺"""
     
     send_message(user_id, msg, markup)
 
@@ -1093,7 +1084,7 @@ def show_task_selection(user_id):
     
     send_message(user_id, msg, markup)
 
-# ================= 12. TEMİZLEME FONKSİYONU =================
+# ================= 11. TEMİZLEME =================
 def cleanup_old_tasks():
     """Eski görevleri temizle"""
     while True:
@@ -1117,25 +1108,23 @@ def cleanup_old_tasks():
                 print(f"🧹 {cleaned} eski görev temizlendi")
             
         except Exception as e:
-            print(f"Temizleme hatası: {e}")
+            print(f"❌ Temizleme hatası: {e}")
         
         time.sleep(3600)
 
-# ================= 13. ANA PROGRAM =================
+# ================= 12. ANA BAŞLATMA =================
 def start_bot():
     """Botu başlat"""
+    global start_time
+    
     print("""
     ╔══════════════════════════════════════════╗
-    ║    🚀 GÖREV YAPSAM BOT - RENDER          ║
-    ║    • Flask Web Server                    ║
-    ║    • Port: {}                    ║
+    ║    🚀 GÖREV YAPSAM BOT - PRODUCTION      ║
+    ║    • Flask + gunicorn                    ║
+    ║    • Production WSGI server              ║
     ║    • 409 Hata Fix                        ║
     ╚══════════════════════════════════════════╝
-    """.format(PORT))
-    
-    # Temizleme thread'ini başlat
-    cleanup_thread = threading.Thread(target=cleanup_old_tasks, daemon=True)
-    cleanup_thread.start()
+    """)
     
     # Bot kontrolü
     try:
@@ -1147,26 +1136,46 @@ def start_bot():
             bot_name = data['result']['first_name']
             bot_username = data['result']['username']
             print(f"✅ Bot: @{bot_username} ({bot_name})")
-            print(f"✅ Port: {PORT}")
             print(f"✅ Admin ID: {ADMIN_ID}")
             print(f"✅ Kanal: @{MANDATORY_CHANNEL}")
+            print(f"✅ Kullanıcılar: {len(users)}")
+            print(f"✅ Görevler: {len(tasks)}")
         else:
             print(f"❌ Bot token hatalı")
-            return
+            return False
     
     except Exception as e:
         print(f"❌ Bot bağlantı hatası: {e}")
-        return
+        return False
     
-    print("🔄 Manuel polling başlatılıyor...")
+    # Temizleme thread'ini başlat
+    cleanup_thread = threading.Thread(target=cleanup_old_tasks, daemon=True)
+    cleanup_thread.start()
     
-    # Polling'i thread'de başlat
-    polling_thread = threading.Thread(target=manual_polling, daemon=True)
+    # Telegram polling'i başlat
+    polling_thread = threading.Thread(target=telegram_polling, daemon=True)
     polling_thread.start()
     
-    # Flask'ı başlat
-    print(f"🌐 Flask web server başlatılıyor (Port: {PORT})...")
-    app.run(host='0.0.0.0', port=PORT, debug=False)
+    print("✅ Bot başarıyla başlatıldı!")
+    print("🌐 Web server çalışıyor...")
+    
+    return True
 
+# ================= 13. PRODUCTION WSGI ENTRY POINT =================
+# Bu fonksiyon gunicorn tarafından çağrılır
+def create_app():
+    """WSGI uygulamasını oluştur"""
+    # Botu başlat
+    bot_thread = threading.Thread(target=start_bot, daemon=True)
+    bot_thread.start()
+    
+    return app
+
+# Development için direkt çalıştırma
 if __name__ == "__main__":
-    start_bot()
+    # Botu başlat
+    if start_bot():
+        # Flask'ı başlat (development için)
+        port = int(os.environ.get('PORT', 8080))
+        print(f"🚀 Development server başlatılıyor: http://0.0.0.0:{port}")
+        app.run(host='0.0.0.0', port=port, debug=False)
