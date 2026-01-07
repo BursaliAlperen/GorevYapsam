@@ -4,13 +4,13 @@ import json
 import requests
 from datetime import datetime, timedelta
 import threading
-import sqlite3
 from flask import Flask, jsonify
 import hashlib
-
-# pytz alternatifi - datetime kullanımı
-from datetime import timezone
 import pytz
+import random
+import firebase_admin
+from firebase_admin import credentials, firestore
+import uuid
 
 # Telegram Ayarları
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -22,16 +22,8 @@ if not TOKEN:
 
 BASE_URL = f"https://api.telegram.org/bot{TOKEN}/"
 
-# Türkiye saati için (pytz olmadan alternatif)
-def get_turkey_time():
-    """Türkiye saatini döndür"""
-    try:
-        # pytz varsa kullan
-        import pytz
-        return datetime.now(pytz.timezone('Europe/Istanbul'))
-    except:
-        # pytz yoksa UTC+3 kullan
-        return datetime.now(timezone(timedelta(hours=3)))
+# Türkiye saati için
+TURKEY_TZ = pytz.timezone('Europe/Istanbul')
 
 # TRX Ayarları
 TRX_ADDRESS = "TVJKGbdBQrbvQzq6WZhb3kaGa3LYgVrMSK"
@@ -46,17 +38,52 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return jsonify({"status": "online", "bot": "Görev Yapsam Bot v15.0"})
+    return jsonify({"status": "online", "bot": "Görev Yapsam Bot v17.0 (Firebase)"})
 
-# Database - pytz bağımlılığını kaldırdık
-class Database:
+def get_turkey_time():
+    """Türkiye saatini döndür"""
+    return datetime.now(TURKEY_TZ)
+
+# Firebase Database
+class FirebaseDatabase:
     def __init__(self):
-        self.conn = sqlite3.connect('bot.db', check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.cursor = self.conn.cursor()
-        self.init_db()
+        try:
+            # Firebase credentials environment variable'dan al
+            firebase_cred_json = os.environ.get('FIREBASE_CREDENTIALS')
+            
+            if not firebase_cred_json:
+                print("⚠️ Firebase credentials bulunamadı, SQLite'a geçiliyor...")
+                # Geçici olarak SQLite kullan
+                import sqlite3
+                self.use_firebase = False
+                self.conn = sqlite3.connect('bot.db', check_same_thread=False)
+                self.conn.row_factory = sqlite3.Row
+                self.cursor = self.conn.cursor()
+                self.init_sqlite()
+            else:
+                # Firebase başlat
+                cred_dict = json.loads(firebase_cred_json)
+                cred = credentials.Certificate(cred_dict)
+                
+                if not firebase_admin._apps:
+                    firebase_admin.initialize_app(cred)
+                
+                self.db = firestore.client()
+                self.use_firebase = True
+                print("✅ Firebase bağlantısı başarılı")
+                
+        except Exception as e:
+            print(f"❌ Firebase başlatma hatası: {e}")
+            print("⚠️ SQLite'a geçiliyor...")
+            self.use_firebase = False
+            import sqlite3
+            self.conn = sqlite3.connect('bot.db', check_same_thread=False)
+            self.conn.row_factory = sqlite3.Row
+            self.cursor = self.conn.cursor()
+            self.init_sqlite()
     
-    def init_db(self):
+    def init_sqlite(self):
+        """SQLite tablolarını oluştur (geçici)"""
         # Kullanıcılar
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
@@ -77,7 +104,9 @@ class Database:
                 total_deposited REAL DEFAULT 0.0,
                 deposit_count INTEGER DEFAULT 0,
                 total_bonus REAL DEFAULT 0.0,
-                language TEXT DEFAULT 'tr'
+                language TEXT DEFAULT 'tr',
+                notification_enabled INTEGER DEFAULT 1,
+                last_active TEXT
             )
         ''')
         
@@ -125,60 +154,469 @@ class Database:
             )
         ''')
         
-        # Katılımlar
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS participations (
-                participation_id TEXT PRIMARY KEY,
-                user_id TEXT,
-                campaign_id TEXT,
-                status TEXT DEFAULT 'pending',
-                created_at TEXT,
-                reward_amount REAL DEFAULT 0.0
-            )
-        ''')
-        
         self.conn.commit()
-        print("✅ Veritabanı hazır")
+        print("✅ SQLite veritabanı hazır")
     
+    # --- FIREBASE METODLARI ---
+    
+    # USER METODLARI
     def get_user(self, user_id):
-        self.cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-        user = self.cursor.fetchone()
-        
-        if not user:
-            now = get_turkey_time().isoformat()
-            self.cursor.execute('''
-                INSERT INTO users (user_id, name, balance, ads_balance, created_at, language)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (user_id, '', 0.0, 0.0, now, 'tr'))
-            self.conn.commit()
+        if self.use_firebase:
+            try:
+                doc_ref = self.db.collection('users').document(user_id)
+                doc = doc_ref.get()
+                
+                if doc.exists:
+                    return doc.to_dict()
+                else:
+                    # Yeni kullanıcı oluştur
+                    user_data = {
+                        'user_id': user_id,
+                        'name': '',
+                        'username': '',
+                        'balance': 0.0,
+                        'ads_balance': 0.0,
+                        'total_earned': 0.0,
+                        'tasks_completed': 0,
+                        'referrals': 0,
+                        'ref_earned': 0.0,
+                        'daily_streak': 0,
+                        'in_channel': 0,
+                        'created_at': get_turkey_time().isoformat(),
+                        'welcome_bonus': 0,
+                        'total_deposited': 0.0,
+                        'deposit_count': 0,
+                        'total_bonus': 0.0,
+                        'language': 'tr',
+                        'notification_enabled': True,
+                        'last_active': get_turkey_time().isoformat()
+                    }
+                    doc_ref.set(user_data)
+                    
+                    # İstatistik güncelle
+                    self.update_bot_stats('new_user')
+                    
+                    return user_data
+            except Exception as e:
+                print(f"❌ Firebase get_user hatası: {e}")
+                return {}
+        else:
+            # SQLite
             self.cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
             user = self.cursor.fetchone()
-        
-        return dict(user) if user else {}
+            
+            if not user:
+                now = get_turkey_time().isoformat()
+                self.cursor.execute('''
+                    INSERT INTO users (user_id, name, balance, ads_balance, created_at, language, last_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (user_id, '', 0.0, 0.0, now, 'tr', now))
+                self.conn.commit()
+                self.cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+                user = self.cursor.fetchone()
+            
+            return dict(user) if user else {}
     
     def update_user(self, user_id, data):
-        if not data: return False
-        set_clause = ', '.join([f"{k} = ?" for k in data.keys()])
-        values = list(data.values())
-        values.append(user_id)
-        query = f"UPDATE users SET {set_clause} WHERE user_id = ?"
-        self.cursor.execute(query, values)
-        self.conn.commit()
-        return True
+        if not data:
+            return False
+        
+        data['last_active'] = get_turkey_time().isoformat()
+        
+        if self.use_firebase:
+            try:
+                doc_ref = self.db.collection('users').document(user_id)
+                doc_ref.update(data)
+                return True
+            except Exception as e:
+                print(f"❌ Firebase update_user hatası: {e}")
+                return False
+        else:
+            # SQLite
+            set_clause = ', '.join([f"{k} = ?" for k in data.keys()])
+            values = list(data.values())
+            values.append(user_id)
+            query = f"UPDATE users SET {set_clause} WHERE user_id = ?"
+            self.cursor.execute(query, values)
+            self.conn.commit()
+            return True
     
     def add_balance(self, user_id, amount, bonus_percent=0):
         user = self.get_user(user_id)
         bonus = amount * bonus_percent / 100
         total = amount + bonus
-        new_balance = user.get('balance', 0) + total
         
-        self.cursor.execute('''
-            UPDATE users 
-            SET balance = ?, total_earned = total_earned + ?, total_bonus = total_bonus + ? 
-            WHERE user_id = ?
-        ''', (new_balance, total, bonus, user_id))
-        self.conn.commit()
+        if self.use_firebase:
+            try:
+                doc_ref = self.db.collection('users').document(user_id)
+                doc_ref.update({
+                    'balance': firestore.Increment(total),
+                    'total_earned': firestore.Increment(total),
+                    'total_bonus': firestore.Increment(bonus)
+                })
+                return True
+            except Exception as e:
+                print(f"❌ Firebase add_balance hatası: {e}")
+                return False
+        else:
+            new_balance = user.get('balance', 0) + total
+            self.cursor.execute('''
+                UPDATE users 
+                SET balance = ?, total_earned = total_earned + ?, total_bonus = total_bonus + ? 
+                WHERE user_id = ?
+            ''', (new_balance, total, bonus, user_id))
+            self.conn.commit()
+            return True
+    
+    # CAMPAIGN METODLARI
+    def create_campaign(self, campaign_data):
+        if self.use_firebase:
+            try:
+                doc_ref = self.db.collection('campaigns').document(campaign_data['campaign_id'])
+                doc_ref.set(campaign_data)
+                return True
+            except Exception as e:
+                print(f"❌ Firebase create_campaign hatası: {e}")
+                return False
+        else:
+            try:
+                self.cursor.execute('''
+                    INSERT INTO campaigns 
+                    (campaign_id, name, description, link, budget, remaining_budget,
+                     creator_id, creator_name, task_type, price_per_task, max_participants,
+                     status, created_at, forward_message_id, forward_chat_id, forward_message_text,
+                     forward_from_bot_id, forward_from_bot_name, target_chat_id, target_chat_name,
+                     is_bot_admin)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    campaign_data['campaign_id'],
+                    campaign_data['name'],
+                    campaign_data['description'],
+                    campaign_data['link'],
+                    campaign_data['budget'],
+                    campaign_data['remaining_budget'],
+                    campaign_data['creator_id'],
+                    campaign_data['creator_name'],
+                    campaign_data['task_type'],
+                    campaign_data['price_per_task'],
+                    campaign_data['max_participants'],
+                    campaign_data['status'],
+                    campaign_data['created_at'],
+                    campaign_data.get('forward_message_id', ''),
+                    campaign_data.get('forward_chat_id', ''),
+                    campaign_data.get('forward_message_text', ''),
+                    campaign_data.get('forward_from_bot_id', ''),
+                    campaign_data.get('forward_from_bot_name', ''),
+                    campaign_data.get('target_chat_id', ''),
+                    campaign_data.get('target_chat_name', ''),
+                    campaign_data.get('is_bot_admin', 0)
+                ))
+                self.conn.commit()
+                return True
+            except Exception as e:
+                print(f"❌ SQLite create_campaign hatası: {e}")
+                return False
+    
+    def get_active_campaigns(self, limit=10):
+        if self.use_firebase:
+            try:
+                campaigns_ref = self.db.collection('campaigns')
+                query = campaigns_ref.where('status', '==', 'active')\
+                                     .where('remaining_budget', '>', 0)\
+                                     .order_by('created_at', direction=firestore.Query.DESCENDING)\
+                                     .limit(limit)
+                docs = query.stream()
+                return [doc.to_dict() for doc in docs]
+            except Exception as e:
+                print(f"❌ Firebase get_active_campaigns hatası: {e}")
+                return []
+        else:
+            self.cursor.execute('''
+                SELECT * FROM campaigns 
+                WHERE status = 'active' AND remaining_budget > 0
+                ORDER BY created_at DESC 
+                LIMIT ?
+            ''', (limit,))
+            campaigns = self.cursor.fetchall()
+            return [dict(camp) for camp in campaigns]
+    
+    def get_user_campaigns(self, user_id, limit=10):
+        if self.use_firebase:
+            try:
+                campaigns_ref = self.db.collection('campaigns')
+                query = campaigns_ref.where('creator_id', '==', user_id)\
+                                     .order_by('created_at', direction=firestore.Query.DESCENDING)\
+                                     .limit(limit)
+                docs = query.stream()
+                return [doc.to_dict() for doc in docs]
+            except Exception as e:
+                print(f"❌ Firebase get_user_campaigns hatası: {e}")
+                return []
+        else:
+            self.cursor.execute('''
+                SELECT * FROM campaigns 
+                WHERE creator_id = ? 
+                ORDER BY created_at DESC 
+                LIMIT ?
+            ''', (user_id, limit))
+            campaigns = self.cursor.fetchall()
+            return [dict(camp) for camp in campaigns]
+    
+    # DEPOSIT METODLARI
+    def create_deposit(self, deposit_data):
+        if self.use_firebase:
+            try:
+                doc_ref = self.db.collection('deposits').document(deposit_data['deposit_id'])
+                doc_ref.set(deposit_data)
+                return True
+            except Exception as e:
+                print(f"❌ Firebase create_deposit hatası: {e}")
+                return False
+        else:
+            try:
+                self.cursor.execute('''
+                    INSERT INTO deposits 
+                    (deposit_id, user_id, amount_try, amount_trx, created_at, trx_price, bonus_amount, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    deposit_data['deposit_id'],
+                    deposit_data['user_id'],
+                    deposit_data['amount_try'],
+                    deposit_data['amount_trx'],
+                    deposit_data['created_at'],
+                    deposit_data['trx_price'],
+                    deposit_data['bonus_amount'],
+                    deposit_data.get('status', 'pending')
+                ))
+                self.conn.commit()
+                return True
+            except Exception as e:
+                print(f"❌ SQLite create_deposit hatası: {e}")
+                return False
+    
+    def update_deposit(self, deposit_id, user_id, txid):
+        if self.use_firebase:
+            try:
+                doc_ref = self.db.collection('deposits').document(deposit_id)
+                doc_ref.update({
+                    'txid': txid,
+                    'status': 'completed',
+                    'completed_at': get_turkey_time().isoformat()
+                })
+                return True
+            except Exception as e:
+                print(f"❌ Firebase update_deposit hatası: {e}")
+                return False
+        else:
+            try:
+                self.cursor.execute('''
+                    UPDATE deposits 
+                    SET txid = ?, status = 'completed', completed_at = ?
+                    WHERE deposit_id = ? AND user_id = ?
+                ''', (txid, get_turkey_time().isoformat(), deposit_id, user_id))
+                self.conn.commit()
+                return True
+            except Exception as e:
+                print(f"❌ SQLite update_deposit hatası: {e}")
+                return False
+    
+    # STATS METODLARI
+    def update_bot_stats(self, stat_type):
+        if not self.use_firebase:
+            return
+        
+        try:
+            stats_ref = self.db.collection('stats').document('bot_stats')
+            stats_doc = stats_ref.get()
+            
+            if stats_doc.exists:
+                current_stats = stats_doc.to_dict()
+            else:
+                current_stats = {
+                    'total_users': 0,
+                    'total_deposits': 0,
+                    'total_campaigns': 0,
+                    'total_tasks_completed': 0,
+                    'total_balance': 0.0,
+                    'last_updated': get_turkey_time().isoformat()
+                }
+            
+            # Kullanıcı sayısını al
+            users_count = len(list(self.db.collection('users').stream()))
+            
+            # Depozit sayısını al
+            deposits_query = self.db.collection('deposits').where('status', '==', 'completed')
+            deposits_count = len(list(deposits_query.stream()))
+            
+            # Kampanya sayısını al
+            campaigns_count = len(list(self.db.collection('campaigns').stream()))
+            
+            # Toplam bakiye
+            total_balance = 0.0
+            users = self.db.collection('users').stream()
+            for user in users:
+                user_data = user.to_dict()
+                total_balance += user_data.get('balance', 0.0)
+            
+            # Güncelle
+            updated_stats = {
+                'total_users': users_count,
+                'total_deposits': deposits_count,
+                'total_campaigns': campaigns_count,
+                'total_balance': total_balance,
+                'last_updated': get_turkey_time().isoformat()
+            }
+            
+            stats_ref.set(updated_stats)
+            
+            # Admin'e yeni kullanıcı bildirimi
+            if stat_type == 'new_user' and users_count > current_stats.get('total_users', 0):
+                self.send_admin_notification(users_count)
+                
+        except Exception as e:
+            print(f"❌ Firebase update_bot_stats hatası: {e}")
+    
+    def send_admin_notification(self, total_users):
+        """Admin'e yeni kullanıcı bildirimi"""
+        try:
+            message = f"""
+<b>👤 YENİ KULLANICI KATILDI!</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎉 <b>Botumuz büyüyor!</b>
+📈 <b>Toplam Kullanıcı Sayısı:</b> {total_users}
+
+<i>Yeni kullanıcılar sisteme katılmaya devam ediyor.</i>
+"""
+            send_message(ADMIN_ID, message)
+        except:
+            pass
+    
+    # NOTIFICATION METODLARI
+    def add_referral_notification(self, user_id, referral_id, amount):
+        if self.use_firebase:
+            try:
+                notification_id = str(uuid.uuid4())[:8]
+                notification_data = {
+                    'notification_id': notification_id,
+                    'user_id': user_id,
+                    'referral_id': referral_id,
+                    'amount': amount,
+                    'created_at': get_turkey_time().isoformat(),
+                    'notified': False
+                }
+                
+                doc_ref = self.db.collection('notifications').document(notification_id)
+                doc_ref.set(notification_data)
+                return True
+            except Exception as e:
+                print(f"❌ Firebase add_referral_notification hatası: {e}")
+                return False
         return True
+    
+    def get_pending_notifications(self):
+        if self.use_firebase:
+            try:
+                notifications_ref = self.db.collection('notifications')
+                query = notifications_ref.where('notified', '==', False)\
+                                         .order_by('created_at')
+                docs = query.stream()
+                return [doc.to_dict() for doc in docs]
+            except Exception as e:
+                print(f"❌ Firebase get_pending_notifications hatası: {e}")
+                return []
+        return []
+    
+    def mark_notification_sent(self, notification_id):
+        if self.use_firebase:
+            try:
+                doc_ref = self.db.collection('notifications').document(notification_id)
+                doc_ref.update({'notified': True})
+                return True
+            except Exception as e:
+                print(f"❌ Firebase mark_notification_sent hatası: {e}")
+                return False
+        return True
+    
+    # GENEL METODLAR
+    def get_all_users(self, limit=20):
+        if self.use_firebase:
+            try:
+                users_ref = self.db.collection('users')
+                query = users_ref.order_by('created_at', direction=firestore.Query.DESCENDING).limit(limit)
+                docs = query.stream()
+                return [doc.to_dict() for doc in docs]
+            except Exception as e:
+                print(f"❌ Firebase get_all_users hatası: {e}")
+                return []
+        else:
+            self.cursor.execute('''
+                SELECT * FROM users 
+                ORDER BY created_at DESC 
+                LIMIT ?
+            ''', (limit,))
+            users = self.cursor.fetchall()
+            return [dict(user) for user in users]
+    
+    def get_all_campaigns(self, limit=20):
+        if self.use_firebase:
+            try:
+                campaigns_ref = self.db.collection('campaigns')
+                query = campaigns_ref.order_by('created_at', direction=firestore.Query.DESCENDING).limit(limit)
+                docs = query.stream()
+                return [doc.to_dict() for doc in docs]
+            except Exception as e:
+                print(f"❌ Firebase get_all_campaigns hatası: {e}")
+                return []
+        else:
+            self.cursor.execute('''
+                SELECT * FROM campaigns 
+                ORDER BY created_at DESC 
+                LIMIT ?
+            ''', (limit,))
+            campaigns = self.cursor.fetchall()
+            return [dict(camp) for camp in campaigns]
+    
+    def get_bot_stats(self):
+        if self.use_firebase:
+            try:
+                stats_ref = self.db.collection('stats').document('bot_stats')
+                stats_doc = stats_ref.get()
+                if stats_doc.exists:
+                    return stats_doc.to_dict()
+                else:
+                    return {
+                        'total_users': 0,
+                        'total_deposits': 0,
+                        'total_campaigns': 0,
+                        'total_tasks_completed': 0,
+                        'total_balance': 0.0,
+                        'last_updated': get_turkey_time().isoformat()
+                    }
+            except Exception as e:
+                print(f"❌ Firebase get_bot_stats hatası: {e}")
+                return {}
+        else:
+            # SQLite için basit istatistik
+            self.cursor.execute("SELECT COUNT(*) FROM users")
+            total_users = self.cursor.fetchone()[0]
+            
+            self.cursor.execute("SELECT COUNT(*) FROM deposits WHERE status = 'completed'")
+            total_deposits = self.cursor.fetchone()[0]
+            
+            self.cursor.execute("SELECT COUNT(*) FROM campaigns")
+            total_campaigns = self.cursor.fetchone()[0]
+            
+            self.cursor.execute("SELECT SUM(balance) FROM users")
+            total_balance = self.cursor.fetchone()[0] or 0.0
+            
+            return {
+                'total_users': total_users,
+                'total_deposits': total_deposits,
+                'total_campaigns': total_campaigns,
+                'total_balance': total_balance,
+                'last_updated': get_turkey_time().isoformat()
+            }
 
 # Telegram Fonksiyonları
 def send_message(chat_id, text, markup=None, parse_mode='HTML'):
@@ -232,20 +670,7 @@ def check_bot_admin(chat_id):
     except: pass
     return False
 
-def edit_message(chat_id, message_id, text, markup=None, parse_mode='HTML'):
-    url = BASE_URL + "editMessageText"
-    data = {'chat_id': chat_id, 'message_id': message_id, 'text': text, 'parse_mode': parse_mode}
-    if markup: data['reply_markup'] = json.dumps(markup)
-    try: return requests.post(url, json=data, timeout=10).json()
-    except: return None
-
-def delete_message(chat_id, message_id):
-    url = BASE_URL + "deleteMessage"
-    data = {'chat_id': chat_id, 'message_id': message_id}
-    try: return requests.post(url, json=data, timeout=5).json()
-    except: return None
-
-# Dil sistemi
+# Dil sistemi (TÜMÜ TÜRKÇE)
 translations = {
     'tr': {
         'welcome': '👋 Hoş Geldin!',
@@ -348,6 +773,7 @@ translations = {
         'budget_deducted': '💰 Bakiye düşüldü',
         'bot_not_admin': '❌ BOT ADMIN DEĞİL!',
         'insufficient_balance': '❌ YETERSİZ BAKİYE!',
+        'insufficient_campaign_balance': '❌ KAMPANYA BAKİYESİ YETERSİZ!',
         'required': 'Gerekli',
         'available': 'Mevcut',
         'missing': 'Eksik',
@@ -446,227 +872,141 @@ translations = {
         'give_permissions': 'Yetkileri verin',
         'continue_after_admin': 'Admin yaptıktan sonra devam edin',
         'cancel_text': '/cancel yazarak iptal edebilirsiniz',
-        'operation_cancelled_text': '❌ İşlem iptal edildi'
-    },
-    'az': {
-        'welcome': '👋 Xoş Gəldin!',
-        'balance': '💰 Balans',
-        'tasks': '📊 Tapşırıqlar',
-        'referrals': '👥 Referallar',
-        'price': '₿ TRX Qiyməti',
-        'channel': '📢 Kanal',
-        'main_menu': '📋 ƏSAS MENYU',
-        'do_task': '🎯 TAPŞIRIQ ET',
-        'create_campaign': '📢 KAMPANIYA YARAT',
-        'my_campaigns': '📋 KAMPANIYALARIM',
-        'deposit': '💰 BALANS YÜKLƏ',
-        'profile': '👤 PROFİL',
-        'bot_info': 'ℹ️ BOT HAQQINDA',
-        'help': '❓ KÖMƏK',
-        'admin_panel': '👑 İDARƏÇİ',
-        'back': '🔙 GERİ',
-        'cancel': '❌ LƏĞV ET',
-        'yes': '✅ BƏLİ',
-        'no': '❌ XEYR',
-        'time': '⏰ Saat',
-        'join_channel': '📢 KANALA QOŞUL',
-        'joined': '✅ QOŞULDUM',
-        'loading': '⏳ Yüklənir...',
-        'success': '✅ Uğurlu!',
-        'error': '❌ Xəta!',
-        'choose_amount': '👇 MƏBLƏĞ SEÇİN',
-        'min': 'Min',
-        'max': 'Max',
-        'bonus_system': '🎁 BONUS',
-        'example': '💡 NÜMUNƏ',
-        'payment_info': '💳 ÖDƏNİŞ',
-        'steps': '👇 ADDIMLAR',
-        'copy_address': '1️⃣ Ünvanı kopyala',
-        'send_trx': '2️⃣ TRX göndər',
-        'send_txid': '3️⃣ TXID göndər',
-        'balance_loaded': '4️⃣ Balans yüklənəcək',
-        'processing_time': '⏳ Əməliyyat müddəti',
-        'txid_format': '✅ TXID formatı',
-        'user': '👤 İstifadəçi',
-        'normal_balance': '💵 Normal Balans',
-        'ad_balance': '📺 Reklam Balansı',
-        'total_balance': '💰 Ümumi Balans',
-        'statistics': '📊 Statistikalar',
-        'total_investment': 'Ümumi İnvestisiya',
-        'total_bonus': 'Ümumi Bonus',
-        'task_count': 'Tapşırıq Sayısı',
-        'referral_count': 'Referal',
-        'ad_bonus_note': '💡 Reklam balansı bonusludur!',
-        'features': '💰 XÜSUSİYYƏTLƏR',
-        'commands': '📋 KOMANDALAR',
-        'rules': '⚠️ QAYDALAR',
-        'support': '📞 DƏSTƏK',
-        'how_it_works': '🤖 BOT NECƏ İŞLƏYİR?',
-        'how_deposit': '💰 BALANS NECƏ YÜKLƏNİR?',
-        'how_create_campaign': '📢 KAMPANIYA NECƏ YARADILIR?',
-        'how_do_task': '🎯 TAPŞIRIQ NECƏ EDİLİR?',
-        'referral_system': '👥 REFERAL SİSTEMİ',
-        'cancel_system': '🔄 LƏĞV SİSTEMİ',
-        'important_warnings': '⚠️ ƏHƏMİYYƏTLİ XƏBƏRDARLIQLAR',
-        'no_campaigns': '📭 HƏLƏ KAMPANIYANIZ YOXDUR',
-        'create_first_campaign': '💡 İlk kampaniyanızı yaradın!',
-        'active': '🟢 Aktiv',
-        'pending': '🟡 Gözləyən',
-        'inactive': '🔴 Passiv',
-        'summary': '📊 XÜLASƏ',
-        'total': '📈 Ümumi',
-        'campaign_type': '🎯 KAMPANIYA NÖVÜ',
-        'bot_campaign': '🤖 BOT KAMPANIYASI',
-        'channel_campaign': '📢 KANAL KAMPANIYASI',
-        'group_campaign': '👥 QRUPA KAMPANIYASI',
-        'choose_type': '👇 NÖV SEÇİN',
-        'step': '📌 ADDIM',
-        'enter_name': 'Ad daxil edin',
-        'enter_description': 'Təsvir daxil edin',
-        'enter_link': 'Link daxil edin',
-        'enter_budget': 'Büdcə daxil edin',
-        'enter_channel': 'Kanal/Qrup daxil edin',
-        'forward_message': '📤 Mesaj forward edin',
-        'how_to_forward': 'Necə edilir',
-        'accepted': '✅ QƏBUL EDİLƏN',
-        'rejected': '❌ RƏDD EDİLƏN',
-        'campaign_summary': '📋 KAMPANIYA XÜLASƏSİ',
-        'target_bot': '🤖 HƏDƏF BOT',
-        'message_content': '📝 MESAJ',
-        'target': '🎯 HƏDƏF',
-        'bot_status': '👑 BOT VƏZİYYƏTİ',
-        'warning': '⚠️ XƏBƏRDARLIQ',
-        'task_price': '💵 TAPŞIRIQ QİYMƏTİ',
-        'max_participants': '👥 MAKSİMUM',
-        'creator': '👤 YARADAN',
-        'confirm_campaign': 'Kampaniyanı təsdiqləyirsiniz?',
-        'auto_approval': '✅ Avtomatik aktiv olacaq',
-        'check_bot_admin': '🔄 BOT ADMIN KONTROL',
-        'approve_send': '✅ TƏSDİQLƏ VƏ GÖNDƏR',
-        'campaign_created': '✅ KAMPANIYA YARADILDI!',
-        'campaign_id': '🔢 KAMPANIYA ID',
-        'status': '📊 VƏZİYYƏT',
-        'budget_deducted': '💰 Balans çıxıldı',
-        'bot_not_admin': '❌ BOT ADMIN DEYİL!',
-        'insufficient_balance': '❌ KİFAYƏT QƏDƏR BALANS YOXDUR!',
-        'required': 'Tələb olunan',
-        'available': 'Mövcud',
-        'missing': 'Çatışmayan',
-        'please_deposit': '💡 Zəhmət olmasa əvvəlcə balans yükləyin',
-        'follow_steps': 'Zəhmət olmasa addımları izləyin',
-        'add_admin': 'İdarəçi Əlavə Et',
-        'all_permissions': 'BÜTÜN SƏLAHİYYƏTLƏRİ aktiv edin',
-        'see_members': 'Üzvləri görə bilmə səlahiyyəti',
-        'save': 'Saxla',
-        'check_again': '✅ Yenidən yoxla',
-        'any_bot': 'HƏRHANSİ BİR BOT',
-        'any_bot_message': 'HƏRHANSİ BİR BOT mesajı',
-        'all_bots_accepted': 'Bütün bot mesajları',
-        'normal_users_rejected': 'Normal istifadəçi mesajları',
-        'suggested_bots': 'Tövsiyyə edilən botlar',
-        'bot_father': '@BotFather - Bot yaratma',
-        'like_bot': '@like - Bəyənmə botu',
-        'vid_bot': '@vid - Video yükləmə',
-        'game_bot': '@gamebot - Oyun botu',
-        'or_any_bot': 'və ya hər hansı bir bot...',
-        'only_bot_message': '❌ Yalnız BOT mesajı forward edin!',
-        'normal_user_message': '⚠️ Normal istifadəçi mesajı forward etdiniz',
-        'correct_steps': 'Doğru addımlar',
-        'find_bot_message': 'BOT mesajı tapın',
-        'forward_to_bot': 'Bu bota FORWARD edin',
-        'system_will_detect': 'Sistem avtomatik aşkarlayacaq',
-        'note_only_bots': 'Qeyd: Yalnız bot mesajları qəbul edilir!',
-        'please_forward': '📤 ZƏHMƏT OLMASA MESAJ FORWARD EDİN!',
-        'forward_any_bot': 'HƏRHANSİ BİR BOT mesajı forward edin',
-        'steps_to_forward': 'Addımlar',
-        'find_bot': 'BOT mesajı tapın',
-        'press_hold': 'Mesaja basılı saxlayın',
-        'click_forward': 'Forward klikləyin',
-        'select_this_bot': 'Bu botu seçin',
-        'send': 'Göndərin',
-        'operation_cancelled': '🔄 Əməliyyat ləğv edildi',
-        'no_active_operation': '⚠️ Aktiv əməliyyat yoxdur',
-        'redirecting_to_menu': 'Əsas menyuya yönləndirilirsiniz...',
-        'channel_check_success': '✅ Kanal yoxlaması uğurlu!',
-        'not_joined_channel': '❌ Hələ kanala qoşulmadınız!',
-        'error_occurred': '❌ Xəta baş verdi',
-        'admin_no_permission': '❌ Bu əməliyyat üçün icazəniz yoxdur!',
-        'admin_panel_title': '👑 İDARƏÇİ PANELİ',
-        'statistics_title': '📊 STATİSTİKALAR',
-        'total_users': 'Ümumi İstifadəçilər',
-        'total_balance': 'Ümumi Balans',
-        'active_campaigns': 'Aktiv Kampaniyalar',
-        'pending_approval': 'Təsdiq Gözləyən',
-        'current_time': '⏰ Saat',
-        'admin_tools': '🛠️ İDARƏÇİ ALƏTLƏRİ',
-        'user_stats': '📊 STATİSTİKALAR',
-        'campaign_stats': '📢 KAMPANIYALAR',
-        'user_management': '👥 İSTİFADƏÇİLƏR',
-        'deposit_management': '💰 DEPOZİTLƏR',
-        'broadcast': '📣 BİLDİRİŞ',
-        'settings': '⚙️ AYARLAR',
-        'campaign_approved': '✅ Kampaniya təsdiqləndi!',
-        'campaign_active': 'Kampaniya aktiv edildi',
-        'users_can_join': 'İstifadəçilər qoşula bilər',
-        'earnings_per_participation': 'Hər iştirak üçün qazanc',
-        'duration_until_budget': 'Büdcə bitənə qədər müddət',
-        'campaign_rejected': '❌ Kampaniya rədd edildi!',
-        'reason_for_rejection': 'RƏDD SƏBƏBİ',
-        'bot_not_admin_reason': 'Bot kanalda admin deyil',
-        'not_following_rules': 'Kampaniya qaydalara uyğun deyil',
-        'missing_info': 'Çatışmayan məlumat',
-        'suspicious_content': 'Şübhəli məzmun',
-        'balance_refunded': '💰 Balans geri qaytarıldı',
-        'check_rules_try_again': '💡 Qaydaları yoxlayıb yenidən cəhd edin',
-        'welcome_bonus_loaded': '✅ Xoş gəldin bonusu yükləndi!',
-        'new_balance': 'Yeni balansınız',
-        'start_tasks': '⚡ Dərhal tapşırıq etməyə başla!',
-        'referral_successful': '🎉 Referal uğurlu!',
-        'referral_bonus_loaded': '💰 Referal bonusu yükləndi',
-        'forward_bot_message': '🤖 Bot mesajı uğurla alındı!',
-        'enter_campaign_name': '📛 Kampaniya adı daxil edin',
-        'example_names': 'Nümunə adlar',
-        'join_our_channel': 'Kanalımıza qoşulun',
-        'youtube_subscribe': 'YouTube Abunə Ol',
-        'instagram_follow': 'Instagram İzləyin',
-        'discord_join': 'Discord Serverinə Qoşulun',
-        'enter_your_name': 'Kampaniya adınızı yazın',
-        'name_saved': '✅ Ad Saxlandı',
-        'description_saved': '✅ Təsvir Saxlandı',
-        'link_saved': '✅ Link Saxlandı',
-        'channel_saved': '✅ Kanal/Qrup Saxlandı',
-        'budget_saved': '✅ Büdcə Saxlandı',
-        'minimum_budget': 'Minimum büdcə 10₺!',
-        'invalid_budget': '❌ Yanlış büdcə! Zəhmət olmasa rəqəm daxil edin',
-        'invalid_format': '❌ Yanlış format! @ ilə başlamalı və ya link olmalı',
-        'channel_not_found': '❌ Kanal/Qrup tapılmadı!',
-        'enter_correct_name': 'Zəhmət olmasa doğru ad daxil edin',
-        'bot_not_admin_warning': '⚠️ BOT ADMIN DEYİL!',
-        'to_create_campaign': 'Kampaniya yaratmaq üçün',
-        'make_bot_admin': 'Botu kanalda ADMIN edin',
-        'give_permissions': 'Səlahiyyətləri verin',
-        'continue_after_admin': 'Admin etdikdən sonra davam edin',
-        'cancel_text': '/cancel yazaraq ləğv edə bilərsiniz',
-        'operation_cancelled_text': '❌ Əməliyyat ləğv edildi'
+        'operation_cancelled_text': '❌ İşlem iptal edildi',
+        'new_tasks_available': '🎉 YENİ GÖREVLER EKLENDİ!',
+        'check_new_tasks': 'Hemen yeni görevleri kontrol et!',
+        'referral_notification': '👥 REFERANS KAZANCI',
+        'new_referral_joined': 'Yeni bir kullanıcı referansınızla katıldı!',
+        'you_earned': 'Kazandınız',
+        'total_referrals': 'Toplam Referans',
+        'notification_settings': '🔔 BİLDİRİM AYARLARI',
+        'enable_notifications': 'Bildirimleri Aç',
+        'disable_notifications': 'Bildirimleri Kapat',
+        'notifications_enabled': '✅ Bildirimler açık',
+        'notifications_disabled': '🔕 Bildirimler kapalı',
+        'new_user_notification': '👤 YENİ KULLANICI',
+        'new_user_joined': 'Yeni kullanıcı botu kullanmaya başladı!',
+        'total_users_now': 'Toplam Kullanıcı Sayısı',
+        'firebase_active': '🔥 FIREBASE AKTİF',
+        'database_status': 'Veritabanı Durumu',
+        'using_firebase': 'Firebase kullanılıyor',
+        'using_sqlite': 'SQLite kullanılıyor'
     }
 }
 
 def get_translation(user_id, key, language=None):
     """Kullanıcının diline göre çeviri döndür"""
     if not language:
-        db = Database()
+        db = FirebaseDatabase()
         user = db.get_user(user_id)
         language = user.get('language', 'tr')
     return translations.get(language, translations['tr']).get(key, key)
 
+# Bildirim Sistemi
+class NotificationSystem:
+    def __init__(self, bot_system):
+        self.bot_system = bot_system
+        self.db = bot_system.db
+        self.last_notification_check = time.time()
+    
+    def check_and_send_notifications(self):
+        """Bildirimleri kontrol et ve gönder"""
+        current_time = time.time()
+        
+        # 5 dakikada bir kontrol et
+        if current_time - self.last_notification_check < 300:
+            return
+        
+        self.last_notification_check = current_time
+        
+        try:
+            # 1. Yeni görev bildirimi (rastgele saatlerde)
+            if random.randint(1, 100) <= 10:  # %10 şans
+                self.send_new_tasks_notification()
+            
+            # 2. Bekleyen referans bildirimleri
+            self.send_referral_notifications()
+            
+        except Exception as e:
+            print(f"❌ Bildirim hatası: {e}")
+    
+    def send_new_tasks_notification(self):
+        """Yeni görevler eklendi bildirimi"""
+        # Aktif kullanıcıları bul (son 24 saat aktif olanlar)
+        one_day_ago = (datetime.now() - timedelta(days=1)).isoformat()
+        
+        users = self.db.get_all_users(limit=100)  # İlk 100 kullanıcı
+        
+        for user in users:
+            user_id = user.get('user_id')
+            notification_enabled = user.get('notification_enabled', True)
+            last_active = user.get('last_active', '')
+            
+            if not notification_enabled:
+                continue
+            
+            if last_active and last_active < one_day_ago:
+                continue
+            
+            try:
+                send_message(user_id, f"""
+<b>{get_translation(user_id, 'new_tasks_available')}</b>
+
+🎯 <b>Yeni görevler eklendi!</b>
+💰 <b>Hemen kontrol et ve para kazanmaya başla!</b>
+
+<i>{get_translation(user_id, 'check_new_tasks')}</i>
+""")
+                time.sleep(0.1)  # Rate limit için bekle
+            except:
+                pass
+    
+    def send_referral_notifications(self):
+        """Referans bildirimlerini gönder"""
+        notifications = self.db.get_pending_notifications()
+        
+        for notif in notifications:
+            try:
+                user_id = notif.get('user_id')
+                referral_id = notif.get('referral_id')
+                amount = notif.get('amount', 0)
+                notification_id = notif.get('notification_id')
+                
+                user = self.db.get_user(user_id)
+                notification_enabled = user.get('notification_enabled', True)
+                
+                if notification_enabled:
+                    send_message(user_id, f"""
+<b>{get_translation(user_id, 'referral_notification')}</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎉 <b>{get_translation(user_id, 'new_referral_joined')}</b>
+👤 <b>Referans ID:</b> <code>{referral_id}</code>
+💰 <b>{get_translation(user_id, 'you_earned')}:</b> {amount:.2f}₺
+
+📊 <b>{get_translation(user_id, 'total_referrals')}:</b> {user.get('referrals', 0)}
+""")
+                
+                # Bildirimi işaretle
+                if notification_id:
+                    self.db.mark_notification_sent(notification_id)
+                
+            except Exception as e:
+                print(f"❌ Referans bildirimi hatası: {e}")
+
 # Bot Sistemi
 class BotSystem:
     def __init__(self):
-        self.db = Database()
+        self.db = FirebaseDatabase()
+        self.notification_system = NotificationSystem(self)
         self.user_states = {}
         self.trx_price = 12.61
         self.update_trx_price()
-        print("🤖 Bot sistemi başlatıldı")
+        
+        if self.db.use_firebase:
+            print("🤖 Bot sistemi başlatıldı (Firebase)")
+        else:
+            print("🤖 Bot sistemi başlatıldı (SQLite)")
     
     def update_trx_price(self):
         try:
@@ -694,6 +1034,9 @@ class BotSystem:
         
         while True:
             try:
+                # Bildirimleri kontrol et
+                self.notification_system.check_and_send_notifications()
+                
                 url = BASE_URL + "getUpdates"
                 params = {'offset': offset, 'timeout': 30, 'allowed_updates': ['message', 'callback_query']}
                 response = requests.get(url, params=params, timeout=35).json()
@@ -759,9 +1102,29 @@ class BotSystem:
                     self.show_active_tasks(user_id)
                 elif text == '/profile':
                     self.show_profile(user_id)
+                elif text == '/notifications':
+                    self.show_notification_settings(user_id)
+                elif text == '/dbstatus':
+                    self.show_db_status(user_id)
         
         except Exception as e:
             print(f"❌ Mesaj işleme hatası: {e}")
+    
+    def show_db_status(self, user_id):
+        """Veritabanı durumunu göster"""
+        db_status = "🔥 Firebase" if self.db.use_firebase else "💾 SQLite"
+        message = f"""
+<b>{get_translation(user_id, 'database_status')}</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<b>📊 Durum:</b> {db_status}
+
+<b>ℹ️ Bilgi:</b>
+{get_translation(user_id, 'using_firebase' if self.db.use_firebase else 'using_sqlite')}
+
+<i>Sistem otomatik olarak en iyi veritabanını kullanır.</i>
+"""
+        send_message(user_id, message)
     
     def handle_user_state(self, user_id, message, user_state):
         state = user_state['state']
@@ -819,7 +1182,7 @@ class BotSystem:
 
 <b>{get_translation(user_id, 'step')} 4/5 - {get_translation(user_id, 'enter_channel')}:</b>
 <i>@ {get_translation(user_id, 'enter_channel')}</i>
-<i>{get_translation(user_id, 'example')}: @kanaladi və ya https://t.me/kanaladi</i>
+<i>{get_translation(user_id, 'example')}: @kanaladi veya https://t.me/kanaladi</i>
 
 <code>/cancel</code> {get_translation(user_id, 'cancel_text')}
 """)
@@ -845,7 +1208,7 @@ class BotSystem:
                     
                     # @ işaretini kontrol et
                     if not chat_input.startswith('@') and not chat_input.startswith('https://t.me/'):
-                        send_message(user_id, f"❌ <b>{get_translation(user_id, 'invalid_format')}</b>\n\n{get_translation(user_id, 'example')}: @kanaladi və ya https://t.me/kanaladi")
+                        send_message(user_id, f"❌ <b>{get_translation(user_id, 'invalid_format')}</b>\n\n{get_translation(user_id, 'example')}: @kanaladi veya https://t.me/kanaladi")
                         return
                     
                     # Linkten @username çıkar
@@ -870,7 +1233,7 @@ class BotSystem:
                         send_message(user_id, f"""
 <b>{get_translation(user_id, 'bot_not_admin_warning')}</b>
 
-📢 <b>Kanal/Qrup:</b> {chat_info.get('title', chat_input)}
+📢 <b>Kanal/Grup:</b> {chat_info.get('title', chat_input)}
 
 <b>{get_translation(user_id, 'to_create_campaign')}:</b>
 1️⃣ {get_translation(user_id, 'make_bot_admin')}
@@ -1002,30 +1365,28 @@ class BotSystem:
             
             # Depoziti güncelle
             try:
-                self.db.cursor.execute('''
-                    UPDATE deposits 
-                    SET txid = ?, status = 'completed', completed_at = ?
-                    WHERE deposit_id = ? AND user_id = ?
-                ''', (txid, get_turkey_time().isoformat(), deposit_id, user_id))
+                success = self.db.update_deposit(deposit_id, user_id, txid)
                 
-                # Kullanıcı bakiyesini güncelle
-                user = self.db.get_user(user_id)
-                amount = data['amount']
-                bonus = data['bonus']
-                
-                # Normal bakiye güncelle
-                new_balance = user.get('balance', 0) + amount + bonus
-                self.db.update_user(user_id, {
-                    'balance': new_balance,
-                    'total_deposited': user.get('total_deposited', 0) + amount,
-                    'deposit_count': user.get('deposit_count', 0) + 1,
-                    'total_bonus': user.get('total_bonus', 0) + bonus
-                })
-                
-                self.db.conn.commit()
-                
-                # Başarı mesajı
-                send_message(user_id, f"""
+                if success:
+                    # Kullanıcı bakiyesini güncelle
+                    user = self.db.get_user(user_id)
+                    amount = data['amount']
+                    bonus = data['bonus']
+                    
+                    # Normal bakiye güncelle
+                    new_balance = user.get('balance', 0) + amount + bonus
+                    self.db.update_user(user_id, {
+                        'balance': new_balance,
+                        'total_deposited': user.get('total_deposited', 0) + amount,
+                        'deposit_count': user.get('deposit_count', 0) + 1,
+                        'total_bonus': user.get('total_bonus', 0) + bonus
+                    })
+                    
+                    # Bot istatistiklerini güncelle
+                    self.db.update_bot_stats('deposit')
+                    
+                    # Başarı mesajı
+                    send_message(user_id, f"""
 <b>✅ {get_translation(user_id, 'success')}</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -1038,10 +1399,12 @@ class BotSystem:
 
 <i>Bakiye başarıyla yüklendi. Hemen görev yapmaya başlayabilirsin!</i>
 """)
-                
-                self.clear_user_state(user_id)
-                time.sleep(2)
-                self.show_main_menu(user_id)
+                    
+                    self.clear_user_state(user_id)
+                    time.sleep(2)
+                    self.show_main_menu(user_id)
+                else:
+                    send_message(user_id, f"❌ <b>{get_translation(user_id, 'error_occurred')}: İşlem kaydedilemedi!</b>")
                 
             except Exception as e:
                 print(f"❌ TXID hatası: {e}")
@@ -1065,6 +1428,19 @@ class BotSystem:
                 self.db.update_user(user_id, {'language': language})
                 answer_callback(callback_id, f"✅ Dil {language.upper()} olarak ayarlandı!")
                 self.show_main_menu(user_id)
+                return
+            
+            # Bildirim ayarları
+            if data == 'notifications_on':
+                self.db.update_user(user_id, {'notification_enabled': True})
+                answer_callback(callback_id, get_translation(user_id, 'notifications_enabled'))
+                self.show_notification_settings(user_id)
+                return
+            
+            if data == 'notifications_off':
+                self.db.update_user(user_id, {'notification_enabled': False})
+                answer_callback(callback_id, get_translation(user_id, 'notifications_disabled'))
+                self.show_notification_settings(user_id)
                 return
             
             # Admin callback'leri
@@ -1134,10 +1510,46 @@ class BotSystem:
                 self.show_profile(user_id)
             elif data == 'language':
                 self.show_language_menu(user_id)
+            elif data == 'notifications':
+                self.show_notification_settings(user_id)
+            elif data == 'dbstatus':
+                self.show_db_status(user_id)
         
         except Exception as e:
             print(f"❌ Callback hatası: {e}")
             answer_callback(callback_id, f"{get_translation(user_id, 'error_occurred')}: {str(e)}", show_alert=True)
+    
+    def show_notification_settings(self, user_id):
+        """Bildirim ayarları menüsü"""
+        user = self.db.get_user(user_id)
+        notifications_enabled = user.get('notification_enabled', True)
+        
+        status_text = get_translation(user_id, 'notifications_enabled') if notifications_enabled else get_translation(user_id, 'notifications_disabled')
+        status_icon = "✅" if notifications_enabled else "🔕"
+        
+        message = f"""
+<b>{get_translation(user_id, 'notification_settings')}</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{status_icon} <b>Durum:</b> {status_text}
+
+<b>📢 Bildirimler:</b>
+• Yeni görevler eklendiğinde
+• Referans kazancı olduğunda
+• Kampanya güncellemeleri
+
+<b>💡 Not:</b> Bildirimler ara sıra gönderilir, spam yapılmaz.
+"""
+        
+        markup = {
+            'inline_keyboard': [
+                [{'text': get_translation(user_id, 'enable_notifications'), 'callback_data': 'notifications_on'}],
+                [{'text': get_translation(user_id, 'disable_notifications'), 'callback_data': 'notifications_off'}],
+                [{'text': get_translation(user_id, 'back'), 'callback_data': 'menu'}]
+            ]
+        }
+        
+        send_message(user_id, message, markup)
     
     def handle_cancel(self, user_id):
         """Kullanıcının mevcut işlemini iptal et"""
@@ -1165,12 +1577,11 @@ class BotSystem:
         markup = {
             'inline_keyboard': [
                 [{'text': '🇹🇷 Türkçe', 'callback_data': 'lang_tr'}],
-                [{'text': '🇦🇿 Azərbaycan Dili', 'callback_data': 'lang_az'}],
                 [{'text': get_translation(user_id, 'back'), 'callback_data': 'menu'}]
             ]
         }
         
-        send_message(user_id, "🌐 <b>Dil Seçin / Dil Seçin</b>\n\n👇 Aşağıdaki dillerden birini seçin:", markup)
+        send_message(user_id, "🌐 <b>Dil Seçin</b>\n\n👇 Aşağıdaki dillerden birini seçin:", markup)
     
     def handle_start(self, user_id, text):
         in_channel = get_chat_member(f"@{MANDATORY_CHANNEL}", user_id)
@@ -1225,6 +1636,10 @@ class BotSystem:
                             'referrals': referrer.get('referrals', 0) + 1,
                             'ref_earned': referrer.get('ref_earned', 0) + 1.0
                         })
+                        
+                        # Referans bildirimi ekle
+                        self.db.add_referral_notification(referrer_id, user_id, 1.0)
+                        
                         send_message(user_id, f"<b>{get_translation(user_id, 'referral_successful')}</b>\n\n💰 <b>{get_translation(user_id, 'referral_bonus_loaded')}</b>")
         
         self.show_main_menu(user_id)
@@ -1233,8 +1648,12 @@ class BotSystem:
         user = self.db.get_user(user_id)
         current_time = get_turkey_time().strftime('%H:%M')
         
+        # Database status icon
+        db_icon = "🔥" if self.db.use_firebase else "💾"
+        
         message = f"""
-<b>🤖 GÖREV YAPSAM BOT</b>
+<b>🤖 GÖREV YAPSAM BOT v17.0</b>
+<small>{db_icon} {get_translation(user_id, 'firebase_active' if self.db.use_firebase else 'using_sqlite')}</small>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 👤 <b>{get_translation(user_id, 'user')}:</b> {user.get('name', 'Kullanıcı')}
@@ -1256,9 +1675,10 @@ class BotSystem:
                 [{'text': get_translation(user_id, 'my_campaigns'), 'callback_data': 'my_campaigns'}],
                 [{'text': get_translation(user_id, 'deposit'), 'callback_data': 'deposit'}],
                 [{'text': get_translation(user_id, 'profile'), 'callback_data': 'profile'},
-                 {'text': get_translation(user_id, 'language'), 'callback_data': 'language'}],
+                 {'text': '🔔', 'callback_data': 'notifications'}],
                 [{'text': get_translation(user_id, 'bot_info'), 'callback_data': 'bot_info'},
-                 {'text': get_translation(user_id, 'help'), 'callback_data': 'help'}]
+                 {'text': get_translation(user_id, 'help'), 'callback_data': 'help'}],
+                [{'text': '📊 DB Status', 'callback_data': 'dbstatus'}]
             ]
         }
         
@@ -1269,13 +1689,7 @@ class BotSystem:
     
     def show_active_tasks(self, user_id):
         """Aktif görevleri göster"""
-        self.db.cursor.execute('''
-            SELECT * FROM campaigns 
-            WHERE status = 'active' AND remaining_budget > 0
-            ORDER BY created_at DESC 
-            LIMIT 10
-        ''')
-        campaigns = self.db.cursor.fetchall()
+        campaigns = self.db.get_active_campaigns(limit=10)
         
         if not campaigns:
             send_message(user_id, f"""
@@ -1295,15 +1709,15 @@ class BotSystem:
         message = f"<b>🎯 {get_translation(user_id, 'do_task')}</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         
         for i, camp in enumerate(campaigns, 1):
-            task_type = camp['task_type']
+            task_type = camp.get('task_type', 'bot')
             task_icon = "🤖" if task_type == 'bot' else "📢" if task_type == 'channel' else "👥"
             task_name = get_translation(user_id, 'bot_campaign') if task_type == 'bot' else get_translation(user_id, 'channel_campaign') if task_type == 'channel' else get_translation(user_id, 'group_campaign')
             
-            message += f"""{task_icon} <b>{camp['name'][:30]}</b>
+            message += f"""{task_icon} <b>{camp.get('name', '')[:30]}</b>
 ├ <b>Tip:</b> {task_name}
-├ <b>Ödül:</b> {camp['price_per_task']}₺
-├ <b>Kalan:</b> {int(camp['remaining_budget'] / camp['price_per_task'])} kişi
-└ <b>ID:</b> <code>{camp['campaign_id']}</code>
+├ <b>Ödül:</b> {camp.get('price_per_task', 0)}₺
+├ <b>Kalan:</b> {int(camp.get('remaining_budget', 0) / camp.get('price_per_task', 1))} kişi
+└ <b>ID:</b> <code>{camp.get('campaign_id', '')}</code>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
         
@@ -1410,9 +1824,9 @@ class BotSystem:
 
 <b>{get_translation(user_id, 'how_to_forward')}:</b>
 1️⃣ <b>{get_translation(user_id, 'any_bot')}</b>'in mesajını tapın
-   • @BotFather, @like, @vid, @gamebot və s.
+   • @BotFather, @like, @vid, @gamebot ve s.
 2️⃣ Mesajı bu bota forward edin
-3️⃣ Sistem avtomatik aşkarlayacaq
+3️⃣ Sistem avtomatik aşkarlayacak
 
 <b>{get_translation(user_id, 'accepted')}:</b> {get_translation(user_id, 'all_bots_accepted')}
 <b>{get_translation(user_id, 'rejected')}:</b> {get_translation(user_id, 'normal_users_rejected')}
@@ -1434,7 +1848,7 @@ class BotSystem:
 • {get_translation(user_id, 'instagram_follow')}
 • {get_translation(user_id, 'discord_join')}
 
-<i>{get_translation(user_id, 'enter_your_name')} və ya</i>
+<i>{get_translation(user_id, 'enter_your_name')} veya</i>
 <code>/cancel</code> <i>{get_translation(user_id, 'cancel_text')}</i>
 """)
     
@@ -1516,12 +1930,12 @@ class BotSystem:
 {get_translation(user_id, 'to_create_campaign')} botu kanalda/grupta admin yapmalısınız.
 
 <b>{get_translation(user_id, 'follow_steps')}:</b>
-1️⃣ {get_translation(user_id, 'enter_channel')} ayarlarına gedin
-2️⃣ <b>{get_translation(user_id, 'add_admin')}</b> bölməsinə gedin
+1️⃣ {get_translation(user_id, 'enter_channel')} ayarlarına gidin
+2️⃣ <b>{get_translation(user_id, 'add_admin')}</b> bölmesine gidin
 3️⃣ <b>@GorevYapsamBot</b> yazın
 4️⃣ <b>{get_translation(user_id, 'all_permissions')}</b>
-5️⃣ Xüsusilə: <b>{get_translation(user_id, 'see_members')}</b>
-6️⃣ <b>{get_translation(user_id, 'save')}</b> düyməsinə basın
+5️⃣ Özellikle: <b>{get_translation(user_id, 'see_members')}</b>
+6️⃣ <b>{get_translation(user_id, 'save')}</b> düğmesine basın
 
 <b>{get_translation(user_id, 'check_again')}.</b>
 """)
@@ -1533,7 +1947,7 @@ class BotSystem:
         
         if balance < budget:
             send_message(user_id, f"""
-<b>{get_translation(user_id, 'insufficient_balance')}</b>
+<b>❌ {get_translation(user_id, 'insufficient_balance')}</b>
 
 <b>{get_translation(user_id, 'required')}:</b> {budget:.2f}₺
 <b>{get_translation(user_id, 'available')}:</b> {balance:.2f}₺
@@ -1550,44 +1964,41 @@ class BotSystem:
         price = 2.5 if data['task_type'] == 'bot' else 1.5 if data['task_type'] == 'channel' else 1.0
         max_participants = int(budget / price)
         
-        # Veritabanına kaydet - OTOMATİK AKTİF
-        try:
-            self.db.cursor.execute('''
-                INSERT INTO campaigns 
-                (campaign_id, name, description, link, budget, remaining_budget,
-                 creator_id, creator_name, task_type, price_per_task, max_participants,
-                 status, created_at, forward_message_id, forward_chat_id, forward_message_text,
-                 forward_from_bot_id, forward_from_bot_name, target_chat_id, target_chat_name,
-                 is_bot_admin)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                campaign_id,
-                data['name'],
-                data['description'],
-                data['link'],
-                budget,
-                budget,
-                user_id,
-                user.get('name', 'Kullanıcı'),
-                data['task_type'],
-                price,
-                max_participants,
-                'active',  # OTOMATİK AKTİF
-                get_turkey_time().isoformat(),
-                data.get('forward_message_id', ''),
-                data.get('forward_chat_id', ''),
-                data.get('forward_message_text', ''),
-                data.get('forward_from_bot_id', ''),
-                data.get('forward_from_bot_name', ''),
-                data.get('target_chat_id', ''),
-                data.get('target_chat_name', ''),
-                data.get('is_bot_admin', 0)
-            ))
-            
+        # Kampanya verilerini hazırla
+        campaign_data = {
+            'campaign_id': campaign_id,
+            'name': data['name'],
+            'description': data['description'],
+            'link': data['link'],
+            'budget': budget,
+            'remaining_budget': budget,
+            'creator_id': user_id,
+            'creator_name': user.get('name', 'Kullanıcı'),
+            'task_type': data['task_type'],
+            'price_per_task': price,
+            'max_participants': max_participants,
+            'current_participants': 0,
+            'status': 'active',
+            'created_at': get_turkey_time().isoformat(),
+            'forward_message_id': data.get('forward_message_id', ''),
+            'forward_chat_id': data.get('forward_chat_id', ''),
+            'forward_message_text': data.get('forward_message_text', ''),
+            'forward_from_bot_id': data.get('forward_from_bot_id', ''),
+            'forward_from_bot_name': data.get('forward_from_bot_name', ''),
+            'target_chat_id': data.get('target_chat_id', ''),
+            'target_chat_name': data.get('target_chat_name', ''),
+            'is_bot_admin': data.get('is_bot_admin', 0)
+        }
+        
+        # Kampanyayı oluştur
+        success = self.db.create_campaign(campaign_data)
+        
+        if success:
             # Bakiyeden düş
             self.db.update_user(user_id, {'balance': balance - budget})
             
-            self.db.conn.commit()
+            # Bot istatistiklerini güncelle
+            self.db.update_bot_stats('new_campaign')
             
             # Kullanıcıya bilgi ver
             success_msg = f"""
@@ -1610,8 +2021,8 @@ class BotSystem:
             time.sleep(2)
             self.show_main_menu(user_id)
             
-        except Exception as e:
-            print(f"❌ Kampanya hatası: {e}")
+        else:
+            print(f"❌ Kampanya hatası")
             send_message(user_id, f"❌ <b>{get_translation(user_id, 'error_occurred')}: Kampanya oluşturulamadı! Lütfen tekrar deneyin.</b>")
     
     def check_bot_admin_status(self, user_id):
@@ -1636,13 +2047,13 @@ class BotSystem:
 
 <b>{get_translation(user_id, 'follow_steps')}:</b>
 
-1️⃣ {get_translation(user_id, 'enter_channel')} ayarlarına gedin
-2️⃣ <b>{get_translation(user_id, 'add_admin')}</b> bölməsinə tıklayın
-3️⃣ <b>{get_translation(user_id, 'add_admin')}</b> düyməsinə basın
+1️⃣ {get_translation(user_id, 'enter_channel')} ayarlarına gidin
+2️⃣ <b>{get_translation(user_id, 'add_admin')}</b> bölmesine tıklayın
+3️⃣ <b>{get_translation(user_id, 'add_admin')}</b> düğmesine basın
 4️⃣ <b>@GorevYapsamBot</b> yazın
 5️⃣ <b>{get_translation(user_id, 'all_permissions')}</b>
-6️⃣ Xüsusilə: <b>{get_translation(user_id, 'see_members')}</b>
-7️⃣ <b>{get_translation(user_id, 'save')}</b> düyməsinə basın
+6️⃣ Özellikle: <b>{get_translation(user_id, 'see_members')}</b>
+7️⃣ <b>{get_translation(user_id, 'save')}</b> düğmesine basın
 
 <b>{get_translation(user_id, 'check_again')}.</b>
 
@@ -1650,13 +2061,7 @@ class BotSystem:
 """)
     
     def show_my_campaigns(self, user_id):
-        self.db.cursor.execute('''
-            SELECT * FROM campaigns 
-            WHERE creator_id = ? 
-            ORDER BY created_at DESC 
-            LIMIT 10
-        ''', (user_id,))
-        campaigns = self.db.cursor.fetchall()
+        campaigns = self.db.get_user_campaigns(user_id, limit=10)
         
         if not campaigns:
             send_message(user_id, f"""
@@ -1681,7 +2086,7 @@ class BotSystem:
         completed_count = 0
         
         for i, camp in enumerate(campaigns, 1):
-            status = camp['status']
+            status = camp.get('status', 'active')
             status_icon = "🟢" if status == 'active' else "🟡" if status == 'pending' else "🔴"
             status_text = get_translation(user_id, 'active') if status == 'active' else get_translation(user_id, 'pending') if status == 'pending' else get_translation(user_id, 'inactive')
             
@@ -1689,13 +2094,13 @@ class BotSystem:
             elif status == 'pending': pending_count += 1
             else: completed_count += 1
             
-            name = camp['name'][:20] + "..." if len(camp['name']) > 20 else camp['name']
+            name = camp.get('name', '')[:20] + "..." if len(camp.get('name', '')) > 20 else camp.get('name', '')
             
             message += f"""{status_icon} <b>{name}</b>
 ├ <b>{get_translation(user_id, 'status')}:</b> {status_text}
-├ <b>{get_translation(user_id, 'enter_budget')}:</b> {camp['budget']:.1f}₺
-├ <b>{get_translation(user_id, 'task_count')}:</b> {camp['current_participants']}/{camp['max_participants']}
-└ <b>ID:</b> <code>{camp['campaign_id']}</code>
+├ <b>{get_translation(user_id, 'enter_budget')}:</b> {camp.get('budget', 0):.1f}₺
+├ <b>{get_translation(user_id, 'task_count')}:</b> {camp.get('current_participants', 0)}/{camp.get('max_participants', 0)}
+└ <b>ID:</b> <code>{camp.get('campaign_id', '')}</code>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
         
@@ -1779,7 +2184,7 @@ class BotSystem:
 3️⃣ <b>{get_translation(user_id, 'send_txid')}</b>
 4️⃣ <b>{get_translation(user_id, 'balance_loaded')}</b>
 
-<b>{get_translation(user_id, 'processing_time')}:</b> 2-5 dəqiqə
+<b>{get_translation(user_id, 'processing_time')}:</b> 2-5 dakika
 <b>{get_translation(user_id, 'txid_format')}:</b> 64 karakterlik hex kodu
 
 <code>/cancel</code> {get_translation(user_id, 'cancel_text')}
@@ -1787,18 +2192,25 @@ class BotSystem:
         
         deposit_id = hashlib.md5(f"{user_id}{time.time()}".encode()).hexdigest()[:10].upper()
         
-        try:
-            self.db.cursor.execute('''
-                INSERT INTO deposits (deposit_id, user_id, amount_try, amount_trx, created_at, trx_price, bonus_amount)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (deposit_id, user_id, amount, trx_amount, get_turkey_time().isoformat(), self.trx_price, bonus))
-            self.db.conn.commit()
-            
+        # Depozit verilerini hazırla
+        deposit_data = {
+            'deposit_id': deposit_id,
+            'user_id': user_id,
+            'amount_try': amount,
+            'amount_trx': trx_amount,
+            'created_at': get_turkey_time().isoformat(),
+            'trx_price': self.trx_price,
+            'bonus_amount': bonus,
+            'status': 'pending'
+        }
+        
+        # Depoziti oluştur
+        success = self.db.create_deposit(deposit_data)
+        
+        if success:
             self.set_user_state(user_id, 'waiting_txid', {'deposit_id': deposit_id, 'amount': amount, 'bonus': bonus})
             send_message(user_id, message)
-            
-        except Exception as e:
-            print(f"❌ Depozit hatası: {e}")
+        else:
             send_message(user_id, f"❌ <b>{get_translation(user_id, 'error_occurred')}: Depozit oluşturulamadı! Lütfen tekrar deneyin.</b>")
     
     def show_balance(self, user_id):
@@ -1837,24 +2249,28 @@ class BotSystem:
     
     def show_bot_info(self, user_id):
         current_time = get_turkey_time().strftime('%H:%M')
+        db_status = "🔥 Firebase" if self.db.use_firebase else "💾 SQLite"
         
         message = f"""
 <b>{get_translation(user_id, 'bot_info')}</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 <b>🤖 {get_translation(user_id, 'bot_info')}:</b> Görev Yapsam Bot
-<b>🔄 Versiya:</b> v15.0
+<b>🔄 Versiyon:</b> v17.0
+<b>🗄️ Veritabanı:</b> {db_status}
 <b>👑 {get_translation(user_id, 'admin_panel')}:</b> {ADMIN_ID}
 <b>📢 {get_translation(user_id, 'channel')}:</b> @{MANDATORY_CHANNEL}
 <b>₿ TRX {get_translation(user_id, 'enter_name')}:</b> <code>{TRX_ADDRESS}</code>
 
 <b>{get_translation(user_id, 'features')}:</b>
-• TRX ilə balans yükləmə
-• Avtomatik kampaniya sistemi
+• TRX ile bakiye yükleme
+• Otomatik kampanya sistemi
 • %{DEPOSIT_BONUS_PERCENT} depozit bonusu
 • %{ADS_BONUS_PERCENT} reklam bonusu
-• OTOMATİK kampanya aktivləşdirmə
-• Referal sistemi
+• OTOMATİK kampanya aktifleştirme
+• Referans sistemi
+• Bildirim sistemi
+• Firebase Cloud Database
 
 <b>{get_translation(user_id, 'commands')}:</b>
 /start - Botu başlat
@@ -1867,15 +2283,19 @@ class BotSystem:
 /help - {get_translation(user_id, 'help')}
 /cancel - {get_translation(user_id, 'cancel')}
 /language - Dil seçimi
+/tasks - Aktif görevler
+/profile - Profil bilgileri
+/notifications - Bildirim ayarları
+/dbstatus - Veritabanı durumu
 
 <b>{get_translation(user_id, 'rules')}:</b>
-• Saxta tapşırıq yasaqdır
-• Çoxlu hesab yasaqdır
-• Spam yasaqdır
-• Qaydalara uymayanlar banlanır
+• Sahte görev yasaktır
+• Çoklu hesap yasaktır
+• Spam yasaktır
+• Kurallara uymayanlar banlanır
 
 <b>{get_translation(user_id, 'support')}:</b>
-Suallarınız üçün admin ilə əlaqə saxlayın.
+Sorularınız için admin ile iletişime geçin.
 
 <b>{get_translation(user_id, 'time')}:</b> {current_time} 🇹🇷
 """
@@ -1896,46 +2316,46 @@ Suallarınız üçün admin ilə əlaqə saxlayın.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 <b>{get_translation(user_id, 'how_it_works')}</b>
-1️⃣ Kanalımıza qoşulun
-2️⃣ Balans yükləyin və ya tapşırıq edin
-3️⃣ Kampaniya yaradın və ya qoşulun
-4️⃣ Pul qazanın!
+1️⃣ Kanalımıza katılın
+2️⃣ Bakiye yükleyin veya görev yapın
+3️⃣ Kampanya oluşturun veya katılın
+4️⃣ Para kazanın!
 
 <b>{get_translation(user_id, 'how_deposit')}</b>
-1️⃣ /deposit komandasını istifadə edin
+1️⃣ /deposit komutunu kullanın
 2️⃣ {get_translation(user_id, 'choose_amount')} (25-200₺)
-3️⃣ TRX ünvanına TRX göndərin
-4️⃣ TXID'yi daxil edin
-5️⃣ Balansınız avtomatik yüklənəcək
+3️⃣ TRX adresine TRX gönderin
+4️⃣ TXID'yi girin
+5️⃣ Bakiyeniz otomatik yüklenecek
 
 <b>{get_translation(user_id, 'how_create_campaign')}</b>
-1️⃣ /createcampaign komandasını istifadə edin
+1️⃣ /createcampaign komutunu kullanın
 2️⃣ {get_translation(user_id, 'campaign_type')}'ni seçin
-3️⃣ {get_translation(user_id, 'steps')}'ı izləyin
+3️⃣ {get_translation(user_id, 'steps')}'ı izleyin
 4️⃣ {get_translation(user_id, 'auto_approval')}
 
 <b>{get_translation(user_id, 'how_do_task')}</b>
-1️⃣ Aktiv kampaniyaları görün
-2️⃣ Tapşırığı tamamlayın
-3️⃣ Sübut göndərin
-4️⃣ Təsdiqi gözləyin
-5️⃣ Mükafatı alın
+1️⃣ Aktif kampanyaları görün
+2️⃣ Görevi tamamlayın
+3️⃣ Kanıt gönderin
+4️⃣ Onayı bekleyin
+5️⃣ Ödülü alın
 
 <b>{get_translation(user_id, 'referral_system')}</b>
-• Hər referal: 1₺
-• Referal linkiniz: /start ref_XXXXXXXX
-• Dostlarınız kanala qoşulmazsa bonus ala bilməzsiniz
+• Her referans: 1₺
+• Referans linkiniz: /start ref_XXXXXXXX
+• Arkadaşlarınız kanala katılmazsa bonus alamazsınız
 
 <b>{get_translation(user_id, 'cancel_system')}</b>
-• Hər addımda <code>/cancel</code> yaza bilərsiniz
-• Hər menyuda {get_translation(user_id, 'cancel')} düyməsi var
-• Səhvən başladılan əməliyyatları dayandıra bilərsiniz
+• Her adımda <code>/cancel</code> yazabilirsiniz
+• Her menüde {get_translation(user_id, 'cancel')} düğmesi var
+• Yanlışlıkla başlatılan işlemleri durdurabilirsiniz
 
 <b>{get_translation(user_id, 'important_warnings')}</b>
-• Saxta tapşırıq etməyin
-• Çoxlu hesab açmayın
-• Spam etməyin
-• Qaydalara əməl edin
+• Sahte görev yapmayın
+• Çoklu hesap açmayın
+• Spam yapmayın
+• Kurallara uyun
 
 <b>{get_translation(user_id, 'time')}:</b> {current_time} 🇹🇷
 """
@@ -1955,31 +2375,29 @@ Suallarınız üçün admin ilə əlaqə saxlayın.
             return
         
         # İstatistikler
-        self.db.cursor.execute("SELECT COUNT(*) FROM users")
-        total_users = self.db.cursor.fetchone()[0]
+        stats = self.db.get_bot_stats()
         
-        self.db.cursor.execute("SELECT SUM(balance) FROM users")
-        total_balance = self.db.cursor.fetchone()[0] or 0
+        total_users = stats.get('total_users', 0)
+        total_balance = stats.get('total_balance', 0.0)
         
-        self.db.cursor.execute("SELECT COUNT(*) FROM campaigns WHERE status = 'active'")
-        active_campaigns = self.db.cursor.fetchone()[0]
-        
-        self.db.cursor.execute("SELECT COUNT(*) FROM campaigns WHERE status = 'pending'")
-        pending_campaigns = self.db.cursor.fetchone()[0]
+        # Aktif kampanya sayısı
+        active_campaigns = len(self.db.get_active_campaigns(limit=100))
         
         current_time = get_turkey_time().strftime('%H:%M')
+        db_status = "🔥 Firebase" if self.db.use_firebase else "💾 SQLite"
         
         message = f"""
-<b>{get_translation(user_id, 'admin_panel_title')} v15.0</b>
+<b>{get_translation(user_id, 'admin_panel_title')} v17.0</b>
+<small>{db_status}</small>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 <b>{get_translation(user_id, 'statistics_title')}</b>
 • 👥 {get_translation(user_id, 'total_users')}: <b>{total_users}</b>
 • 💰 {get_translation(user_id, 'total_balance')}: {total_balance:.2f}₺
 • 📢 {get_translation(user_id, 'active_campaigns')}: {active_campaigns}
-• ⏳ {get_translation(user_id, 'pending_approval')}: {pending_campaigns} (OTOMATİK)
 • ₿ {get_translation(user_id, 'price')}: {self.trx_price:.2f}₺
 • {get_translation(user_id, 'current_time')}: {current_time} 🇹🇷
+• 🗄️ Veritabanı: {db_status}
 
 <b>{get_translation(user_id, 'admin_tools')}</b>
 """
@@ -2004,33 +2422,18 @@ Suallarınız üçün admin ilə əlaqə saxlayın.
             send_message(user_id, f"<b>{get_translation(user_id, 'admin_no_permission')}</b>")
             return
         
-        # Detaylı istatistikler
-        self.db.cursor.execute("SELECT COUNT(*) FROM users")
-        total_users = self.db.cursor.fetchone()[0]
+        # Bot istatistiklerini al
+        stats = self.db.get_bot_stats()
         
-        self.db.cursor.execute("SELECT COUNT(*) FROM users WHERE DATE(created_at) = DATE('now')")
-        new_users_today = self.db.cursor.fetchone()[0]
+        total_users = stats.get('total_users', 0)
+        total_deposits = stats.get('total_deposits', 0)
+        total_campaigns = stats.get('total_campaigns', 0)
+        total_balance = stats.get('total_balance', 0.0)
+        last_updated = stats.get('last_updated', 'Hiç güncellenmedi')[:19]
         
-        self.db.cursor.execute("SELECT SUM(balance) FROM users")
-        total_balance = self.db.cursor.fetchone()[0] or 0
-        
-        self.db.cursor.execute("SELECT SUM(total_deposited) FROM users")
-        total_deposited = self.db.cursor.fetchone()[0] or 0
-        
-        self.db.cursor.execute("SELECT SUM(total_bonus) FROM users")
-        total_bonus = self.db.cursor.fetchone()[0] or 0
-        
-        self.db.cursor.execute("SELECT COUNT(*) FROM campaigns")
-        total_campaigns = self.db.cursor.fetchone()[0]
-        
-        self.db.cursor.execute("SELECT COUNT(*) FROM campaigns WHERE status = 'active'")
-        active_campaigns = self.db.cursor.fetchone()[0]
-        
-        self.db.cursor.execute("SELECT COUNT(*) FROM campaigns WHERE DATE(created_at) = DATE('now')")
-        new_campaigns_today = self.db.cursor.fetchone()[0]
-        
-        self.db.cursor.execute("SELECT COUNT(*) FROM deposits WHERE status = 'pending'")
-        pending_deposits = self.db.cursor.fetchone()[0]
+        # Bugünkü istatistikler
+        today = datetime.now().strftime('%Y-%m-%d')
+        # Not: Firebase'de tarih filtrelemesi eklenebilir
         
         current_time = get_turkey_time().strftime('%H:%M')
         
@@ -2039,23 +2442,20 @@ Suallarınız üçün admin ilə əlaqə saxlayın.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 <b>👥 {get_translation(user_id, 'total_users')}:</b> {total_users}
-<b>📈 Bugünkü yeni kullanıcılar:</b> {new_users_today}
-
 <b>💰 {get_translation(user_id, 'total_balance')}:</b> {total_balance:.2f}₺
-<b>💳 Toplam yatırım:</b> {total_deposited:.2f}₺
-<b>🎁 Toplam bonus:</b> {total_bonus:.2f}₺
+<b>💳 Toplam yatırım:</b> {total_deposits} işlem
 
 <b>📢 Toplam kampanyalar:</b> {total_campaigns}
-<b>🟢 Aktif kampanyalar:</b> {active_campaigns}
-<b>📈 Bugünkü yeni kampanyalar:</b> {new_campaigns_today}
+<b>🟢 Aktif kampanyalar:</b> {len(self.db.get_active_campaigns(limit=100))}
 
-<b>⏳ Bekleyen depozitler:</b> {pending_deposits}
-
+<b>⏳ Son güncelleme:</b> {last_updated}
 <b>{get_translation(user_id, 'time')}:</b> {current_time} 🇹🇷
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 <b>💡 Sistem OTOMATİK çalışıyor:</b>
 • Kampanyalar otomatik aktif
 • Admin onayı gerekmez
+• Bildirimler otomatik gönderilir
+• Yeni kullanıcılar otomatik kaydedilir
 """
         
         markup = {
@@ -2066,105 +2466,13 @@ Suallarınız üçün admin ilə əlaqə saxlayın.
         
         send_message(user_id, message, markup)
     
-    def approve_campaign(self, campaign_id):
-        try:
-            # Kampanyayı bul
-            self.db.cursor.execute("SELECT * FROM campaigns WHERE campaign_id = ?", (campaign_id,))
-            campaign = self.db.cursor.fetchone()
-            
-            if not campaign:
-                send_message(ADMIN_ID, f"❌ <b>Kampanya bulunamadı:</b> {campaign_id}")
-                return
-            
-            # Kampanyayı aktif et (OTOMATİK OLDUĞU İÇİN ARTIK GEREK YOK)
-            # self.db.cursor.execute("UPDATE campaigns SET status = 'active' WHERE campaign_id = ?", (campaign_id,))
-            # self.db.conn.commit()
-            
-            # Oluşturucuya bildir
-            creator_id = campaign['creator_id']
-            send_message(creator_id, f"""
-<b>{get_translation(creator_id, 'campaign_approved')}</b>
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-<b>📛 {get_translation(creator_id, 'enter_name')}:</b> {campaign['name']}
-<b>{get_translation(creator_id, 'campaign_id')}:</b> <code>{campaign_id}</code>
-<b>💰 {get_translation(creator_id, 'enter_budget')}:</b> {campaign['budget']:.2f}₺
-<b>{get_translation(creator_id, 'max_participants')}:</b> {campaign['max_participants']}
-
-✅ <b>{get_translation(creator_id, 'campaign_active')}</b>
-📢 <b>{get_translation(creator_id, 'users_can_join')}</b>
-
-💰 <b>{get_translation(creator_id, 'earnings_per_participation')}:</b> {campaign['price_per_task']}₺
-⏳ <b>{get_translation(creator_id, 'duration_until_budget')}</b>
-""")
-            
-            # Admin'e bildir
-            send_message(ADMIN_ID, f"ℹ️ <b>BİLGİ:</b> Kampanyalar artık OTOMATİK aktif oluyor.\n\nKampanya: {campaign_id}")
-            
-        except Exception as e:
-            print(f"❌ Onay hatası: {e}")
-            send_message(ADMIN_ID, f"❌ <b>Kampanya işlem hatası:</b> {campaign_id}")
-    
-    def reject_campaign(self, campaign_id):
-        try:
-            # Kampanyayı bul
-            self.db.cursor.execute("SELECT * FROM campaigns WHERE campaign_id = ?", (campaign_id,))
-            campaign = self.db.cursor.fetchone()
-            
-            if not campaign:
-                send_message(ADMIN_ID, f"❌ <b>Kampanya bulunamadı:</b> {campaign_id}")
-                return
-            
-            # Bakiye iadesi
-            creator_id = campaign['creator_id']
-            budget = campaign['budget']
-            
-            user = self.db.get_user(creator_id)
-            new_balance = user.get('balance', 0) + budget
-            self.db.update_user(creator_id, {'balance': new_balance})
-            
-            # Kampanyayı reddet
-            self.db.cursor.execute("UPDATE campaigns SET status = 'rejected' WHERE campaign_id = ?", (campaign_id,))
-            self.db.conn.commit()
-            
-            # Oluşturucuya bildir
-            send_message(creator_id, f"""
-<b>{get_translation(creator_id, 'campaign_rejected')}</b>
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-<b>📛 {get_translation(creator_id, 'enter_name')}:</b> {campaign['name']}
-<b>{get_translation(creator_id, 'campaign_id')}:</b> <code>{campaign_id}</code>
-<b>💰 {get_translation(creator_id, 'enter_budget')}:</b> {budget:.2f}₺
-
-<b>{get_translation(creator_id, 'reason_for_rejection')}:</b>
-• {get_translation(creator_id, 'bot_not_admin_reason')}
-• {get_translation(creator_id, 'not_following_rules')}
-• {get_translation(creator_id, 'missing_info')}
-• {get_translation(creator_id, 'suspicious_content')}
-
-💰 <b>{get_translation(creator_id, 'balance_refunded')}:</b> {budget:.2f}₺
-💡 <b>{get_translation(creator_id, 'check_rules_try_again')}</b>
-""")
-            
-            # Admin'e bildir
-            send_message(ADMIN_ID, f"❌ <b>Kampanya reddedildi:</b> {campaign_id}\n\n{budget:.2f}₺ kullanıcıya iade edildi.")
-            
-        except Exception as e:
-            print(f"❌ Reddetme hatası: {e}")
-            send_message(ADMIN_ID, f"❌ <b>Kampanya reddedilemedi:</b> {campaign_id}")
-
     def show_admin_campaigns(self, user_id):
         """Admin için kampanya listesi"""
         if user_id != ADMIN_ID:
             send_message(user_id, f"<b>{get_translation(user_id, 'admin_no_permission')}</b>")
             return
         
-        self.db.cursor.execute('''
-            SELECT * FROM campaigns 
-            ORDER BY created_at DESC 
-            LIMIT 20
-        ''')
-        campaigns = self.db.cursor.fetchall()
+        campaigns = self.db.get_all_campaigns(limit=20)
         
         if not campaigns:
             send_message(user_id, "<b>📭 Hiç kampanya bulunamadı!</b>")
@@ -2173,15 +2481,15 @@ Suallarınız üçün admin ilə əlaqə saxlayın.
         message = "<b>📢 TÜM KAMPANYALAR</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         
         for i, camp in enumerate(campaigns, 1):
-            status = camp['status']
+            status = camp.get('status', 'active')
             status_icon = "🟢" if status == 'active' else "🟡" if status == 'pending' else "🔴"
             
-            message += f"""{status_icon} <b>{camp['name'][:20]}</b>
-├ <b>ID:</b> <code>{camp['campaign_id']}</code>
+            message += f"""{status_icon} <b>{camp.get('name', '')[:20]}</b>
+├ <b>ID:</b> <code>{camp.get('campaign_id', '')}</code>
 ├ <b>Durum:</b> {status}
-├ <b>Oluşturan:</b> {camp['creator_name']}
-├ <b>Bütçe:</b> {camp['budget']:.1f}₺
-└ <b>Katılım:</b> {camp['current_participants']}/{camp['max_participants']}
+├ <b>Oluşturan:</b> {camp.get('creator_name', '')}
+├ <b>Bütçe:</b> {camp.get('budget', 0):.1f}₺
+└ <b>Katılım:</b> {camp.get('current_participants', 0)}/{camp.get('max_participants', 0)}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
         
@@ -2201,12 +2509,7 @@ Suallarınız üçün admin ilə əlaqə saxlayın.
             send_message(user_id, f"<b>{get_translation(user_id, 'admin_no_permission')}</b>")
             return
         
-        self.db.cursor.execute('''
-            SELECT * FROM users 
-            ORDER BY created_at DESC 
-            LIMIT 20
-        ''')
-        users = self.db.cursor.fetchall()
+        users = self.db.get_all_users(limit=20)
         
         if not users:
             send_message(user_id, "<b>👥 Hiç kullanıcı bulunamadı!</b>")
@@ -2215,11 +2518,11 @@ Suallarınız üçün admin ilə əlaqə saxlayın.
         message = "<b>👥 TÜM KULLANICILAR</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         
         for i, usr in enumerate(users, 1):
-            message += f"""👤 <b>{usr['name'][:15]}</b>
-├ <b>ID:</b> <code>{usr['user_id']}</code>
-├ <b>Bakiye:</b> {usr['balance']:.1f}₺
-├ <b>Referans:</b> {usr['referrals']}
-└ <b>Kayıt:</b> {usr['created_at'][:10]}
+            message += f"""👤 <b>{usr.get('name', '')[:15]}</b>
+├ <b>ID:</b> <code>{usr.get('user_id', '')}</code>
+├ <b>Bakiye:</b> {usr.get('balance', 0):.1f}₺
+├ <b>Referans:</b> {usr.get('referrals', 0)}
+└ <b>Kayıt:</b> {usr.get('created_at', '')[:10] if usr.get('created_at') else 'Bilinmiyor'}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
         
@@ -2239,21 +2542,27 @@ Suallarınız üçün admin ilə əlaqə saxlayın.
             send_message(user_id, f"<b>{get_translation(user_id, 'admin_no_permission')}</b>")
             return
         
-        send_message(user_id, "📣 <b>Yayın sistemi</b>\n\nBu özellik henüz tamamlanmadı. Yakında eklenecek!")
+        send_message(user_id, "📣 <b>Yayın sistemi</b>\n\nBu özellik yakında eklenecek!")
     
-    # Diğer admin fonksiyonları için placeholder'lar
+    # Diğer admin fonksiyonları
     def show_admin_deposits(self, user_id):
-        send_message(user_id, "💰 <b>Depozit Yönetimi</b>\n\nBu özellik henüz tamamlanmadı. Yakında eklenecek!")
+        send_message(user_id, "💰 <b>Depozit Yönetimi</b>\n\nBu özellik yakında eklenecek!")
     
     def show_admin_settings(self, user_id):
-        send_message(user_id, "⚙️ <b>Ayarlar</b>\n\nBu özellik henüz tamamlanmadı. Yakında eklenecek!")
+        send_message(user_id, "⚙️ <b>Ayarlar</b>\n\nBu özellik yakında eklenecek!")
+    
+    def approve_campaign(self, campaign_id):
+        send_message(ADMIN_ID, f"ℹ️ <b>BİLGİ:</b> Kampanyalar OTOMATİK aktif oluyor.\n\nKampanya: {campaign_id}")
+    
+    def reject_campaign(self, campaign_id):
+        send_message(ADMIN_ID, f"❌ <b>Kampanya reddetme</b>\n\nBu özellik şu anda kullanılamıyor.")
 
 # Ana Program
 def main():
     print("""
     ╔════════════════════════════════════════════════════════════════╗
-    ║                    GÖREV YAPSAM BOT v15.0                      ║
-    ║   TRX DEPOZİT + OTOMATİK GÖREV + REKLAM BAKİYESİ + BONUS SİSTEM║
+    ║                    GÖREV YAPSAM BOT v17.0                      ║
+    ║                FIREBASE EDITION - CLOUD DATABASE               ║
     ╚════════════════════════════════════════════════════════════════╝
     """)
     
@@ -2271,10 +2580,13 @@ def main():
     print(f"💰 Min Depozit: {MIN_DEPOSIT_TRY}₺, Max: {MAX_DEPOSIT_TRY}₺")
     print(f"🎁 Bonuslar: %{DEPOSIT_BONUS_PERCENT} Normal, %{ADS_BONUS_PERCENT} Reklam")
     print(f"⏰ Türkiye Saati: {current_time}")
+    print(f"🗄️ Veritabanı: {'Firebase' if bot.db.use_firebase else 'SQLite'}")
+    print("🔔 Bildirim sistemi aktif: Yeni görevler ve referans bildirimleri")
     print("🔄 İptal sistemi aktif: /cancel komutu her yerde çalışır")
     print("🤖 Forward sistemi: HERHANGİ BİR BOT mesajı kabul edilir")
-    print("🌐 Çoklu dil desteği: Türkçe ve Azerbaycan Dili")
+    print("🌐 Tüm sistem TÜRKÇE")
     print("⚡ OTOMATİK sistem: Kampanyalar otomatik aktif olur")
+    print("📊 İstatistik takibi: Toplam kullanıcı, kampanya, görev")
     print("🔗 Telegram'da /start yazarak test edin")
     
     return app
