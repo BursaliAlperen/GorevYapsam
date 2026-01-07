@@ -5,7 +5,7 @@ Developer: Alperen
 Database: Firebase Firestore v2
 Ödeme: Yakında (Papara & Kripto)
 Dil: Türkçe & Azerbaycan Türkçesi
-Render Optimized - skip_pending eklendi
+Render Optimized - Async fix
 """
 
 import os
@@ -13,6 +13,7 @@ import asyncio
 import telebot
 from telebot import types
 from telebot.async_telebot import AsyncTeleBot
+from telebot.asyncio_helper import ApiException
 import threading
 import time
 from datetime import datetime, timedelta
@@ -35,15 +36,20 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "7904032877"))
 MANDATORY_CHANNEL = os.getenv("MANDATORY_CHANNEL", "GY_Refim")
 
 # ================= 2. FIREBASE FIRESTORE BAĞLANTISI =================
+db = None
 try:
     firebase_creds_json = os.getenv("FIREBASE_CREDENTIALS")
     
     if firebase_creds_json:
         cred_dict = json.loads(firebase_creds_json)
         cred = credentials.Certificate(cred_dict)
-        firebase_admin.initialize_app(cred, {
-            'projectId': 'gorev-yapsam-bot',
-        })
+        
+        # Firebase'i başlat (eğer henüz başlatılmadıysa)
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app(cred, {
+                'projectId': cred_dict.get('project_id', 'gorev-yapsam-bot'),
+            })
+        
         db = firestore.client()
         print("✅ Firebase Firestore bağlantısı başarılı!")
     else:
@@ -592,6 +598,7 @@ Botu kullanabilmek için aşağıdaki kanala katılman gerekiyor:
 async def handle_callback(call):
     user_id = call.from_user.id
     data = call.data
+    message_id = call.message.message_id if call.message else None
     
     try:
         if data not in ["check_join", "set_lang_tr", "set_lang_az"]:
@@ -606,7 +613,7 @@ async def handle_callback(call):
         if data == "check_join":
             if await check_channel_membership(user_id):
                 await create_or_update_user(user_id, {'channel_joined': True})
-                await show_main_menu(user_id, call.message.message_id)
+                await show_main_menu(user_id, message_id)
                 await bot.answer_callback_query(call.id, "✅ Başarılı!")
             else:
                 await bot.answer_callback_query(
@@ -616,50 +623,65 @@ async def handle_callback(call):
                 )
         
         elif data == "refresh_main":
-            await show_main_menu(user_id, call.message.message_id)
+            await show_main_menu(user_id, message_id)
             await bot.answer_callback_query(call.id, "🔄 Yenilendi!")
         
         elif data == "back_menu":
-            await show_main_menu(user_id, call.message.message_id)
+            await show_main_menu(user_id, message_id)
         
         elif data == "deposit_menu":
-            await show_deposit_menu(user_id, call.message.message_id)
+            await show_deposit_menu(user_id, message_id)
         
         elif data == "withdraw_menu":
-            await show_withdraw_menu(user_id, call.message.message_id)
+            await show_withdraw_menu(user_id, message_id)
         
         elif data.startswith("set_lang_"):
             lang = data.replace("set_lang_", "")
             await create_or_update_user(user_id, {'language': lang})
             await bot.answer_callback_query(call.id, f"✅ Dil {lang} olarak ayarlandı!")
-            await show_main_menu(user_id, call.message.message_id)
+            await show_main_menu(user_id, message_id)
         
         elif data == "language_menu":
-            await show_language_menu(user_id, call.message.message_id)
+            await show_language_menu(user_id, message_id)
         
         elif data == "support_menu":
-            await show_support_menu(user_id, call.message.message_id)
+            await show_support_menu(user_id, message_id)
         
         elif data == "faq_menu":
-            await show_faq_menu(user_id, call.message.message_id)
+            await show_faq_menu(user_id, message_id)
         
         elif data == "my_balance":
-            await show_balance_details(user_id, call.message.message_id)
+            await show_balance_details(user_id, message_id)
         
         elif data == "do_task":
-            await show_task_selection(user_id, call.message.message_id)
+            await show_task_selection(user_id, message_id)
         
         elif data == "create_task_menu":
-            await show_create_task_menu(user_id, call.message.message_id)
+            await show_create_task_menu(user_id, message_id)
         
         elif data == "my_refs":
-            await show_referral_info(user_id, call.message.message_id)
+            await show_referral_info(user_id, message_id)
         
         elif data == "ad_balance_menu":
-            await show_ad_balance_conversion(user_id, call.message.message_id)
+            await show_ad_balance_conversion(user_id, message_id)
+        
+        elif data.startswith("convert_"):
+            if data.startswith("convert_"):
+                if data == "convert_custom":
+                    await ask_custom_conversion_amount(user_id, message_id)
+                else:
+                    try:
+                        amount = float(data.replace("convert_", ""))
+                        await handle_ad_conversion(user_id, message_id, amount)
+                    except ValueError:
+                        await bot.answer_callback_query(
+                            call.id,
+                            "❌ Geçersiz miktar!",
+                            show_alert=True
+                        )
         
         elif data == "admin_panel" and user_id == ADMIN_ID:
-            await show_admin_panel(user_id, call.message.message_id)
+            await show_admin_panel(user_id, message_id)
         
         elif data.startswith("copy_"):
             text_to_copy = data.replace("copy_", "")
@@ -911,7 +933,6 @@ async def show_balance_details(user_id: int, message_id: int = None):
     """Bakiye detaylarını göster"""
     user = await get_user(user_id)
     if not user:
-        await bot.answer_callback_query(call.id, "❌ Kullanıcı bulunamadı!")
         return
     
     lang = user.get('language', 'tr')
@@ -1191,18 +1212,23 @@ async def show_ad_balance_conversion(user_id: int, message_id: int = None):
     except Exception as e:
         print(f"Ad balance conversion hatası: {e}")
 
-async def handle_ad_conversion(user_id: int, message_id: int, amount: float):
+async def handle_ad_conversion(user_id: int, callback_query_id: int, amount: float):
     """Reklam bakiyesi çevirim işlemi"""
     user = await get_user(user_id)
     if not user:
+        await bot.answer_callback_query(
+            callback_query_id,
+            "❌ Kullanıcı bulunamadı!",
+            show_alert=True
+        )
         return
     
     normal_balance = user.get('balance', 0)
     
     if normal_balance < amount:
         await bot.answer_callback_query(
-            callback_query_id=message_id,
-            text=f"❌ Yetersiz bakiye! Mevcut: {normal_balance:.2f} ₺",
+            callback_query_id,
+            f"❌ Yetersiz bakiye! Mevcut: {normal_balance:.2f} ₺",
             show_alert=True
         )
         return
@@ -1235,12 +1261,15 @@ async def handle_ad_conversion(user_id: int, message_id: int, amount: float):
 💡 <b>Artık reklam bakiyenle görev oluşturabilirsin!</b>
 """
     
-    await bot.edit_message_text(
-        chat_id=user_id,
-        message_id=message_id,
-        text=message,
-        reply_markup=markup
-    )
+    try:
+        await bot.edit_message_text(
+            chat_id=user_id,
+            message_id=callback_query_id,
+            text=message,
+            reply_markup=markup
+        )
+    except:
+        await bot.send_message(user_id, message, reply_markup=markup)
 
 async def ask_custom_conversion_amount(user_id: int, message_id: int):
     """Özel miktar çevirim için sor"""
@@ -1353,8 +1382,38 @@ async def handle_all_messages(message):
                 await bot.send_message(user_id, "❌ Geçersiz miktar! Pozitif bir sayı girin.")
                 return
             
-            await handle_ad_conversion(user_id, None, amount)
+            user = await get_user(user_id)
+            if user:
+                normal_balance = user.get('balance', 0)
+                if normal_balance < amount:
+                    await bot.send_message(user_id, f"❌ Yetersiz bakiye! Mevcut: {normal_balance:.2f} ₺")
+                    del user_states[user_id]
+                    await show_main_menu(user_id)
+                    return
+            
+            converted_amount = amount * 1.25
+            
+            await update_balance(user_id, -amount, 'balance')
+            await update_balance(user_id, converted_amount, 'ad_balance')
             del user_states[user_id]
+            
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🏠 Ana Menü", callback_data="back_menu"))
+            
+            success_msg = f"""
+✅ <b>ÇEVİRİM BAŞARILI!</b>
+
+<b>─────────────────────</b>
+
+💰 <b>Çevrilen Miktar:</b> {amount:.2f} ₺
+🎁 <b>Bonus (%25):</b> {amount * 0.25:.2f} ₺
+💰 <b>Toplam Kazanç:</b> {converted_amount:.2f} ₺
+
+<b>─────────────────────</b>
+
+💡 <b>Artık reklam bakiyenle görev oluşturabilirsin!</b>
+"""
+            await bot.send_message(user_id, success_msg, reply_markup=markup)
             
         except ValueError:
             await bot.send_message(user_id, "❌ Geçersiz format! Sayı girin. (Örnek: 50.75)")
@@ -1369,10 +1428,9 @@ def update_prices():
     """TRX fiyatlarını güncelle"""
     get_trx_price()
 
-schedule.every(30).seconds.do(update_prices)
-
 def schedule_runner():
     """Schedule görevlerini çalıştır"""
+    schedule.every(30).seconds.do(update_prices)
     while True:
         schedule.run_pending()
         time.sleep(1)
@@ -1393,19 +1451,24 @@ async def run_bot_async():
     
     try:
         print("🤖 Bot polling başlatılıyor...")
-        # DÜZELTME: skip_pending=True eklendi
-        await bot.infinity_polling(skip_pending=True)
+        await bot.polling(non_stop=True, timeout=60, request_timeout=60)
     except Exception as e:
         print(f"❌ Bot hatası: {e}")
         await asyncio.sleep(10)
         await run_bot_async()
 
-def main():
-    """Ana çalıştırma fonksiyonu"""
+async def main_async():
+    """Ana async çalıştırma fonksiyonu"""
+    # Schedule thread'ini başlat
     schedule_thread = threading.Thread(target=schedule_runner, daemon=True)
     schedule_thread.start()
     
-    asyncio.run(run_bot_async())
+    # Bot'u başlat
+    await run_bot_async()
+
+def main():
+    """Ana çalıştırma fonksiyonu"""
+    asyncio.run(main_async())
 
 if __name__ == "__main__":
     main()
