@@ -13,6 +13,7 @@ import re
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ADMIN_ID = os.environ.get("ADMIN_ID", "7904032877")
 MANDATORY_CHANNEL = os.environ.get("MANDATORY_CHANNEL", "GY_Refim")
+BOT_ID = TOKEN.split(':')[0] if TOKEN else ""
 
 if not TOKEN:
     raise ValueError("Bot token gerekli!")
@@ -32,7 +33,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return jsonify({"status": "online", "bot": "Görev Yapsam Bot v12.0"})
+    return jsonify({"status": "online", "bot": "Görev Yapsam Bot v13.0"})
 
 # Database
 class Database:
@@ -84,6 +85,8 @@ class Database:
                 status TEXT DEFAULT 'pending',
                 created_at TEXT,
                 forward_message_id TEXT,
+                forward_chat_id TEXT,
+                forward_message_text TEXT,
                 target_chat_id TEXT,
                 target_chat_name TEXT,
                 admin_approved INTEGER DEFAULT 0,
@@ -171,10 +174,11 @@ def send_message(chat_id, text, markup=None, parse_mode='HTML'):
     try: return requests.post(url, json=data, timeout=10).json()
     except: return None
 
-def answer_callback(callback_id, text=None):
+def answer_callback(callback_id, text=None, show_alert=False):
     url = BASE_URL + "answerCallbackQuery"
     data = {'callback_query_id': callback_id}
     if text: data['text'] = text
+    if show_alert: data['show_alert'] = True
     try: requests.post(url, json=data, timeout=5)
     except: pass
 
@@ -201,7 +205,7 @@ def get_chat_info(chat_id):
 
 def check_bot_admin(chat_id):
     url = BASE_URL + "getChatMember"
-    data = {'chat_id': chat_id, 'user_id': int(TOKEN.split(':')[0])}
+    data = {'chat_id': chat_id, 'user_id': int(BOT_ID)}
     try:
         response = requests.post(url, json=data, timeout=10).json()
         if response.get('ok'):
@@ -210,16 +214,12 @@ def check_bot_admin(chat_id):
     except: pass
     return False
 
-def get_chat_admins(chat_id):
-    url = BASE_URL + "getChatAdministrators"
-    data = {'chat_id': chat_id}
-    try:
-        response = requests.post(url, json=data, timeout=10).json()
-        if response.get('ok'):
-            admins = response['result']
-            return [str(admin['user']['id']) for admin in admins]
-    except: pass
-    return []
+def edit_message(chat_id, message_id, text, markup=None, parse_mode='HTML'):
+    url = BASE_URL + "editMessageText"
+    data = {'chat_id': chat_id, 'message_id': message_id, 'text': text, 'parse_mode': parse_mode}
+    if markup: data['reply_markup'] = json.dumps(markup)
+    try: return requests.post(url, json=data, timeout=10).json()
+    except: return None
 
 # Bot Sistemi
 class BotSystem:
@@ -287,6 +287,7 @@ class BotSystem:
                     'username': message['from'].get('username', '')
                 })
             
+            # Kullanıcı state'i varsa önce onu işle
             if user_state['state']:
                 self.handle_user_state(user_id, message, user_state)
                 return
@@ -311,6 +312,8 @@ class BotSystem:
                     self.show_bot_info(user_id)
                 elif text == '/help': 
                     self.show_help(user_id)
+                elif text == '/cancel':
+                    self.handle_cancel(user_id)
         
         except Exception as e:
             print(f"❌ Mesaj işleme hatası: {e}")
@@ -320,17 +323,36 @@ class BotSystem:
         data = user_state['data']
         step = user_state.get('step', 1)
         
+        # /cancel komutu için her durumda çalışsın
+        if 'text' in message and message['text'] == '/cancel':
+            self.handle_cancel(user_id)
+            return
+        
         # KAMPANYA OLUŞTURMA
         if state == 'creating_campaign':
             if step == 1:  # İsim
                 data['name'] = message['text']
                 user_state['step'] = 2
-                send_message(user_id, "<b>✅ 1/5 - İsim Kaydedildi</b>\n\n<b>2/5 - Açıklama girin:</b>\n\nÖrnek: 'Kanalımıza katılın, içeriklerimizi takip edin'")
+                send_message(user_id, f"""
+<b>✅ 1/5 - İsim Kaydedildi</b>
+
+<b>📄 2/5 - Açıklama girin:</b>
+<i>Örnek: 'Kanalımıza katılın, içeriklerimizi takip edin'</i>
+
+<code>/cancel</code> yazarak iptal edebilirsiniz.
+""")
             
             elif step == 2:  # Açıklama
                 data['description'] = message['text']
                 user_state['step'] = 3
-                send_message(user_id, "<b>✅ 2/5 - Açıklama Kaydedildi</b>\n\n<b>3/5 - Link girin:</b>\n\nÖrnek: https://t.me/kanaladi")
+                send_message(user_id, f"""
+<b>✅ 2/5 - Açıklama Kaydedildi</b>
+
+<b>🔗 3/5 - Link girin:</b>
+<i>Örnek: https://t.me/kanaladi</i>
+
+<code>/cancel</code> yazarak iptal edebilirsiniz.
+""")
             
             elif step == 3:  # Link
                 data['link'] = message['text']
@@ -338,9 +360,24 @@ class BotSystem:
                 
                 task_type = data['task_type']
                 if task_type == 'bot':
-                    send_message(user_id, "<b>✅ 3/5 - Link Kaydedildi</b>\n\n<b>4/5 - Bütçe girin (₺):</b>\n\nMinimum: 10₺")
+                    send_message(user_id, f"""
+<b>✅ 3/5 - Link Kaydedildi</b>
+
+<b>💰 4/5 - Bütçe girin (₺):</b>
+<i>Minimum: 10₺ - Sadece sayı girin (örn: 50)</i>
+
+<code>/cancel</code> yazarak iptal edebilirsiniz.
+""")
                 else:
-                    send_message(user_id, "<b>✅ 3/5 - Link Kaydedildi</b>\n\n<b>4/5 - Kanal/Grup ismi girin (@ ile başlamalı):</b>\n\nÖrnek: @kanaladi veya kanal linki")
+                    send_message(user_id, f"""
+<b>✅ 3/5 - Link Kaydedildi</b>
+
+<b>🎯 4/5 - Kanal/Grup ismi girin:</b>
+<i>@ ile başlamalı veya link olmalı</i>
+<i>Örnek: @kanaladi veya https://t.me/kanaladi</i>
+
+<code>/cancel</code> yazarak iptal edebilirsiniz.
+""")
             
             elif step == 4:
                 task_type = data['task_type']
@@ -388,7 +425,7 @@ class BotSystem:
                         send_message(user_id, f"""
 <b>⚠️ BOT ADMIN DEĞİL!</b>
 
-Kanal/Grup: <b>{chat_info.get('title', chat_input)}</b>
+📢 <b>Kanal/Grup:</b> {chat_info.get('title', chat_input)}
 
 <b>Kampanyayı oluşturmak için:</b>
 1️⃣ Botu kanalda <b>ADMIN</b> yapın
@@ -399,7 +436,15 @@ Kanal/Grup: <b>{chat_info.get('title', chat_input)}</b>
 """)
                         time.sleep(1)
                     
-                    send_message(user_id, f"<b>✅ 4/5 - Kanal/Grup Kaydedildi</b>\n\n<b>5/5 - Bütçe girin (₺):</b>\n\nKanal: <b>{chat_info.get('title', chat_input)}</b>\nMinimum: 10₺")
+                    send_message(user_id, f"""
+<b>✅ 4/5 - Kanal/Grup Kaydedildi</b>
+
+<b>💰 5/5 - Bütçe girin (₺):</b>
+<i>Kanal: <b>{chat_info.get('title', chat_input)}</b></i>
+<i>Minimum: 10₺ - Sadece sayı girin</i>
+
+<code>/cancel</code> yazarak iptal edebilirsiniz.
+""")
             
             elif step == 5:  # Bütçe (kanal/grup için)
                 try:
@@ -414,42 +459,101 @@ Kanal/Grup: <b>{chat_info.get('title', chat_input)}</b>
                 except:
                     send_message(user_id, "❌ <b>Geçersiz bütçe! Lütfen sayı girin.</b>")
         
-        # BOT MESAJ FORWARD
+        # BOT MESAJ FORWARD - DÜZELTİLMİŞ VERSİYON
         elif state == 'forward_message':
-            if 'forward_from' in message and message['forward_from'].get('is_bot'):
-                data['forward_message_id'] = message['message_id']
-                data['forward_from_id'] = message['forward_from']['id']
-                
-                # Forward edilen mesajın bu bota ait olup olmadığını kontrol et
-                if str(data['forward_from_id']) == str(TOKEN.split(':')[0]):
-                    send_message(user_id, "<b>✅ Bot mesajı alındı</b>\n\n<b>1/5 - Kampanya ismi girin:</b>\n\nÖrnek: 'Bot Mesajı Forward Görevi'")
-                    user_state['step'] = 1
-                    user_state['state'] = 'creating_campaign'
+            # Önce forward mesaj olup olmadığını kontrol et
+            if 'forward_from' in message:
+                # Bot kontrolü - FIXED: Sadece forward_from.is_bot kontrolü
+                if message['forward_from'].get('is_bot', False):
+                    forward_from_id = str(message['forward_from']['id'])
+                    
+                    # FIX: Bu botun kendi mesajını kontrol et
+                    if forward_from_id == BOT_ID:
+                        data['forward_message_id'] = message['message_id']
+                        data['forward_chat_id'] = message['chat']['id']
+                        
+                        # Mesaj metnini al
+                        message_text = message.get('text', '') or message.get('caption', '') or ''
+                        data['forward_message_text'] = message_text[:200] + '...' if len(message_text) > 200 else message_text
+                        
+                        # Başarılı mesajı
+                        send_message(user_id, "<b>✅ Bot mesajı başarıyla alındı!</b>\n\n<b>📛 1/5 - Kampanya ismi girin:</b>\n\n<i>Örnek: 'Bot Mesajı Forward Görevi'</i>")
+                        user_state['step'] = 1
+                        user_state['state'] = 'creating_campaign'
+                    else:
+                        # Başka bir botun mesajı forward edilmiş
+                        answer_callback(None, "❌ Sadece bu botun mesajını forward edin!", show_alert=True)
+                        send_message(user_id, """
+<b>❌ Sadece bu botun mesajını forward edin!</b>
+
+⚠️ <b>YANLIŞ:</b> Başka bot mesajı forward ettiniz.
+✅ <b>DOĞRU:</b> Bu botun (@GorevYapsamBot) mesajını forward edin.
+
+<b>Nasıl yapılır:</b>
+1️⃣ Bu botun mesajını bulun (örnek: /start mesajı)
+2️⃣ Mesajı bu bota forward edin
+3️⃣ Sistem otomatik algılayacak
+""")
                 else:
-                    send_message(user_id, "❌ <b>Sadece bu botun mesajını forward edin!</b>\n\nBu botun mesajını bulup forward edin.")
+                    # Bot değil, normal kullanıcı mesajı
+                    send_message(user_id, """
+<b>❌ Sadece BOT mesajı forward edin!</b>
+
+⚠️ <b>Normal kullanıcı mesajı forward ettiniz.</b>
+
+<b>Doğru adımlar:</b>
+1️⃣ Herhangi bir <b>BOT</b>'un mesajını bulun
+2️⃣ Mesajı bu bota <b>FORWARD</b> edin
+3️⃣ Sistem otomatik algılayacak
+
+<i>Not: Sadece botların mesajları kabul edilir!</i>
+""")
+            elif 'text' in message and message['text'] == '/cancel':
+                self.handle_cancel(user_id)
             else:
-                send_message(user_id, "❌ <b>Sadece BOT mesajı forward edin!</b>\n\nHerhangi bir botun mesajını forward edebilirsiniz.")
+                # Forward mesaj değil
+                send_message(user_id, """
+<b>📤 LÜTFEN MESAJ FORWARD EDİN!</b>
+
+<i>Bir mesaj forward etmeniz gerekiyor:</i>
+
+<b>Adımlar:</b>
+1️⃣ Başka bir <b>BOT</b>'un mesajını bulun
+2️⃣ Mesaja basılı tutun veya sağ tıklayın
+3️⃣ <b>Forward</b> seçeneğine tıklayın
+4️⃣ Bu botu (@GorevYapsamBot) seçin
+5️⃣ Gönderin
+
+<code>/cancel</code> yazarak iptal edebilirsiniz.
+""")
     
     def process_callback(self, callback):
         try:
             user_id = str(callback['from']['id'])
             data = callback['data']
             callback_id = callback['id']
+            message_id = callback['message']['message_id'] if 'message' in callback else None
             
-            answer_callback(callback_id)
+            # İptal butonu kontrolü
+            if data == 'cancel':
+                self.handle_cancel(user_id)
+                answer_callback(callback_id, "❌ İşlem iptal edildi.")
+                return
             
             # Admin callback'leri
             if data.startswith('admin_'):
                 if user_id != ADMIN_ID:
-                    send_message(user_id, "❌ <b>Bu işlem için yetkiniz yok!</b>")
+                    answer_callback(callback_id, "❌ Bu işlem için yetkiniz yok!", show_alert=True)
                     return
                 
                 if data.startswith('admin_approve_'):
                     campaign_id = data.replace('admin_approve_', '')
                     self.approve_campaign(campaign_id)
+                    answer_callback(callback_id, f"✅ Kampanya {campaign_id} onaylandı!")
                 elif data.startswith('admin_reject_'):
                     campaign_id = data.replace('admin_reject_', '')
                     self.reject_campaign(campaign_id)
+                    answer_callback(callback_id, f"❌ Kampanya {campaign_id} reddedildi!")
                 elif data == 'admin_panel':
                     self.show_admin_panel(user_id)
                 elif data == 'admin_campaigns':
@@ -484,18 +588,44 @@ Kanal/Grup: <b>{chat_info.get('title', chat_input)}</b>
                 self.confirm_campaign(user_id)
             elif data == 'campaign_cancel':
                 self.clear_user_state(user_id)
-                send_message(user_id, "❌ <b>Kampanya oluşturma iptal edildi.</b>")
+                answer_callback(callback_id, "❌ Kampanya oluşturma iptal edildi.")
+                send_message(user_id, "<b>❌ Kampanya oluşturma iptal edildi.</b>\n\nAna menüye yönlendiriliyorsunuz...")
+                time.sleep(1)
+                self.show_main_menu(user_id)
             elif data == 'check_bot_admin':
                 self.check_bot_admin_status(user_id)
             elif data == 'joined':
                 if get_chat_member(f"@{MANDATORY_CHANNEL}", user_id):
                     self.db.update_user(user_id, {'in_channel': 1})
+                    answer_callback(callback_id, "✅ Kanal kontrolü başarılı!")
                     self.show_main_menu(user_id)
                 else:
-                    send_message(user_id, f"❌ <b>Hala kanala katılmadınız!</b>\n\n👉 @{MANDATORY_CHANNEL}")
+                    answer_callback(callback_id, "❌ Hala kanala katılmadınız!", show_alert=True)
         
         except Exception as e:
             print(f"❌ Callback hatası: {e}")
+            answer_callback(callback_id, f"❌ Bir hata oluştu: {str(e)}", show_alert=True)
+    
+    def handle_cancel(self, user_id):
+        """Kullanıcının mevcut işlemini iptal et"""
+        user_state = self.get_user_state(user_id)
+        
+        if user_state['state']:
+            previous_state = user_state['state']
+            self.clear_user_state(user_id)
+            
+            cancel_messages = {
+                'forward_message': "📤 Forward işlemi iptal edildi.",
+                'creating_campaign': "📢 Kampanya oluşturma iptal edildi.",
+                'waiting_txid': "💳 Depozit işlemi iptal edildi."
+            }
+            
+            message = cancel_messages.get(previous_state, "🔄 İşlem iptal edildi.")
+            send_message(user_id, f"<b>{message}</b>\n\nAna menüye yönlendiriliyorsunuz...")
+            time.sleep(1)
+            self.show_main_menu(user_id)
+        else:
+            send_message(user_id, "<b>⚠️ Aktif bir işleminiz bulunmuyor.</b>")
     
     def handle_start(self, user_id, text):
         in_channel = get_chat_member(f"@{MANDATORY_CHANNEL}", user_id)
@@ -558,8 +688,8 @@ Kanal/Grup: <b>{chat_info.get('title', chat_input)}</b>
         user = self.db.get_user(user_id)
         
         message = f"""
-<b>🤖 GÖREV YAPSAM BOT</b>
-━━━━━━━━━━━━━━━━━━━━
+<b>🤖 GÖREV YAPSAM BOT v13.0</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 👤 <b>Kullanıcı:</b> {user.get('name', 'Kullanıcı')}
 💰 <b>Bakiye:</b> <code>{user.get('balance', 0):.2f}₺</code>
@@ -567,10 +697,9 @@ Kanal/Grup: <b>{chat_info.get('title', chat_input)}</b>
 👥 <b>Referans:</b> {user.get('referrals', 0)}
 
 <b>₿ TRX Fiyatı:</b> {self.trx_price:.2f}₺
-
-<b>📢 ZORUNLU KANAL:</b> @{MANDATORY_CHANNEL}
-━━━━━━━━━━━━━━━━━━━━
-<b>ANA MENÜ</b>
+<b>📢 Zorunlu Kanal:</b> @{MANDATORY_CHANNEL}
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+<b>📋 ANA MENÜ</b>
 """
         
         markup = {
@@ -596,7 +725,7 @@ Kanal/Grup: <b>{chat_info.get('title', chat_input)}</b>
         
         message = """
 <b>📢 KAMPANYA TİPİ SEÇİN</b>
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 <b>🤖 BOT KAMPANYASI</b>
 • Görev: Bot mesajını forward etme
@@ -616,6 +745,7 @@ Kanal/Grup: <b>{chat_info.get('title', chat_input)}</b>
 • Durum: Bot grupta admin olmalı
 • Not: Botu grupta admin yapın
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 <b>👇 Hangi tür kampanya oluşturacaksınız?</b>
 """
         
@@ -624,7 +754,7 @@ Kanal/Grup: <b>{chat_info.get('title', chat_input)}</b>
                 [{'text': '🤖 BOT KAMPANYASI', 'callback_data': 'camp_type_bot'}],
                 [{'text': '📢 KANAL KAMPANYASI', 'callback_data': 'camp_type_channel'}],
                 [{'text': '👥 GRUP KAMPANYASI', 'callback_data': 'camp_type_group'}],
-                [{'text': '🔙 GERİ', 'callback_data': 'menu'}]
+                [{'text': '❌ İPTAL', 'callback_data': 'cancel'}, {'text': '🔙 GERİ', 'callback_data': 'menu'}]
             ]
         }
         
@@ -637,7 +767,7 @@ Kanal/Grup: <b>{chat_info.get('title', chat_input)}</b>
             self.set_user_state(user_id, 'forward_message', {'task_type': task_type})
             send_message(user_id, """
 <b>🤖 BOT KAMPANYASI OLUŞTURMA</b>
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 <b>📌 ADIM 1:</b> Bot mesajı forward edin
 
@@ -647,13 +777,16 @@ Kanal/Grup: <b>{chat_info.get('title', chat_input)}</b>
 3️⃣ Sistem otomatik algılayacak
 
 <b>⚠️ NOT:</b> Sadece BOT mesajı forward edin!
+
+<i>Bir mesaj forward edin veya</i>
+<code>/cancel</code> <i>yazarak iptal edin</i>
 """)
         else:
             task_name = "KANAL" if task_type == 'channel' else "GRUP"
             self.set_user_state(user_id, 'creating_campaign', {'task_type': task_type})
             send_message(user_id, f"""
 <b>📢 {task_name} KAMPANYASI OLUŞTURMA</b>
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 <b>📌 ADIM 1/5:</b> Kampanya ismi girin
 
@@ -663,7 +796,8 @@ Kanal/Grup: <b>{chat_info.get('title', chat_input)}</b>
 • Instagram Takip Et
 • Discord Sunucusu
 
-<b>Kampanya isminizi yazın:</b>
+<i>Kampanya isminizi yazın veya</i>
+<code>/cancel</code> <i>yazarak iptal edin</i>
 """)
     
     def show_campaign_summary(self, user_id, data):
@@ -675,7 +809,7 @@ Kanal/Grup: <b>{chat_info.get('title', chat_input)}</b>
         
         summary = f"""
 <b>📋 KAMPANYA ÖZETİ</b>
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 <b>🎯 KAMPANYA TİPİ:</b> {task_name}
 <b>📛 İSİM:</b> {data['name']}
@@ -701,9 +835,9 @@ Kanal/Grup: <b>{chat_info.get('title', chat_input)}</b>
 <b>👥 MAKSİMUM KATILIM:</b> {max_participants}
 <b>👤 OLUŞTURAN:</b> {data.get('creator_name', 'Kullanıcı')}
 
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 <b>Kampanyayı onaylıyor musunuz?</b>
-<b>✅ Onaylandıktan sonra admin kontrolünden geçecek.</b>
+<i>✅ Onaylandıktan sonra admin kontrolünden geçecek.</i>
 """
         
         markup = {
@@ -743,7 +877,9 @@ Kampanyayı oluşturmak için botu kanalda/grupta admin yapmalısınız.
 1️⃣ Kanal/grup ayarlarına git
 2️⃣ Yöneticiler (Admins) bölümüne git
 3️⃣ Botu admin olarak ekle
-4️⃣ Tüm yetkileri ver (özellikle üyeleri görme)
+4️⃣ TÜM YETKİLERİ aktif edin
+5️⃣ Özellikle: Üyeleri görme yetkisi
+6️⃣ Kaydet butonuna basın
 
 <b>Admin yaptıktan sonra tekrar deneyin.</b>
 """)
@@ -778,9 +914,9 @@ Kampanyayı oluşturmak için botu kanalda/grupta admin yapmalısınız.
                 INSERT INTO campaigns 
                 (campaign_id, name, description, link, budget, remaining_budget,
                  creator_id, creator_name, task_type, price_per_task, max_participants,
-                 status, created_at, forward_message_id, target_chat_id, target_chat_name,
-                 admin_approved, admin_checked, is_bot_admin)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 status, created_at, forward_message_id, forward_chat_id, forward_message_text,
+                 target_chat_id, target_chat_name, admin_approved, admin_checked, is_bot_admin)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 campaign_id,
                 data['name'],
@@ -796,6 +932,8 @@ Kampanyayı oluşturmak için botu kanalda/grupta admin yapmalısınız.
                 'pending',
                 datetime.now().isoformat(),
                 data.get('forward_message_id', ''),
+                data.get('forward_chat_id', ''),
+                data.get('forward_message_text', ''),
                 data.get('target_chat_id', ''),
                 data.get('target_chat_name', ''),
                 0,  # admin_approved
@@ -813,7 +951,7 @@ Kampanyayı oluşturmak için botu kanalda/grupta admin yapmalısınız.
                 task_name = "BOT" if data['task_type'] == 'bot' else "KANAL" if data['task_type'] == 'channel' else "GRUP"
                 admin_msg = f"""
 <b>🆕 YENİ KAMPANYA ONAY BEKLİYOR</b>
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 <b>📛 İSİM:</b> {data['name']}
 <b>🎯 TİP:</b> {task_name}
@@ -833,7 +971,8 @@ Kampanyayı oluşturmak için botu kanalda/grupta admin yapmalısınız.
                 admin_markup = {
                     'inline_keyboard': [[
                         {'text': '✅ ONAYLA', 'callback_data': f'admin_approve_{campaign_id}'},
-                        {'text': '❌ REDDET', 'callback_data': f'admin_reject_{campaign_id}'}
+                        {'text': '❌ REDDET', 'callback_data': f'admin_reject_{campaign_id}'},
+                        {'text': '🗑️ SİL', 'callback_data': f'admin_delete_{campaign_id}'}
                     ]]
                 }
                 send_message(ADMIN_ID, admin_msg, admin_markup)
@@ -841,7 +980,7 @@ Kampanyayı oluşturmak için botu kanalda/grupta admin yapmalısınız.
             # Kullanıcıya bilgi ver
             success_msg = f"""
 <b>✅ KAMPANYA OLUŞTURULDU!</b>
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 <b>📛 İSİM:</b> {data['name']}
 <b>💰 BÜTÇE:</b> {budget:.2f}₺
@@ -851,10 +990,14 @@ Kampanyayı oluşturmak için botu kanalda/grupta admin yapmalısınız.
 
 ⏳ <b>Admin onayı genellikle 24 saat içinde yapılır.</b>
 📢 <b>Onaylandıktan sonra kampanya aktif olacak.</b>
+
+💰 <b>{budget:.2f}₺ bakiyenizden düşüldü.</b>
 """
             
             send_message(user_id, success_msg)
             self.clear_user_state(user_id)
+            time.sleep(2)
+            self.show_main_menu(user_id)
             
         except Exception as e:
             print(f"❌ Kampanya hatası: {e}")
@@ -891,6 +1034,8 @@ Kampanyayı oluşturmak için botu kanalda/grupta admin yapmalısınız.
 7️⃣ <b>Kaydet</b> butonuna basın
 
 <b>✅ Admin yaptıktan sonra tekrar kontrol edin.</b>
+
+<code>/cancel</code> yazarak iptal edebilirsiniz.
 """)
     
     def show_my_campaigns(self, user_id):
@@ -914,9 +1059,11 @@ Kampanyayı oluşturmak için botu kanalda/grupta admin yapmalısınız.
 3️⃣ Adımları takip edin
 4️⃣ Admin onayı bekleyin
 """)
+            time.sleep(2)
+            self.show_main_menu(user_id)
             return
         
-        message = "<b>📋 KAMPANYALARIM</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        message = "<b>📋 KAMPANYALARIM</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         
         active_count = 0
         pending_count = 0
@@ -924,7 +1071,7 @@ Kampanyayı oluşturmak için botu kanalda/grupta admin yapmalısınız.
         
         for i, camp in enumerate(campaigns, 1):
             status = camp['status']
-            status_icon = "✅" if status == 'active' else "⏳" if status == 'pending' else "❌"
+            status_icon = "🟢" if status == 'active' else "🟡" if status == 'pending' else "🔴"
             status_text = "AKTİF" if status == 'active' else "BEKLİYOR" if status == 'pending' else "PASİF"
             
             if status == 'active': active_count += 1
@@ -933,18 +1080,18 @@ Kampanyayı oluşturmak için botu kanalda/grupta admin yapmalısınız.
             
             name = camp['name'][:20] + "..." if len(camp['name']) > 20 else camp['name']
             
-            message += f"""<b>{i}.</b> {status_icon} <b>{name}</b>
-   ├ <b>Durum:</b> {status_text}
-   ├ <b>Bütçe:</b> {camp['budget']:.1f}₺
-   ├ <b>Katılım:</b> {camp['current_participants']}/{camp['max_participants']}
-   └ <b>ID:</b> <code>{camp['campaign_id']}</code>
-   ━━━━━━━━━━━━━━━━━━━━
+            message += f"""{status_icon} <b>{name}</b>
+├ <b>Durum:</b> {status_text}
+├ <b>Bütçe:</b> {camp['budget']:.1f}₺
+├ <b>Katılım:</b> {camp['current_participants']}/{camp['max_participants']}
+└ <b>ID:</b> <code>{camp['campaign_id']}</code>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
         
         message += f"\n<b>📊 ÖZET:</b>\n"
-        message += f"• ✅ Aktif: {active_count}\n"
-        message += f"• ⏳ Bekleyen: {pending_count}\n"
-        message += f"• ❌ Pasif: {completed_count}\n"
+        message += f"• 🟢 Aktif: {active_count}\n"
+        message += f"• 🟡 Bekleyen: {pending_count}\n"
+        message += f"• 🔴 Pasif: {completed_count}\n"
         message += f"• 📈 Toplam: {len(campaigns)}"
         
         markup = {
@@ -961,7 +1108,7 @@ Kampanyayı oluşturmak için botu kanalda/grupta admin yapmalısınız.
         
         message = f"""
 <b>💰 BAKİYE YÜKLEME</b>
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 <b>₿ TRX FİYATI:</b> {self.trx_price:.2f}₺
 <b>💵 MİNİMUM:</b> {MIN_DEPOSIT_TRY}₺
@@ -975,7 +1122,7 @@ Kampanyayı oluşturmak için botu kanalda/grupta admin yapmalısınız.
 • Normal: 135₺ (35₺ bonus)
 • Reklam: 120₺ (20₺ bonus)
 
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 <b>👇 TUTAR SEÇİN:</b>
 """
         
@@ -985,7 +1132,7 @@ Kampanyayı oluşturmak için botu kanalda/grupta admin yapmalısınız.
                  {'text': f'50₺ ({(50/self.trx_price):.2f} TRX)', 'callback_data': 'deposit_amount_50'}],
                 [{'text': f'100₺ ({(100/self.trx_price):.2f} TRX)', 'callback_data': 'deposit_amount_100'},
                  {'text': f'200₺ ({(200/self.trx_price):.2f} TRX)', 'callback_data': 'deposit_amount_200'}],
-                [{'text': '🔙 GERİ', 'callback_data': 'menu'}]
+                [{'text': '❌ İPTAL', 'callback_data': 'cancel'}, {'text': '🔙 GERİ', 'callback_data': 'menu'}]
             ]
         }
         
@@ -998,7 +1145,7 @@ Kampanyayı oluşturmak için botu kanalda/grupta admin yapmalısınız.
         
         message = f"""
 <b>💳 ÖDEME BİLGİLERİ</b>
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 <b>💵 TUTAR:</b> {amount:.2f}₺
 <b>₿ TRX MİKTARI:</b> {trx_amount:.4f} TRX
@@ -1010,7 +1157,7 @@ Kampanyayı oluşturmak için botu kanalda/grupta admin yapmalısınız.
 <b>🔗 TRX ADRESİ:</b>
 <code>{TRX_ADDRESS}</code>
 
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 <b>👇 ADIM ADIM YAPMANIZ GEREKENLER:</b>
 
 1️⃣ <b>Adresi kopyala</b> (üstüne tıkla)
@@ -1020,6 +1167,8 @@ Kampanyayı oluşturmak için botu kanalda/grupta admin yapmalısınız.
 
 ⏳ <b>İşlem süresi:</b> 2-5 dakika
 ✅ <b>TXID formatı:</b> 64 karakterlik hex kodu
+
+<code>/cancel</code> yazarak iptal edebilirsiniz.
 """
         
         deposit_id = hashlib.md5(f"{user_id}{time.time()}".encode()).hexdigest()[:10].upper()
@@ -1043,7 +1192,7 @@ Kampanyayı oluşturmak için botu kanalda/grupta admin yapmalısınız.
         
         message = f"""
 <b>💰 BAKİYE DETAYLARI</b>
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 <b>👤 KULLANICI:</b> {user.get('name', 'Kullanıcı')}
 <b>🆔 ID:</b> {user_id}
@@ -1074,10 +1223,10 @@ Kampanyayı oluşturmak için botu kanalda/grupta admin yapmalısınız.
     def show_bot_info(self, user_id):
         message = f"""
 <b>ℹ️ BOT HAKKINDA</b>
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 <b>🤖 BOT ADI:</b> Görev Yapsam Bot
-<b>🔄 VERSİYON:</b> v12.0
+<b>🔄 VERSİYON:</b> v13.0
 <b>👑 YÖNETİCİ:</b> {ADMIN_ID}
 <b>📢 ZORUNLU KANAL:</b> @{MANDATORY_CHANNEL}
 <b>₿ TRX ADRESİ:</b> <code>{TRX_ADDRESS}</code>
@@ -1099,6 +1248,7 @@ Kampanyayı oluşturmak için botu kanalda/grupta admin yapmalısınız.
 /balance - Bakiyem
 /botinfo - Bu menü
 /help - Yardım
+/cancel - İptal et
 
 <b>⚠️ KURALLAR:</b>
 • Sahte görev yasak
@@ -1121,7 +1271,7 @@ Sorularınız için admin ile iletişime geçin.
     def show_help(self, user_id):
         message = """
 <b>❓ YARDIM MENÜSÜ</b>
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 <b>🤖 BOT NASIL ÇALIŞIR?</b>
 1️⃣ Kanalımıza katılın
@@ -1154,6 +1304,11 @@ Sorularınız için admin ile iletişime geçin.
 • Her referans: 1₺
 • Referans linkin: /start ref_XXXXXXXX
 • Arkadaşların kanala katılmazsa bonus alamazsın
+
+<b>🔄 İPTAL SİSTEMİ</b>
+• Her adımda <code>/cancel</code> yazabilirsin
+• Her menüde ❌ İPTAL butonu var
+• Yanlışlıkla başlatılan işlemleri durdurabilirsin
 
 <b>⚠️ ÖNEMLİ UYARILAR</b>
 • Sahte görev yapma
@@ -1190,8 +1345,8 @@ Sorularınız için admin ile iletişime geçin.
         active_campaigns = self.db.cursor.fetchone()[0]
         
         message = f"""
-<b>👑 YÖNETİCİ PANELİ v12.0</b>
-━━━━━━━━━━━━━━━━━━━━
+<b>👑 YÖNETİCİ PANELİ v13.0</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 <b>📊 İSTATİSTİKLER</b>
 • 👥 Toplam Kullanıcı: <b>{total_users}</b>
@@ -1210,8 +1365,9 @@ Sorularınız için admin ile iletişime geçin.
                  {'text': '📢 KAMPANYALAR', 'callback_data': 'admin_campaigns'}],
                 [{'text': '👥 KULLANICILAR', 'callback_data': 'admin_users'},
                  {'text': '💰 DEPOZİTLER', 'callback_data': 'admin_deposits'}],
-                [{'text': '📣 BİLDİRİM', 'callback_data': 'admin_broadcast'}],
-                [{'text': '🔙 ANA MENÜ', 'callback_data': 'menu'}]
+                [{'text': '📣 BİLDİRİM', 'callback_data': 'admin_broadcast'},
+                 {'text': '⚙️ AYARLAR', 'callback_data': 'admin_settings'}],
+                [{'text': '❌ İPTAL', 'callback_data': 'cancel'}, {'text': '🔙 ANA MENÜ', 'callback_data': 'menu'}]
             ]
         }
         
@@ -1235,7 +1391,7 @@ Sorularınız için admin ile iletişime geçin.
             creator_id = campaign['creator_id']
             send_message(creator_id, f"""
 <b>🎉 KAMPANYANIZ ONAYLANDI!</b>
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 <b>📛 İSİM:</b> {campaign['name']}
 <b>🔢 ID:</b> <code>{campaign_id}</code>
@@ -1244,6 +1400,9 @@ Sorularınız için admin ile iletişime geçin.
 
 ✅ <b>Kampanyanız şimdi aktif!</b>
 📢 <b>Kullanıcılar katılmaya başlayabilir.</b>
+
+💰 <b>Kazanç:</b> Her katılım için {campaign['price_per_task']}₺
+⏳ <b>Süre:</b> Bütçe bitene kadar aktif
 """)
             
             # Admin'e bildir
@@ -1278,7 +1437,7 @@ Sorularınız için admin ile iletişime geçin.
             # Oluşturucuya bildir
             send_message(creator_id, f"""
 <b>❌ KAMPANYANIZ REDDEDİLDİ!</b>
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 <b>📛 İSİM:</b> {campaign['name']}
 <b>🔢 ID:</b> <code>{campaign_id}</code>
@@ -1305,7 +1464,7 @@ Sorularınız için admin ile iletişime geçin.
 def main():
     print("""
     ╔════════════════════════════════════════════════════════════════╗
-    ║                    GÖREV YAPSAM BOT v12.0                      ║
+    ║                    GÖREV YAPSAM BOT v13.0                      ║
     ║   TRX DEPOZİT + OTOMATİK GÖREV + REKLAM BAKİYESİ + BONUS SİSTEM║
     ╚════════════════════════════════════════════════════════════════╝
     """)
@@ -1317,10 +1476,12 @@ def main():
     
     print("✅ Bot başarıyla başlatıldı!")
     print(f"👑 Admin ID: {ADMIN_ID}")
+    print(f"🤖 Bot ID: {BOT_ID}")
     print(f"📢 Zorunlu Kanal: @{MANDATORY_CHANNEL}")
     print(f"₿ TRX Adresi: {TRX_ADDRESS}")
     print(f"💰 Min Depozit: {MIN_DEPOSIT_TRY}₺, Max: {MAX_DEPOSIT_TRY}₺")
     print(f"🎁 Bonuslar: %{DEPOSIT_BONUS_PERCENT} Normal, %{ADS_BONUS_PERCENT} Reklam")
+    print("🔄 İptal sistemi aktif: /cancel komutu her yerde çalışır")
     print("🔗 Telegram'da /start yazarak test edin")
     
     return app
