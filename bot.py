@@ -1,11 +1,11 @@
 """
-🚀 GÖREV YAPSAM BOT PRO v16.3 - FIXED SINGLE INSTANCE
+🚀 GÖREV YAPSAM BOT PRO v16.4 - SIMPLIFIED
 Telegram: @GorevYapsamBot
 Developer: Alperen
 Database: SQLite3 + Render Disk Backup
 Ödeme: Yakında (Papara & Kripto)
 Dil: Türkçe & Azerbaycan Türkçesi
-Render Optimized - Single Instance Fix
+Render Optimized - No Schedule Module
 """
 
 import os
@@ -19,7 +19,6 @@ from telebot import types
 import requests
 from dotenv import load_dotenv
 import cachetools
-import schedule
 import signal
 import sys
 import logging
@@ -76,8 +75,8 @@ def init_database():
             channel_joined INTEGER DEFAULT 0,
             welcome_bonus INTEGER DEFAULT 0,
             ref_parent INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT,
+            updated_at TEXT
         )
         ''')
         
@@ -88,7 +87,7 @@ def init_database():
             user_id INTEGER,
             threshold INTEGER,
             amount REAL,
-            awarded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            awarded_at TEXT,
             FOREIGN KEY (user_id) REFERENCES users(user_id)
         )
         ''')
@@ -99,7 +98,8 @@ def init_database():
         
     except Exception as e:
         logger.error(f"❌ Database initialization error: {e}")
-        sys.exit(1)
+        # Render'da çalışmaya devam et
+        pass
 
 # Veritabanını başlat
 init_database()
@@ -139,6 +139,10 @@ def create_or_update_user(user_id: int, user_data: dict) -> bool:
         conn = get_db_connection()
         cursor = conn.cursor()
         
+        # Timestamp ekle
+        now = datetime.now().isoformat()
+        user_data['updated_at'] = now
+        
         # Var mı kontrol et
         cursor.execute('SELECT user_id FROM users WHERE user_id = ?', (user_id,))
         exists = cursor.fetchone()
@@ -154,10 +158,11 @@ def create_or_update_user(user_id: int, user_data: dict) -> bool:
                     values.append(value)
             
             values.append(user_id)
-            query = f"UPDATE users SET {', '.join(update_fields)}, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?"
+            query = f"UPDATE users SET {', '.join(update_fields)} WHERE user_id = ?"
             cursor.execute(query, values)
         else:
             # Insert
+            user_data['created_at'] = now
             fields = ['user_id'] + list(user_data.keys())
             placeholders = ['?'] * len(fields)
             values = [user_id] + list(user_data.values())
@@ -179,19 +184,21 @@ def update_balance(user_id: int, amount: float, balance_type: str = 'balance') -
         conn = get_db_connection()
         cursor = conn.cursor()
         
+        now = datetime.now().isoformat()
+        
         if balance_type == 'ad_balance':
             cursor.execute(
-                'UPDATE users SET ad_balance = ad_balance + ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?',
-                (amount, user_id)
+                'UPDATE users SET ad_balance = ad_balance + ?, updated_at = ? WHERE user_id = ?',
+                (amount, now, user_id)
             )
         else:
             cursor.execute(
                 '''UPDATE users SET 
                 balance = balance + ?, 
                 total_earned = total_earned + ?,
-                updated_at = CURRENT_TIMESTAMP 
+                updated_at = ? 
                 WHERE user_id = ?''',
-                (amount, max(amount, 0), user_id)
+                (amount, max(amount, 0), now, user_id)
             )
         
         conn.commit()
@@ -214,21 +221,23 @@ def add_referral(user_id: int, parent_id: int) -> bool:
         conn = get_db_connection()
         cursor = conn.cursor()
         
+        now = datetime.now().isoformat()
+        
         # Referans sayısını artır
         cursor.execute(
             '''UPDATE users SET 
             referrals = referrals + 1,
             ref_earned = ref_earned + 1.0,
             balance = balance + 1.0,
-            updated_at = CURRENT_TIMESTAMP 
+            updated_at = ? 
             WHERE user_id = ?''',
-            (parent_id,)
+            (now, parent_id)
         )
         
         # Yeni kullanıcıya parent id ekle
         cursor.execute(
-            'UPDATE users SET ref_parent = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?',
-            (parent_id, user_id)
+            'UPDATE users SET ref_parent = ?, updated_at = ? WHERE user_id = ?',
+            (parent_id, now, user_id)
         )
         
         conn.commit()
@@ -263,6 +272,8 @@ def check_referral_bonuses(user_id: int):
         conn = get_db_connection()
         cursor = conn.cursor()
         
+        now = datetime.now().isoformat()
+        
         for threshold, amount in bonuses.items():
             if referrals >= threshold:
                 # Bonus henüz eklenmemişse ekle
@@ -274,12 +285,12 @@ def check_referral_bonuses(user_id: int):
                 
                 if not exists:
                     cursor.execute(
-                        'UPDATE users SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?',
-                        (amount, user_id)
+                        'UPDATE users SET balance = balance + ?, updated_at = ? WHERE user_id = ?',
+                        (amount, now, user_id)
                     )
                     cursor.execute(
-                        'INSERT INTO referral_bonuses (user_id, threshold, amount) VALUES (?, ?, ?)',
-                        (user_id, threshold, amount)
+                        'INSERT INTO referral_bonuses (user_id, threshold, amount, awarded_at) VALUES (?, ?, ?, ?)',
+                        (user_id, threshold, amount, now)
                     )
                     logger.info(f"User {user_id} received {amount} TL referral bonus for {threshold} referrals")
         
@@ -289,15 +300,44 @@ def check_referral_bonuses(user_id: int):
     except Exception as e:
         logger.error(f"Referans bonus kontrol hatası: {e}")
 
-# ================= 5. BOT KONFİGÜRASYONU =================
-# SINGLE INSTANCE için polling ayarları
-bot = telebot.TeleBot(TOKEN, parse_mode='HTML', threaded=False)  # threaded=False önemli!
+# ================= 5. BACKUP SİSTEMİ =================
+def backup_database():
+    """Database'i JSON'a yedekle"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT * FROM users')
+        users = [dict(row) for row in cursor.fetchall()]
+        
+        backup_data = {
+            'timestamp': datetime.now().isoformat(),
+            'users': users
+        }
+        
+        with open(BACKUP_PATH, 'w', encoding='utf-8') as f:
+            json.dump(backup_data, f, ensure_ascii=False, indent=2)
+        
+        conn.close()
+        logger.info("✅ Database backup completed")
+        
+    except Exception as e:
+        logger.error(f"Backup hatası: {e}")
 
-# ================= 6. CACHE SİSTEMİ =================
-user_cache = cachetools.TTLCache(maxsize=1000, ttl=60)
-user_states = {}
+def backup_thread_function():
+    """Yedekleme thread'i"""
+    while True:
+        try:
+            time.sleep(6 * 3600)  # 6 saatte bir
+            backup_database()
+        except Exception as e:
+            logger.error(f"Backup thread error: {e}")
+            time.sleep(60)
 
-# ================= 7. DİL SİSTEMİ (KISALTMALAR) =================
+# ================= 6. BOT KONFİGÜRASYONU =================
+bot = telebot.TeleBot(TOKEN, parse_mode='HTML', threaded=False)
+
+# ================= 7. DİL SİSTEMİ =================
 TRANSLATIONS = {
     'tr': {
         'main_menu': {
@@ -483,7 +523,7 @@ def show_main_menu(user_id: int, message_id: int = None, edit: bool = True):
     except Exception as e:
         logger.error(f"Menü gönderme hatası: {e}")
 
-# ================= 10. START KOMUTU (REFERANS DÜZELTMESİ) =================
+# ================= 10. START KOMUTU =================
 @bot.message_handler(commands=['start', 'menu', 'yardım', 'help'])
 def handle_start(message):
     user_id = message.from_user.id
@@ -497,7 +537,6 @@ def handle_start(message):
         if param.startswith('ref_'):
             try:
                 referrer_id = int(param.replace('ref_', ''))
-                # Referans yapan kişinin kendisi olmadığından emin ol
                 if referrer_id == user_id:
                     referrer_id = None
             except:
@@ -609,7 +648,6 @@ def handle_callback(call):
             show_main_menu(user_id, call.message.message_id)
         
         elif data == "deposit_menu":
-            # Basit deposit menüsü
             markup = types.InlineKeyboardMarkup()
             markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="back_menu"))
             
@@ -639,7 +677,6 @@ Lütfen kısa bir süre bekleyin.
             )
         
         elif data == "withdraw_menu":
-            # Basit withdraw menüsü
             user = get_user(user_id)
             markup = types.InlineKeyboardMarkup()
             markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="back_menu"))
@@ -677,7 +714,6 @@ Para çekme sistemi çok yakında aktif edilecektir.
             show_main_menu(user_id, call.message.message_id)
         
         elif data == "language_menu":
-            # Basit dil menüsü
             user = get_user(user_id)
             current_lang = user.get('language', 'tr') if user else 'tr'
             
@@ -716,7 +752,6 @@ Aşağıdaki dillerden birini seçin:
             )
         
         elif data == "my_balance":
-            # Basit bakiye menüsü
             user = get_user(user_id)
             total_balance = user.get('balance', 0) + user.get('ad_balance', 0)
             
@@ -758,7 +793,7 @@ Aşağıdaki dillerden birini seçin:
             )
         
         elif data == "my_refs":
-            # Referans menüsü - KANAL KONTROLLÜ
+            # REFERANS MENÜSÜ - KANAL KONTROLLÜ
             user = get_user(user_id)
             
             # KANAL KONTROLÜ
@@ -829,7 +864,6 @@ Katıldıktan sonra referans linkini alabilir ve arkadaşlarını davet edebilir
             )
         
         elif data == "ad_balance_menu":
-            # Basit ad balance menüsü
             user = get_user(user_id)
             
             markup = types.InlineKeyboardMarkup(row_width=2)
@@ -870,7 +904,6 @@ Katıldıktan sonra referans linkini alabilir ve arkadaşlarını davet edebilir
             bot.answer_callback_query(call.id, "✅ Kopyalandı!")
         
         elif data.startswith("convert_"):
-            # Dönüşüm işlemi
             amount = float(data.replace("convert_", ""))
             user = get_user(user_id)
             
@@ -915,7 +948,6 @@ Katıldıktan sonra referans linkini alabilir ve arkadaşlarını davet edebilir
             )
         
         elif data == "admin_panel" and user_id == ADMIN_ID:
-            # Basit admin panel
             conn = get_db_connection()
             cursor = conn.cursor()
             
@@ -977,29 +1009,41 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
     
     logger.info(f"""
-    🚀 GÖREV YAPSAM BOT PRO v16.3
+    🚀 GÖREV YAPSAM BOT PRO v16.4
     ═══════════════════════════════════════════
     📅 Başlatılıyor: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
     🔧 Database: SQLite3 (Persistent)
     🌍 Dil Desteği: Türkçe & Azerbaycan
     💰 Referans Sistemi: Kanal Katılım Zorunlu
-    ⚡ Instance: Single (409 Hatası Çözüldü)
+    ⚡ Schedule: Removed (No Dependencies)
     ═══════════════════════════════════════════
     """)
+    
+    # Backup thread'ini başlat
+    backup_thread = threading.Thread(target=backup_thread_function, daemon=True)
+    backup_thread.start()
+    
+    # İlk backup
+    try:
+        backup_database()
+    except:
+        pass
     
     try:
         logger.info("🤖 Bot polling başlatılıyor...")
         
-        # ÖNEMLİ: skip_pending=True ve non_stop=True ile
+        # ÖNEMLİ: skip_pending=True ile başlat
         bot.polling(
             non_stop=True,
             timeout=30,
-            skip_pending=True  # ÖNEMLİ: Bekleyen mesajları atla
+            skip_pending=True,
+            interval=0.5
         )
         
     except Exception as e:
         logger.error(f"❌ Bot hatası: {e}")
         time.sleep(5)
+        logger.info("🔄 Bot yeniden başlatılıyor...")
         main()  # Yeniden başlat
 
 if __name__ == "__main__":
