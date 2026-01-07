@@ -1,14 +1,6 @@
 """
-🚀 GÖREV YAPSAM BOT - TAM GÜNCELLEME
-Telegram: @GorevYapsamBot
-Developer: Alperen
-Kanal: @GY_Refim
-
-ÖZELLİKLER:
-1. Bot görevi için FORWARD zorunlu, kanal/grup için adminlik yeterli
-2. Her görev tipi için farklı fiyat ve kota hesaplama
-3. 409 hata fix - Manuel polling
-4. requests==2.32.3 düzeltildi
+🚀 GÖREV YAPSAM BOT - RENDER UYUMLU VERSİYON
+Render için PORT binding eklendi
 """
 
 import os
@@ -21,8 +13,34 @@ import signal
 import sys
 import threading
 import re
+from flask import Flask, jsonify  # Flask eklendi
 
-# ================= 1. AYARLAR =================
+# ================= 1. FLASK WEB SERVER (RENDER İÇİN) =================
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return jsonify({
+        "status": "online",
+        "bot": "Görev Yapsam Bot",
+        "version": "3.0",
+        "timestamp": datetime.now().isoformat()
+    })
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy"}), 200
+
+@app.route('/stats')
+def stats():
+    return jsonify({
+        "users": len(users),
+        "tasks": len(tasks),
+        "active_tasks": len(active_tasks),
+        "withdrawals": len(withdrawals)
+    })
+
+# ================= 2. AYARLAR =================
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -30,12 +48,16 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "7904032877"))
 MANDATORY_CHANNEL = os.getenv("MANDATORY_CHANNEL", "GY_Refim")
 BASE_URL = f"https://api.telegram.org/bot{TOKEN}/"
 
+# Render port ayarı
+PORT = int(os.environ.get('PORT', 8080))
+
 print("=" * 60)
-print("🤖 GÖREV YAPSAM BOT - GÜNCELLENMİŞ VERSİYON")
+print("🤖 GÖREV YAPSAM BOT - RENDER VERSİYON")
 print(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print(f"🔌 Port: {PORT}")
 print("=" * 60)
 
-# ================= 2. VERİTABANLARI =================
+# ================= 3. VERİTABANLARI =================
 USERS_DB = "users.json"
 TASKS_DB = "tasks.json"
 ACTIVE_TASKS_DB = "active_tasks.json"
@@ -54,21 +76,15 @@ def save_json(filename, data):
     try:
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
     except:
-        pass
+        return False
 
 # Veritabanlarını yükle
 users = load_json(USERS_DB)
 tasks = load_json(TASKS_DB)
 active_tasks = load_json(ACTIVE_TASKS_DB)
 withdrawals = load_json(WITHDRAWALS_DB)
-
-# ================= 3. GÖREV FİYATLARI =================
-TASK_PRICES = {
-    'bot': 2.5,      # 2.5₺ per task
-    'channel': 1.5,  # 1.5₺ per task
-    'group': 1.0     # 1.0₺ per task
-}
 
 # ================= 4. TELEGRAM API FONKSİYONLARI =================
 def send_message(chat_id, text, reply_markup=None, parse_mode='HTML'):
@@ -124,19 +140,6 @@ def edit_message(chat_id, message_id, text, reply_markup=None):
     except:
         return None
 
-def delete_message(chat_id, message_id):
-    """Mesaj sil"""
-    url = BASE_URL + "deleteMessage"
-    data = {
-        'chat_id': chat_id,
-        'message_id': message_id
-    }
-    
-    try:
-        requests.post(url, json=data, timeout=5)
-    except:
-        pass
-
 def get_chat_member(chat_id, user_id):
     """Kanal üyeliğini kontrol et"""
     url = BASE_URL + "getChatMember"
@@ -161,8 +164,9 @@ def manual_polling():
     print("🔄 Manuel polling başlatıldı...")
     
     offset = 0
+    polling_active = True
     
-    while True:
+    while polling_active:
         try:
             # GetUpdates isteği
             url = BASE_URL + "getUpdates"
@@ -175,15 +179,14 @@ def manual_polling():
             response = requests.get(url, params=params, timeout=35)
             
             if response.status_code == 409:
-                print("⚠️ 409 Conflict - Diğer bot instance'ı tespit edildi!")
-                print("⏳ 5 saniye bekleyip yeniden deneniyor...")
+                print("⚠️ 409 Conflict - 5 saniye bekleniyor...")
                 time.sleep(5)
                 offset = 0
                 continue
             
             if response.status_code != 200:
-                print(f"⚠️ HTTP {response.status_code} - 5 saniye bekleniyor...")
-                time.sleep(5)
+                print(f"⚠️ HTTP {response.status_code} - 3 saniye bekleniyor...")
+                time.sleep(3)
                 continue
             
             data = response.json()
@@ -216,9 +219,16 @@ def manual_polling():
             time.sleep(5)
             continue
             
+        except KeyboardInterrupt:
+            print("\n⏹️ Polling durduruluyor...")
+            polling_active = False
+            break
+            
         except Exception as e:
             print(f"❌ Hata: {e}")
             time.sleep(2)
+        
+        time.sleep(0.1)
 
 # ================= 6. MESAJ HANDLER =================
 def handle_update_message(message):
@@ -257,7 +267,7 @@ def handle_update_message(message):
         
         user = users[user_id]
         
-        # State kontrolü - GÖREV OLUŞTURMA AKIŞI
+        # State kontrolü
         if user.get('state'):
             handle_user_state(user_id, message)
             return
@@ -281,27 +291,21 @@ def handle_update_message(message):
             elif text.startswith('/createtask'):
                 check_bot_in_channel(user_id)
                 return
+                
+            elif text.startswith('/help'):
+                send_message(
+                    user_id,
+                    "🤖 <b>GÖREV YAPSAM BOT - YARDIM</b>\n\n"
+                    "📋 <b>Komutlar:</b>\n"
+                    "/start - Botu başlat\n"
+                    "/menu - Ana menü\n"
+                    "/tasks - Görev yap\n"
+                    "/createtask - Görev oluştur\n"
+                    "/help - Yardım\n\n"
+                    "📢 <b>Kanal:</b> @GY_Refim"
+                )
+                return
         
-        # Forward mesaj kontrolü (sadece bot görevi için)
-        if 'forward_from_chat' in message and user.get('state') == 'waiting_forward':
-            user['forward_msg'] = {
-                'chat_id': message['forward_from_chat']['id'],
-                'message_id': message['message_id'],
-                'chat_title': message['forward_from_chat'].get('title', '')
-            }
-            user['state'] = 'waiting_link'
-            save_json(USERS_DB, users)
-            
-            send_message(
-                user_id,
-                "✅ <b>Forward mesaj alındı!</b>\n\n"
-                "🔗 Şimdi görev linkini gönderin:\n"
-                "(Örnek: https://t.me/OrnekBot)\n\n"
-                "❌ İptal etmek için: /iptal"
-            )
-            return
-        
-        # Diğer mesajlar
         show_main_menu(user_id)
             
     except Exception as e:
@@ -314,46 +318,35 @@ def handle_user_state(user_id, message):
     task_type = user.get('task_type')
     
     if state == 'waiting_forward':
-        # SADECE BOT GÖREVİ İÇİN FORWARD ZORUNLU
-        if task_type == 'bot':
-            if 'forward_from_chat' not in message:
-                send_message(
-                    user_id,
-                    "❌ <b>BOT GÖREVİ İÇİN FORWARD ZORUNLU!</b>\n\n"
-                    "Lütfen botunuza eklemek istediğiniz mesajı <b>forward</b> edin.\n\n"
-                    "❌ İptal: /iptal"
-                )
-                return
-                
-            # Forward mesajı kaydet
-            user['forward_msg'] = {
-                'chat_id': message['forward_from_chat']['id'],
-                'message_id': message['message_id'],
-                'chat_title': message['forward_from_chat'].get('title', '')
-            }
-            user['state'] = 'waiting_link'
-            save_json(USERS_DB, users)
+        if 'text' in message and message['text'] == '/iptal':
+            cancel_task_creation(user_id)
+            return
             
+        if 'forward_from_chat' not in message:
             send_message(
                 user_id,
-                "✅ <b>Forward mesaj alındı!</b>\n\n"
-                "🔗 Şimdi <b>bot username</b>'ini gönderin:\n"
-                "(Örnek: @OrnekBot)\n\n"
+                "❌ <b>Lütfen bir mesaj FORWARD edin!</b>\n\n"
+                "Görev oluşturmak için öncelikle mesajı forward etmelisiniz.\n\n"
                 "❌ İptal: /iptal"
             )
-            
-        else:  # Kanal veya grup görevi
-            user['state'] = 'waiting_link'
-            save_json(USERS_DB, users)
-            
-            send_message(
-                user_id,
-                "✅ <b>KANAL/GRUP GÖREVİ</b>\n\n"
-                "🔗 Şimdi kanal/grup linkini gönderin:\n"
-                "(Örnek: https://t.me/OrnekKanal)\n\n"
-                "⚠️ <b>ÖNEMLİ:</b> Botun admin olduğundan emin olun!\n\n"
-                "❌ İptal: /iptal"
-            )
+            return
+        
+        # Forward mesajı kaydet
+        user['forward_msg'] = {
+            'chat_id': message['forward_from_chat']['id'],
+            'message_id': message['message_id'],
+            'chat_title': message['forward_from_chat'].get('title', '')
+        }
+        user['state'] = 'waiting_link'
+        save_json(USERS_DB, users)
+        
+        send_message(
+            user_id,
+            "✅ <b>Forward mesaj alındı!</b>\n\n"
+            "🔗 Şimdi görev linkini gönderin:\n"
+            "(Örnek: https://t.me/OrnekKanal)\n\n"
+            "❌ İptal: /iptal"
+        )
     
     elif state == 'waiting_link':
         if 'text' in message:
@@ -364,34 +357,17 @@ def handle_user_state(user_id, message):
                 return
             
             # Link kontrolü
-            if task_type == 'bot':
-                # Bot için username kontrolü
-                if not (text.startswith('@') or re.match(r'^[a-zA-Z0-9_]{5,}$', text)):
-                    send_message(
-                        user_id,
-                        "❌ Geçersiz bot username!\n\n"
-                        "Lütfen geçerli bir bot username'i girin:\n"
-                        "• @OrnekBot\n"
-                        "• OrnekBot\n\n"
-                        "❌ İptal: /iptal"
-                    )
-                    return
-                
-                if not text.startswith('@'):
-                    text = '@' + text
-                    
-            else:  # Kanal veya grup
-                if not (text.startswith(('https://t.me/', 't.me/', '@'))):
-                    send_message(
-                        user_id,
-                        "❌ Geçersiz link formatı!\n\n"
-                        "Lütfen geçerli bir Telegram linki girin:\n"
-                        "• https://t.me/OrnekKanal\n"
-                        "• t.me/OrnekGrup\n"
-                        "• @OrnekKanal\n\n"
-                        "❌ İptal: /iptal"
-                    )
-                    return
+            if not (text.startswith(('https://t.me/', 't.me/', '@'))):
+                send_message(
+                    user_id,
+                    "❌ Geçersiz link formatı!\n\n"
+                    "Lütfen geçerli bir Telegram linki girin:\n"
+                    "• https://t.me/OrnekKanal\n"
+                    "• t.me/OrnekBot\n"
+                    "• @OrnekKullanici\n\n"
+                    "❌ İptal: /iptal"
+                )
+                return
             
             user['task_link'] = text
             user['state'] = 'waiting_name'
@@ -401,8 +377,7 @@ def handle_user_state(user_id, message):
                 user_id,
                 "✅ <b>Link kaydedildi!</b>\n\n"
                 "📝 Şimdi görev için bir <b>isim</b> girin:\n"
-                "(Örnek: Telegram Botuna Katıl, Kanalımıza Katıl)\n\n"
-                "💡 <i>Kısa ve açıklayıcı bir isim seçin.</i>\n\n"
+                "(Örnek: Telegram Kanalına Katıl)\n\n"
                 "❌ İptal: /iptal"
             )
     
@@ -418,7 +393,7 @@ def handle_user_state(user_id, message):
                 send_message(
                     user_id,
                     "❌ İsim 3-50 karakter arasında olmalı!\n\n"
-                    "📝 Lütfen tekrar görev ismi girin:\n\n"
+                    "📝 Lütfen tekrar girin:\n\n"
                     "❌ İptal: /iptal"
                 )
                 return
@@ -431,8 +406,7 @@ def handle_user_state(user_id, message):
                 user_id,
                 "✅ <b>İsim kaydedildi!</b>\n\n"
                 "📄 Şimdi görev için bir <b>açıklama</b> girin:\n"
-                "(Örnek: Bu bota katılın ve /start yazın)\n\n"
-                "💡 <i>Detaylı açıklama daha fazla katılım sağlar.</i>\n\n"
+                "(Örnek: Bu kanala katılın ve 5 dakika kalın)\n\n"
                 "❌ İptal: /iptal"
             )
     
@@ -448,7 +422,7 @@ def handle_user_state(user_id, message):
                 send_message(
                     user_id,
                     "❌ Açıklama en az 10 karakter olmalı!\n\n"
-                    "📄 Lütfen tekrar görev açıklaması girin:\n\n"
+                    "📄 Lütfen tekrar girin:\n\n"
                     "❌ İptal: /iptal"
                 )
                 return
@@ -457,8 +431,10 @@ def handle_user_state(user_id, message):
             user['state'] = 'waiting_budget'
             save_json(USERS_DB, users)
             
-            # Görev tipine göre bilgi
-            price_per_task = TASK_PRICES.get(task_type, 1.5)
+            # Fiyat bilgisi
+            prices = {'bot': 2.5, 'channel': 1.5, 'group': 1.0}
+            task_type = user.get('task_type', 'channel')
+            price_per_task = prices.get(task_type, 1.5)
             
             msg = f"""✅ <b>Açıklama kaydedildi!</b>
 
@@ -468,10 +444,7 @@ def handle_user_state(user_id, message):
 💸 <b>Mevcut Bakiyeniz:</b> {user.get('balance', 0):.2f}₺
 
 📊 <b>HESAPLAMA:</b>
-• 1₺'lik görev için: {price_per_task}₺ ÷ {price_per_task}₺ = 1 görev
-• 100₺'lik görev için: 100₺ ÷ {price_per_task}₺ = {int(100/price_per_task)} görev
-
-💡 <i>Örnek: 100₺ bütçe ile {int(100/price_per_task)} görev oluşturabilirsiniz.</i>
+• 100₺ ÷ {price_per_task}₺ = {int(100/price_per_task)} görev
 
 ❌ İptal: /iptal"""
             
@@ -488,36 +461,30 @@ def handle_user_state(user_id, message):
             try:
                 budget = float(text)
                 task_type = user.get('task_type', 'channel')
-                price_per_task = TASK_PRICES.get(task_type, 1.5)
+                prices = {'bot': 2.5, 'channel': 1.5, 'group': 1.0}
+                price_per_task = prices.get(task_type, 1.5)
                 
-                # Minimum bütçe kontrolü
                 if budget < price_per_task:
                     send_message(
                         user_id,
                         f"❌ Minimum bütçe: {price_per_task}₺!\n\n"
-                        f"💰 Lütfen {price_per_task}₺ veya üzeri bir tutar girin:\n\n"
+                        f"💰 Lütfen {price_per_task}₺ veya üzeri girin:\n\n"
                         f"❌ İptal: /iptal"
                     )
                     return
                 
-                # Bakiye kontrolü
                 if user.get('balance', 0) < budget:
                     send_message(
                         user_id,
                         f"❌ Yetersiz bakiye!\n\n"
                         f"💸 Mevcut: {user.get('balance', 0):.2f}₺\n"
                         f"💰 Gerekli: {budget:.2f}₺\n\n"
-                        f"💡 Bakiye yüklemek için /menu\n\n"
                         f"❌ İptal: /iptal"
                     )
                     return
                 
                 user['task_budget'] = budget
-                
-                # Görev sayısını hesapla
                 task_count = int(budget / price_per_task)
-                
-                # Onay mesajı gönder
                 show_task_confirmation(user_id, task_count)
                 
             except ValueError:
@@ -527,63 +494,6 @@ def handle_user_state(user_id, message):
                     "💰 Lütfen sayı girin (Örnek: 50, 100.5):\n\n"
                     "❌ İptal: /iptal"
                 )
-
-def show_task_confirmation(user_id, task_count):
-    """Görev onay ekranı"""
-    user = users[user_id]
-    task_type = user.get('task_type', 'channel')
-    price_per_task = TASK_PRICES.get(task_type, 1.5)
-    
-    task_type_text = {
-        'bot': '🤖 BOT GÖREVİ',
-        'channel': '📢 KANAL GÖREVİ',
-        'group': '👥 GRUP GÖREVİ'
-    }.get(task_type, '📢 KANAL GÖREVİ')
-    
-    markup = {
-        'inline_keyboard': [
-            [
-                {'text': '✅ ONAYLA', 'callback_data': 'confirm_task'},
-                {'text': '❌ İPTAL ET', 'callback_data': 'cancel_create'}
-            ]
-        ]
-    }
-    
-    # Özel mesaj (görev tipine göre)
-    special_msg = ""
-    if task_type == 'bot':
-        special_msg = "⚠️ <b>BOT GÖREVİ:</b> Forward mesaj zorunlu!\n"
-    else:
-        special_msg = "⚠️ <b>KANAL/GRUP:</b> Bot admin olmalı!\n"
-    
-    msg = f"""🎯 <b>GÖREV ÖZETİ</b>
-
-══════════════════════════════
-
-📋 <b>Görev Tipi:</b> {task_type_text}
-🔗 <b>Link:</b> {user.get('task_link', 'Belirtilmedi')}
-📝 <b>İsim:</b> {user.get('task_name', 'Belirtilmedi')}
-📄 <b>Açıklama:</b> {user.get('task_desc', 'Belirtilmedi')}
-
-══════════════════════════════
-
-💰 <b>BÜTÇE DETAYI</b>
-• Toplam Bütçe: {user.get('task_budget', 0):.2f}₺
-• Görev Başı Maliyet: {price_per_task}₺
-• Oluşturulacak Görev: {task_count} adet
-
-══════════════════════════════
-
-💸 <b>BAKİYE DURUMU</b>
-• Mevcut Bakiye: {user.get('balance', 0):.2f}₺
-• Kalan Bakiye: {user.get('balance', 0) - user.get('task_budget', 0):.2f}₺
-
-══════════════════════════════
-
-{special_msg}
-⚠️ <b>Onaylıyor musunuz?</b>"""
-    
-    send_message(user_id, msg, markup)
 
 # ================= 7. START KOMUTU =================
 def handle_start_command(user_id, first_name, text):
@@ -685,8 +595,8 @@ def handle_callback_query(callback):
                 answer_callback(callback_id, "❌ Hala kanala katılmadın!", True)
             return
         
-        # Kanal kontrolü (bazı işlemler için)
-        if data not in ["joined", "refresh", "menu", "check_channel"]:
+        # Kanal kontrolü
+        if data not in ["joined", "refresh", "menu"]:
             if not get_chat_member(MANDATORY_CHANNEL, int(user_id)):
                 answer_callback(callback_id, f"❌ Önce kanala katıl! @{MANDATORY_CHANNEL}", True)
                 return
@@ -719,9 +629,6 @@ def handle_callback_query(callback):
         elif data == "cancel_create":
             cancel_task_creation(user_id)
         
-        elif data == "check_channel":
-            check_bot_in_channel(user_id)
-        
         else:
             show_main_menu(user_id)
             
@@ -750,17 +657,9 @@ def check_bot_in_channel(user_id):
 
 ══════════════════════════════
 
-🤖 <b>BOT GÖREVİ (2.5₺/görev)</b>
-• Forward mesaj <b>ZORUNLU</b>
-• Bot username ile çalışır
-
-📢 <b>KANAL GÖREVİ (1.5₺/görev)</b>
-• Bot kanalda <b>ADMIN</b> olmalı
-• Forward gerekmez
-
-👥 <b>GRUP GÖREVİ (1₺/görev)</b>
-• Bot grupta <b>ADMIN</b> olmalı
-• Forward gerekmez
+🤖 <b>BOT GÖREVİ</b> - 2.5₺/görev
+📢 <b>KANAL GÖREVİ</b> - 1.5₺/görev
+👥 <b>GRUP GÖREVİ</b> - 1₺/görev
 
 ══════════════════════════════
 
@@ -779,51 +678,83 @@ def start_create_task_flow(user_id, task_type):
         user['state'] = 'waiting_forward'
         save_json(USERS_DB, users)
         
-        msg = """📝 <b>BOT GÖREVİ OLUŞTURMA - ADIM 1/5</b>
-
-══════════════════════════════
-
-🤖 <b>Görev Tipi:</b> BOT GÖREVİ (2.5₺/görev)
+        msg = """📝 <b>BOT GÖREVİ OLUŞTURMA</b>
 
 ══════════════════════════════
 
 📤 <b>ADIM 1: FORWARD MESAJ</b>
 
-Lütfen botunuza eklemek istediğiniz mesajı <b>forward</b> edin.
-
-⚠️ <b>ÖNEMLİ:</b>
-• Sadece bot görevi için forward ZORUNLU
-• Mesajı buraya forward etmelisiniz
+Lütfen mesajı <b>forward</b> edin.
 
 ❌ İptal: /iptal"""
         
-    else:  # Kanal veya grup
+    else:
         user['state'] = 'waiting_link'
         save_json(USERS_DB, users)
         
         task_type_text = "KANAL GÖREVİ" if task_type == 'channel' else "GRUP GÖREVİ"
-        price = "1.5₺" if task_type == 'channel' else "1₺"
         
         msg = f"""📝 <b>{task_type_text} OLUŞTURMA</b>
 
 ══════════════════════════════
 
-📢 <b>Görev Tipi:</b> {task_type_text} ({price}/görev)
-
-══════════════════════════════
-
-⚠️ <b>ÖNEMLİ KONTROLLER:</b>
-1. Botu kanalınıza/grubunuza ekleyin
-2. Bot'a ADMIN yetkileri verin
-3. Linki göndermeye hazır olun
-
 🔗 <b>ADIM 1: LİNK GÖNDERME</b>
 
-Lütfen kanal/grup linkini gönderin:
+Lütfen linki gönderin:
 
 ❌ İptal: /iptal"""
     
     send_message(user_id, msg)
+
+def show_task_confirmation(user_id, task_count):
+    """Görev onay ekranı"""
+    user = users[user_id]
+    task_type = user.get('task_type', 'channel')
+    prices = {'bot': 2.5, 'channel': 1.5, 'group': 1.0}
+    price_per_task = prices.get(task_type, 1.5)
+    
+    task_type_text = {
+        'bot': '🤖 BOT GÖREVİ',
+        'channel': '📢 KANAL GÖREVİ',
+        'group': '👥 GRUP GÖREVİ'
+    }.get(task_type, '📢 KANAL GÖREVİ')
+    
+    markup = {
+        'inline_keyboard': [
+            [
+                {'text': '✅ ONAYLA', 'callback_data': 'confirm_task'},
+                {'text': '❌ İPTAL ET', 'callback_data': 'cancel_create'}
+            ]
+        ]
+    }
+    
+    msg = f"""🎯 <b>GÖREV ÖZETİ</b>
+
+══════════════════════════════
+
+📋 <b>Tip:</b> {task_type_text}
+🔗 <b>Link:</b> {user.get('task_link', 'Belirtilmedi')}
+📝 <b>İsim:</b> {user.get('task_name', 'Belirtilmedi')}
+📄 <b>Açıklama:</b> {user.get('task_desc', 'Belirtilmedi')}
+
+══════════════════════════════
+
+💰 <b>BÜTÇE DETAYI</b>
+• Toplam: {user.get('task_budget', 0):.2f}₺
+• Görev Başı: {price_per_task}₺
+• Görev Sayısı: {task_count} adet
+
+══════════════════════════════
+
+💸 <b>BAKİYE DURUMU</b>
+• Mevcut: {user.get('balance', 0):.2f}₺
+• Kalan: {user.get('balance', 0) - user.get('task_budget', 0):.2f}₺
+
+══════════════════════════════
+
+⚠️ <b>Onaylıyor musunuz?</b>"""
+    
+    send_message(user_id, msg, markup)
 
 def confirm_and_create_task(user_id, message_id):
     """Görevi onayla ve oluştur"""
@@ -838,13 +769,13 @@ def confirm_and_create_task(user_id, message_id):
                 message_id,
                 f"❌ <b>Yetersiz bakiye!</b>\n\n"
                 f"💸 Mevcut: {user.get('balance', 0):.2f}₺\n"
-                f"💰 Gerekli: {budget:.2f}₺\n\n"
-                f"💡 Lütfen bakiye yükleyin."
+                f"💰 Gerekli: {budget:.2f}₺"
             )
         return
     
     task_type = user.get('task_type', 'channel')
-    price_per_task = TASK_PRICES.get(task_type, 1.5)
+    prices = {'bot': 2.5, 'channel': 1.5, 'group': 1.0}
+    price_per_task = prices.get(task_type, 1.5)
     
     # Görev sayısını hesapla
     task_count = int(budget / price_per_task)
@@ -868,8 +799,7 @@ def confirm_and_create_task(user_id, message_id):
         'completed_by': [],
         'max_completions': task_count,
         'current_completions': 0,
-        'status': 'active',
-        'forward_msg': user.get('forward_msg') if task_type == 'bot' else None
+        'status': 'active'
     }
     
     tasks[task_id] = task_data
@@ -899,13 +829,13 @@ def confirm_and_create_task(user_id, message_id):
         ]
     }
     
-    # Kota hesaplama mesajı
+    # Kota mesajı
     if price_per_task == 1.0:
-        kota_msg = f"100₺ bütçe ile {task_count} görev oluşturuldu."
+        kota_msg = f"100₺ = {task_count} görev"
     elif price_per_task == 1.5:
-        kota_msg = f"100₺ bütçe ile {int(100/1.5)} görev oluşturulabilir."
-    else:  # 2.5
-        kota_msg = f"100₺ bütçe ile {int(100/2.5)} görev oluşturulabilir."
+        kota_msg = f"100₺ = {int(100/1.5)} görev"
+    else:
+        kota_msg = f"100₺ = {int(100/2.5)} görev"
     
     msg = f"""🎉 <b>GÖREV OLUŞTURULDU!</b>
 
@@ -914,22 +844,20 @@ def confirm_and_create_task(user_id, message_id):
 📌 <b>Görev ID:</b> <code>{task_id}</code>
 📋 <b>Tip:</b> {task_type.upper()}
 🔗 <b>Link:</b> {task_data['link']}
-📝 <b>İsim:</b> {task_data['name']}
 
 ══════════════════════════════
 
-💰 <b>BÜTÇE DETAYI</b>
-• Toplam Bütçe: {budget:.2f}₺
+💰 <b>BÜTÇE</b>
+• Toplam: {budget:.2f}₺
 • Görev Başı: {price_per_task}₺
-• Oluşturulan Görev: {task_count} adet
+• Görev Sayısı: {task_count} adet
 • Kalan Bakiye: {user.get('balance', 0):.2f}₺
 
 ══════════════════════════════
 
-📊 <b>KOTA BİLGİSİ</b>
-{kota_msg}
+📊 <b>KOTA:</b> {kota_msg}
 
-✅ <b>Göreviniz aktif listeye eklendi!</b>"""
+✅ <b>Göreviniz aktif!</b>"""
     
     if message_id:
         edit_message(user_id, message_id, msg, markup)
@@ -964,8 +892,6 @@ def show_withdraw_menu(user_id):
     """Para çekme menüsü"""
     user = users.get(user_id, {})
     balance = user.get('balance', 0)
-    
-    # Minimum çekim miktarı
     min_withdraw = 20.0
     
     markup = {
@@ -996,14 +922,13 @@ def show_withdraw_menu(user_id):
 ══════════════════════════════
 
 🎯 <b>YAKINDA AKTİF:</b>
-• ₿ Kripto Para (USDT)
+• ₿ Kripto Para
 • 📱 Papara
-• 🏦 Banka Havalesi
+• 🏦 Banka
 
 ══════════════════════════════
 
-⚠️ <b>Not:</b> Ödeme işlemleri manuel olarak yapılmaktadır.
-<i>"ÖDEME TALEP ET" butonuna bastıktan sonra admin onayı bekleyin.</i>"""
+⚠️ <i>"ÖDEME TALEP ET" butonuna basın.</i>"""
     
     send_message(user_id, msg, markup)
 
@@ -1014,11 +939,7 @@ def request_withdrawal(user_id, message_id):
     min_withdraw = 20.0
     
     if balance < min_withdraw:
-        answer_callback(
-            'temp_id',
-            f"❌ Minimum çekim: {min_withdraw}₺!",
-            True
-        )
+        send_message(user_id, f"❌ Minimum çekim: {min_withdraw}₺!")
         return
     
     # Talep ID oluştur
@@ -1031,9 +952,7 @@ def request_withdrawal(user_id, message_id):
         'user_name': user.get('name', 'Kullanıcı'),
         'amount': balance,
         'status': 'pending',
-        'created_at': datetime.now().isoformat(),
-        'payment_method': 'pending',
-        'admin_note': ''
+        'created_at': datetime.now().isoformat()
     }
     
     withdrawals[request_id] = withdrawal_data
@@ -1042,32 +961,13 @@ def request_withdrawal(user_id, message_id):
     # Admin'e bildir
     admin_msg = f"""🔔 <b>YENİ ÖDEME TALEBI</b>
 
-══════════════════════════════
-
 👤 <b>Kullanıcı:</b> {user.get('name', 'Kullanıcı')}
 🆔 <b>ID:</b> {user_id}
 💰 <b>Tutar:</b> {balance:.2f}₺
 📅 <b>Tarih:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}
-🔢 <b>Talep No:</b> {request_id}
-
-══════════════════════════════
-
-💳 <i>Ödeme yöntemi seçin:</i>"""
+🔢 <b>Talep No:</b> {request_id}"""
     
-    admin_markup = {
-        'inline_keyboard': [
-            [
-                {'text': '₿ USDT (TRC20)', 'callback_data': f'admin_withdraw_{request_id}_usdt'},
-                {'text': '📱 Papara', 'callback_data': f'admin_withdraw_{request_id}_papara'}
-            ],
-            [
-                {'text': '🏦 Banka', 'callback_data': f'admin_withdraw_{request_id}_bank'},
-                {'text': '❌ Reddet', 'callback_data': f'admin_withdraw_{request_id}_reject'}
-            ]
-        ]
-    }
-    
-    send_message(ADMIN_ID, admin_msg, admin_markup)
+    send_message(ADMIN_ID, admin_msg)
     
     # Kullanıcıya bilgi ver
     markup = {
@@ -1078,19 +978,13 @@ def request_withdrawal(user_id, message_id):
     
     msg = f"""✅ <b>ÖDEME TALEBI OLUŞTURULDU!</b>
 
-══════════════════════════════
-
 📋 <b>Talep No:</b> <code>{request_id}</code>
 💰 <b>Tutar:</b> {balance:.2f}₺
 👤 <b>Adınız:</b> {user.get('name', 'Kullanıcı')}
 📅 <b>Tarih:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}
 
-══════════════════════════════
-
 ⏳ <b>DURUM:</b> Admin onayı bekleniyor...
-🕐 <b>Süre:</b> 24-48 saat
-
-⚠️ <i>Lütfen bildirimleri açık tutun!</i>"""
+🕐 <b>Süre:</b> 24-48 saat"""
     
     if message_id:
         edit_message(user_id, message_id, msg, markup)
@@ -1139,11 +1033,7 @@ def show_main_menu(user_id):
 
 ══════════════════════════════
 
-📢 <b>Kanal:</b> @{MANDATORY_CHANNEL}
-
-══════════════════════════════
-
-⚡ <i>Aşağıdaki butonlardan seçim yap!</i>"""
+📢 <b>Kanal:</b> @{MANDATORY_CHANNEL}"""
     
     send_message(user_id, msg, markup)
 
@@ -1162,25 +1052,17 @@ def show_balance_menu(user_id):
     
     msg = f"""💰 <b>BAKİYE DETAY</b>
 
-══════════════════════════════
-
 👤 {user.get('name', 'Kullanıcı')}
 🆔 {user_id}
-
-══════════════════════════════
 
 💵 <b>BAKİYE</b>
 • Mevcut: {user.get('balance', 0):.2f}₺
 • Minimum Çekim: 20₺
 
-══════════════════════════════
-
 📊 <b>İSTATİSTİK</b>
 • Tamamlanan Görev: {user.get('tasks_completed', 0)}
 • Oluşturulan Görev: {user.get('tasks_created', 0)}
-• Referans Sayısı: {user.get('referrals', 0)}
-• Referans Kazancı: {user.get('ref_earned', 0):.2f}₺
-• Toplam Kazanç: {user.get('total_earned', 0):.2f}₺"""
+• Referans Sayısı: {user.get('referrals', 0)}"""
     
     send_message(user_id, msg, markup)
 
@@ -1203,23 +1085,11 @@ def show_task_selection(user_id):
     
     msg = """📋 <b>GÖREV TİPİ SEÇİMİ</b>
 
-══════════════════════════════
+🤖 <b>BOT GÖREVİ</b> - 2.5₺
+📢 <b>KANAL GÖREVİ</b> - 1.5₺
+👥 <b>GRUP GÖREVİ</b> - 1₺
 
-🤖 <b>BOT GÖREVİ</b>
-• Ödül: 2.5₺
-• Botlara katılma/start atma
-
-📢 <b>KANAL GÖREVİ</b>
-• Ödül: 1.5₺
-• Kanallara katılma
-
-👥 <b>GRUP GÖREVİ</b>
-• Ödül: 1₺
-• Gruplara katılma
-
-══════════════════════════════
-
-👇 <b>Görev tipini seçin:</b>"""
+👇 <b>Seçin:</b>"""
     
     send_message(user_id, msg, markup)
 
@@ -1252,24 +1122,16 @@ def cleanup_old_tasks():
         time.sleep(3600)
 
 # ================= 13. ANA PROGRAM =================
-def main():
+def start_bot():
+    """Botu başlat"""
     print("""
     ╔══════════════════════════════════════════╗
-    ║    🚀 GÖREV YAPSAM BOT - SON VERSİYON    ║
-    ║    • Bot görevi: FORWARD zorunlu         ║
-    ║    • Kanal/grup: Adminlik yeterli        ║
-    ║    • Farklı fiyatlar ve kota hesaplama   ║
-    ║    • 409 Hata Fix - Manuel Polling       ║
+    ║    🚀 GÖREV YAPSAM BOT - RENDER          ║
+    ║    • Flask Web Server                    ║
+    ║    • Port: {}                    ║
+    ║    • 409 Hata Fix                        ║
     ╚══════════════════════════════════════════╝
-    """)
-    
-    # Sinyal handler
-    def signal_handler(sig, frame):
-        print("\n👋 Bot kapatılıyor...")
-        sys.exit(0)
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    """.format(PORT))
     
     # Temizleme thread'ini başlat
     cleanup_thread = threading.Thread(target=cleanup_old_tasks, daemon=True)
@@ -1284,11 +1146,12 @@ def main():
         if data.get('ok'):
             bot_name = data['result']['first_name']
             bot_username = data['result']['username']
-            print(f"✅ Bot bağlantısı: @{bot_username} ({bot_name})")
-            print(f"✅ 409 Hata Fix: Manuel polling aktif")
-            print(f"✅ Görev Fiyatları: Bot:2.5₺, Kanal:1.5₺, Grup:1₺")
+            print(f"✅ Bot: @{bot_username} ({bot_name})")
+            print(f"✅ Port: {PORT}")
+            print(f"✅ Admin ID: {ADMIN_ID}")
+            print(f"✅ Kanal: @{MANDATORY_CHANNEL}")
         else:
-            print(f"❌ Bot token hatalı: {data}")
+            print(f"❌ Bot token hatalı")
             return
     
     except Exception as e:
@@ -1297,13 +1160,13 @@ def main():
     
     print("🔄 Manuel polling başlatılıyor...")
     
-    # Ana polling döngüsü
-    try:
-        manual_polling()
-    except KeyboardInterrupt:
-        print("\n👋 Bot kapatılıyor...")
-    except Exception as e:
-        print(f"🚨 Kritik hata: {e}")
+    # Polling'i thread'de başlat
+    polling_thread = threading.Thread(target=manual_polling, daemon=True)
+    polling_thread.start()
+    
+    # Flask'ı başlat
+    print(f"🌐 Flask web server başlatılıyor (Port: {PORT})...")
+    app.run(host='0.0.0.0', port=PORT, debug=False)
 
 if __name__ == "__main__":
-    main()
+    start_bot()
