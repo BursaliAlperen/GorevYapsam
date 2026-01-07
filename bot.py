@@ -36,7 +36,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return jsonify({"status": "online", "bot": "Görev Yapsam Bot v16.0"})
+    return jsonify({"status": "online", "bot": "Görev Yapsam Bot v17.0"})
 
 def get_turkey_time():
     """Türkiye saatini döndür"""
@@ -123,19 +123,6 @@ class Database:
             )
         ''')
         
-        # Bot istatistikleri
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS bot_stats (
-                stat_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                total_users INTEGER DEFAULT 0,
-                total_deposits INTEGER DEFAULT 0,
-                total_campaigns INTEGER DEFAULT 0,
-                total_tasks_completed INTEGER DEFAULT 0,
-                total_balance REAL DEFAULT 0.0,
-                last_updated TEXT
-            )
-        ''')
-        
         self.conn.commit()
         print("✅ Veritabanı hazır")
     
@@ -152,10 +139,7 @@ class Database:
             ''', (user_id, '', 0.0, 0.0, now, 'tr', now, referral_code))
             self.conn.commit()
             
-            # Bot istatistiklerini güncelle
-            self.update_bot_stats('new_user')
-            
-            # Admin'e yeni kullanıcı bildirimi
+            # Admin'e bildirim
             self.send_new_user_notification(user_id)
             
             self.cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
@@ -164,34 +148,32 @@ class Database:
         return dict(user) if user else {}
     
     def send_new_user_notification(self, new_user_id):
-        """Admin'e yeni kullanıcı bildirimi gönder"""
+        """Admin'e yeni kullanıcı bildirimi"""
         try:
             new_user = self.get_user(new_user_id)
-            # Toplam kullanıcı sayısını al
             self.cursor.execute("SELECT COUNT(*) as total FROM users")
             total_result = self.cursor.fetchone()
             total_users = total_result['total'] if total_result else 0
             
-            # Referans ile mi normal giriş ile mi kaydolduğunu kontrol et
             referred_by = new_user.get('referred_by', '')
             if referred_by:
-                referral_type = f"Referans ile (Referans ID: {referred_by})"
+                referral_type = f"Referans ile (ID: {referred_by})"
             else:
                 referral_type = "Normal giriş"
             
             send_message(ADMIN_ID, f"""
-👤 <b>YENİ KULLANICI KAYDOLDU!</b>
+👤 <b>YENİ KULLANICI</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-📝 <b>Kullanıcı Adı:</b> {new_user.get('name', 'Yok')}
-🆔 <b>User ID:</b> <code>{new_user_id}</code>
+📝 <b>Kullanıcı:</b> {new_user.get('name', 'Yok')}
+🆔 <b>ID:</b> <code>{new_user_id}</code>
 📊 <b>Kayıt Türü:</b> {referral_type}
 
-📈 <b>Toplam Kullanıcı Sayısı:</b> {total_users}
-⏰ <b>Kayıt Zamanı:</b> {new_user.get('created_at', 'Bilinmiyor')[:19]}
+📈 <b>Toplam Kullanıcı:</b> {total_users}
+⏰ <b>Zaman:</b> {new_user.get('created_at', 'Bilinmiyor')[:19]}
 """)
-        except Exception as e:
-            print(f"❌ Admin bildirimi hatası: {e}")
+        except:
+            pass
     
     def update_user(self, user_id, data):
         if not data: return False
@@ -217,50 +199,24 @@ class Database:
         ''', (new_balance, total, bonus, user_id))
         self.conn.commit()
         
-        # Bakiye eklendi bildirimi
+        # Bildirim
         if amount > 0:
             source_text = "sistem" if source == "system" else "referans"
             message = f"""
-💰 <b>BAKİYE EKLENDİ!</b>
+<b>💰 BAKİYE EKLENDİ</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-🎉 <b>+{total:.2f}₺ bakiyenize eklendi!</b>
+🎉 <b>+{total:.2f}₺ eklendi!</b>
 • Kaynak: {source_text}
 • Tutar: {amount:.2f}₺
-• Bonus: {bonus:.2f}₺ (%{bonus_percent})
+• Bonus: {bonus:.2f}₺
 • Yeni Bakiye: {new_balance:.2f}₺
 
-💡 <b>Hemen görev yapmaya başlayabilirsiniz!</b>
+💡 <b>Hemen görev yap!</b>
 """
             send_message(user_id, message)
         
         return True
-    
-    def update_bot_stats(self, stat_type):
-        """Bot istatistiklerini güncelle"""
-        now = get_turkey_time().isoformat()
-        
-        self.cursor.execute("SELECT COUNT(*) FROM users")
-        total_users = self.cursor.fetchone()[0]
-        
-        self.cursor.execute("SELECT COUNT(*) FROM deposits WHERE status = 'completed'")
-        total_deposits = self.cursor.fetchone()[0]
-        
-        self.cursor.execute("SELECT COUNT(*) FROM campaigns")
-        total_campaigns = self.cursor.fetchone()[0]
-        
-        self.cursor.execute("SELECT SUM(tasks_completed) FROM users")
-        total_tasks = self.cursor.fetchone()[0] or 0
-        
-        self.cursor.execute("SELECT SUM(balance) FROM users")
-        total_balance = self.cursor.fetchone()[0] or 0.0
-        
-        self.cursor.execute('''
-            INSERT OR REPLACE INTO bot_stats (stat_id, total_users, total_deposits, total_campaigns, 
-            total_tasks_completed, total_balance, last_updated)
-            VALUES (1, ?, ?, ?, ?, ?, ?)
-        ''', (total_users, total_deposits, total_campaigns, total_tasks, total_balance, now))
-        self.conn.commit()
 
 # Telegram Fonksiyonları
 def send_message(chat_id, text, markup=None, parse_mode='HTML'):
@@ -271,7 +227,7 @@ def send_message(chat_id, text, markup=None, parse_mode='HTML'):
         response = requests.post(url, json=data, timeout=10).json()
         return response
     except Exception as e:
-        print(f"❌ Mesaj gönderme hatası: {e}")
+        print(f"❌ Mesaj hatası: {e}")
         return None
 
 def answer_callback(callback_id, text=None, show_alert=False):
@@ -280,10 +236,9 @@ def answer_callback(callback_id, text=None, show_alert=False):
     if text: data['text'] = text
     if show_alert: data['show_alert'] = True
     try: 
-        response = requests.post(url, json=data, timeout=5)
-        return response
+        requests.post(url, json=data, timeout=5)
     except: 
-        return None
+        pass
 
 def get_chat_member(chat_id, user_id):
     url = BASE_URL + "getChatMember"
@@ -295,16 +250,6 @@ def get_chat_member(chat_id, user_id):
             return status in ['member', 'administrator', 'creator']
     except: pass
     return False
-
-def get_chat_info(chat_id):
-    url = BASE_URL + "getChat"
-    data = {'chat_id': chat_id}
-    try:
-        response = requests.post(url, json=data, timeout=10).json()
-        if response.get('ok'):
-            return response['result']
-    except: pass
-    return None
 
 def check_bot_admin(chat_id):
     bot_id = int(TOKEN.split(':')[0])
@@ -318,80 +263,10 @@ def check_bot_admin(chat_id):
     except: pass
     return False
 
-# Dil sistemi
-translations = {
-    'tr': {
-        'welcome': '👋 Hoş Geldin',
-        'balance': '💰 Bakiye',
-        'tasks': '🎯 Görevler',
-        'referrals': '👥 Referans',
-        'deposit': '💳 Yükle',
-        'withdraw': '🏧 Çek',
-        'profile': '👤 Profil',
-        'help': '❓ Yardım',
-        'admin': '👑 Admin',
-        'back': '🔙 Geri',
-        'cancel': '❌ İptal',
-        'menu': '📋 Menü',
-        'create_campaign': '📢 Kampanya',
-        'my_campaigns': '📋 Kampanyalarım',
-        'bot_info': '🤖 Bot',
-        'notifications': '🔔 Bildirim',
-        'referral_link': '🔗 Referans Linki',
-        'copy_link': '📋 Linki Kopyala',
-        'share_link': '📤 Paylaş',
-        'referral_earnings': '💰 Kazanç',
-        'new_user': '🆕 Yeni Kullanıcı',
-        'total_users': '👥 Toplam',
-        'active_campaigns': '📢 Aktif',
-        'pending_approval': '⏳ Bekleyen',
-        'user_stats': '📊 İstatistik',
-        'campaign_stats': '📈 Kampanyalar',
-        'user_management': '👥 Kullanıcılar',
-        'deposit_management': '💳 Depozitler',
-        'broadcast': '📢 Duyuru',
-        'settings': '⚙️ Ayarlar'
-    }
-}
-
-def get_translation(key):
-    """Çeviri döndür"""
-    return translations['tr'].get(key, key)
-
-# Bildirim Sistemi
-class NotificationSystem:
-    def __init__(self, bot_system):
-        self.bot_system = bot_system
-        self.db = bot_system.db
-    
-    def send_referral_notification(self, referrer_id, referral_id):
-        """Referans bildirimi gönder"""
-        try:
-            referrer = self.db.get_user(referrer_id)
-            referral = self.db.get_user(referral_id)
-            
-            # Referans sahibine bildirim
-            message = f"""
-🎉 <b>REFERANS KAZANCI!</b>
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-👤 <b>Yeni referansınız:</b> {referral.get('name', 'Kullanıcı')}
-💰 <b>Kazandınız:</b> 1.00₺
-📊 <b>Toplam referans:</b> {referrer.get('referrals', 0)}
-💵 <b>Yeni bakiye:</b> {referrer.get('balance', 0):.2f}₺
-
-🔗 <b>Referans linkinizle daha çok kişi davet edin!</b>
-"""
-            send_message(referrer_id, message)
-            
-        except Exception as e:
-            print(f"❌ Referans bildirimi hatası: {e}")
-
 # Bot Sistemi
 class BotSystem:
     def __init__(self):
         self.db = Database()
-        self.notification_system = NotificationSystem(self)
         self.user_states = {}
         self.trx_price = 12.61
         self.update_trx_price()
@@ -403,7 +278,6 @@ class BotSystem:
             if response.status_code == 200:
                 data = response.json()
                 self.trx_price = data.get('tron', {}).get('try', 12.61)
-                print(f"₿ TRX Fiyatı: {self.trx_price:.2f}₺")
         except: 
             pass
     
@@ -455,7 +329,7 @@ class BotSystem:
                     'username': message['from'].get('username', '')
                 })
             
-            # Kullanıcı state'i varsa önce onu işle
+            # State kontrolü
             if user_state['state']:
                 self.handle_user_state(user_id, message, user_state)
                 return
@@ -468,13 +342,9 @@ class BotSystem:
                     self.show_main_menu(user_id)
                 elif text == '/admin' and user_id == ADMIN_ID: 
                     self.show_admin_panel(user_id)
-                elif text == '/referral':
-                    self.show_referral_menu(user_id)
-                elif text == '/deposit':
-                    self.show_deposit_menu(user_id)
         
         except Exception as e:
-            print(f"❌ Mesaj işleme hatası: {e}")
+            print(f"❌ Mesaj hatası: {e}")
     
     def process_callback(self, callback):
         try:
@@ -482,19 +352,15 @@ class BotSystem:
             data = callback['data']
             callback_id = callback['id']
             
-            # Önce callback'i cevapla
             answer_callback(callback_id)
             
-            # Temel navigasyon
+            # Ana butonlar
             if data == 'menu':
                 self.show_main_menu(user_id)
             elif data == 'back':
                 self.show_main_menu(user_id)
-            elif data == 'cancel':
-                self.clear_user_state(user_id)
-                self.show_main_menu(user_id)
             
-            # Ana menü butonları
+            # Menü butonları
             elif data == 'tasks':
                 self.show_active_tasks(user_id)
             elif data == 'create_campaign':
@@ -503,16 +369,14 @@ class BotSystem:
                 self.show_my_campaigns(user_id)
             elif data == 'deposit':
                 self.show_deposit_menu(user_id)
+            elif data == 'withdraw':
+                self.show_withdraw_menu(user_id)
             elif data == 'profile':
                 self.show_profile(user_id)
             elif data == 'referral':
                 self.show_referral_menu(user_id)
-            elif data == 'bot_info':
-                self.show_bot_info(user_id)
             elif data == 'help':
                 self.show_help(user_id)
-            elif data == 'notifications':
-                self.toggle_notifications(user_id)
             
             # Admin butonları
             elif data == 'admin_panel':
@@ -525,25 +389,18 @@ class BotSystem:
                 self.show_admin_users(user_id)
             elif data == 'admin_deposits':
                 self.show_admin_deposits(user_id)
-            elif data == 'admin_broadcast':
-                self.show_admin_broadcast(user_id)
-            elif data == 'admin_settings':
-                self.show_admin_settings(user_id)
             
-            # Kampanya oluşturma
+            # Kampanya tipi
             elif data.startswith('camp_type_'):
                 task_type = data.replace('camp_type_', '')
                 self.start_campaign_creation(user_id, task_type)
             
-            # Depozit işlemleri
-            elif data.startswith('deposit_'):
-                if data == 'deposit_menu':
-                    self.show_deposit_menu(user_id)
-                elif data.startswith('deposit_amount_'):
-                    amount = float(data.replace('deposit_amount_', ''))
-                    self.start_deposit(user_id, amount)
+            # Depozit tutarları
+            elif data.startswith('deposit_amount_'):
+                amount = float(data.replace('deposit_amount_', ''))
+                self.start_deposit(user_id, amount)
             
-            # Referans işlemleri
+            # Referans butonları
             elif data == 'referral_copy':
                 self.copy_referral_link(user_id)
             elif data == 'referral_share':
@@ -559,7 +416,6 @@ class BotSystem:
         
         except Exception as e:
             print(f"❌ Callback hatası: {e}")
-            send_message(user_id, "❌ Bir hata oluştu!")
     
     def handle_start(self, user_id, text):
         # Kanal kontrolü
@@ -570,18 +426,14 @@ class BotSystem:
                     {'text': '✅ Katıldım', 'callback_data': 'joined'}
                 ]]
             }
-            send_message(user_id, f"""
-🤖 <b>Görev Yapsam Bot'a Hoş Geldiniz!</b>
+            send_message(user_id, """
+<b>🤖 GÖREV YAPSAM BOT</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-📢 <b>Botu kullanmak için:</b>
-1️⃣ Önce kanala katılın: @{MANDATORY_CHANNEL}
-2️⃣ Katıldıktan sonra "Katıldım" butonuna basın
+📢 <b>Kullanmak için kanala katılın:</b>
+👉 @GY_Refim
 
-💡 <b>Özellikler:</b>
-• Görev yap para kazan
-• Kampanya oluştur
-• TRX ile bakiye yükle
-• Referans sistemi
+💡 <b>Sonra "Katıldım" butonuna basın</b>
 """, markup)
             return
         
@@ -600,114 +452,73 @@ class BotSystem:
                 if referrer_id and referrer_id != user_id:
                     referrer = self.db.get_user(referrer_id)
                     if referrer:
-                        # Referans ile kaydolduğunu işaretle
+                        # Referans ile kaydol
                         self.db.update_user(user_id, {'referred_by': referrer_id})
                         
-                        # Referans sahibine bonus ekle
+                        # Bonus ekle
                         self.db.add_balance(referrer_id, 1.0, 0, "referral")
                         self.db.update_user(referrer_id, {
                             'referrals': referrer.get('referrals', 0) + 1,
                             'ref_earned': referrer.get('ref_earned', 0) + 1.0
                         })
                         
-                        # Referans bildirimi gönder
-                        self.notification_system.send_referral_notification(referrer_id, user_id)
-                        
-                        # Yeni kullanıcıya mesaj
-                        send_message(user_id, "🎉 Referans linki ile kaydoldunuz! Davet eden kullanıcıya 1₺ bonus yüklendi.")
+                        # Bildirim gönder
+                        send_message(referrer_id, f"""
+<b>🎉 REFERANS KAZANCI</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+👤 <b>Yeni referans:</b> {user.get('name', 'Kullanıcı')}
+💰 <b>Kazandınız:</b> 1.00₺
+📊 <b>Toplam referans:</b> {referrer.get('referrals', 0) + 1}
+""")
         
         self.show_main_menu(user_id)
     
     def show_main_menu(self, user_id):
         user = self.db.get_user(user_id)
+        current_time = get_turkey_time().strftime('%H:%M')
         
         message = f"""
-<b>{get_translation('welcome')} {user.get('name', 'Kullanıcı')}!</b>
+<b>🤖 GÖREV YAPSAM BOT</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-💰 <b>Bakiye:</b> {user.get('balance', 0):.2f}₺
-🎯 <b>Görev:</b> {user.get('tasks_completed', 0)}
-👥 <b>Referans:</b> {user.get('referrals', 0)}
+<b>👤 Kullanıcı:</b> {user.get('name', 'Kullanıcı')}
+<b>💰 Bakiye:</b> <code>{user.get('balance', 0):.2f}₺</code>
+<b>🎯 Görev:</b> {user.get('tasks_completed', 0)}
+<b>👥 Referans:</b> {user.get('referrals', 0)}
 
+<b>⏰ Saat:</b> {current_time} 🇹🇷
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 <b>📋 ANA MENÜ</b>
 """
         
-        # Temel butonlar
-        buttons = [
-            [{'text': get_translation('tasks'), 'callback_data': 'tasks'}],
-            [{'text': get_translation('create_campaign'), 'callback_data': 'create_campaign'},
-             {'text': get_translation('my_campaigns'), 'callback_data': 'my_campaigns'}],
-            [{'text': get_translation('deposit'), 'callback_data': 'deposit'},
-             {'text': get_translation('referral'), 'callback_data': 'referral'}],
-            [{'text': get_translation('profile'), 'callback_data': 'profile'},
-             {'text': get_translation('bot_info'), 'callback_data': 'bot_info'}],
-            [{'text': '🔔', 'callback_data': 'notifications'},
-             {'text': get_translation('help'), 'callback_data': 'help'}]
-        ]
-        
-        # Admin butonu
-        if user_id == ADMIN_ID:
-            buttons.append([{'text': get_translation('admin'), 'callback_data': 'admin_panel'}])
-        
-        markup = {'inline_keyboard': buttons}
-        send_message(user_id, message, markup)
-    
-    def show_referral_menu(self, user_id):
-        user = self.db.get_user(user_id)
-        referral_link = f"https://t.me/GorevYapsamBot?start=ref_{user_id}"
-        
-        message = f"""
-<b>{get_translation('referrals')}</b>
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-👥 <b>Toplam Referans:</b> {user.get('referrals', 0)}
-💰 <b>Referans Kazancı:</b> {user.get('ref_earned', 0):.2f}₺
-
-🔗 <b>Referans Linkiniz:</b>
-<code>{referral_link}</code>
-
-💡 <b>Her referans için 1₺ kazanırsınız!</b>
-"""
-        
+        # Yan yana butonlar (2'li sıralar)
         markup = {
             'inline_keyboard': [
-                [{'text': '📋 Linki Kopyala', 'callback_data': 'referral_copy'}],
-                [{'text': '📤 Arkadaşlarını Paylaş', 'callback_data': 'referral_share'}],
-                [{'text': get_translation('back'), 'callback_data': 'menu'}]
+                [
+                    {'text': '🎯 Görev Yap', 'callback_data': 'tasks'},
+                    {'text': '📢 Kampanya', 'callback_data': 'create_campaign'}
+                ],
+                [
+                    {'text': '💰 Bakiye', 'callback_data': 'deposit'},
+                    {'text': '🏧 Çekim', 'callback_data': 'withdraw'}
+                ],
+                [
+                    {'text': '👤 Profil', 'callback_data': 'profile'},
+                    {'text': '👥 Referans', 'callback_data': 'referral'}
+                ],
+                [
+                    {'text': '🤖 Bot Bilgi', 'callback_data': 'help'},
+                    {'text': '📋 Menü', 'callback_data': 'menu'}
+                ]
             ]
         }
         
-        send_message(user_id, message, markup)
-    
-    def copy_referral_link(self, user_id):
-        referral_link = f"https://t.me/GorevYapsamBot?start=ref_{user_id}"
-        send_message(user_id, f"🔗 <b>Referans Linkiniz:</b>\n\n<code>{referral_link}</code>\n\n📋 Yukarıdaki linki kopyalayıp paylaşabilirsiniz.")
-    
-    def share_referral_link(self, user_id):
-        user = self.db.get_user(user_id)
-        referral_link = f"https://t.me/GorevYapsamBot?start=ref_{user_id}"
-        
-        message = f"""
-🎉 <b>Görev Yapsam Bot'ta Para Kazan!</b>
-
-🤖 Arkadaşlarım, bu bot ile görev yaparak para kazanabilirsiniz!
-💰 Her görev için ödeme alın
-📢 Kendi kampanyalarınızı oluşturun
-👥 Referans sistemi ile ekstra kazanın
-
-🔗 <b>Benim referans linkim:</b>
-{referral_link}
-
-💡 <b>Linke tıklayarak kaydolun ve hemen 2₺ bonus alın!</b>
-"""
-        
-        # Paylaşım butonları
-        markup = {
-            'inline_keyboard': [[
-                {'text': '📤 Telegramda Paylaş', 'url': f'https://t.me/share/url?url={referral_link}&text=Görev+Yapsam+Bot+ile+para+kazan!'}
-            ]]
-        }
+        # Admin butonu (tek başına)
+        if user_id == ADMIN_ID:
+            markup['inline_keyboard'].append([
+                {'text': '👑 Admin Panel', 'callback_data': 'admin_panel'}
+            ])
         
         send_message(user_id, message, markup)
     
@@ -721,39 +532,400 @@ class BotSystem:
         campaigns = self.db.cursor.fetchall()
         
         if not campaigns:
-            message = "📭 <b>Şu anda aktif görev bulunmuyor.</b>"
+            message = """
+<b>🎯 AKTİF GÖREVLER</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📭 <b>Şu anda aktif görev yok</b>
+
+💡 <b>Kendi kampanyanızı oluşturun!</b>
+"""
         else:
-            message = "<b>🎯 AKTİF GÖREVLER</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            message = """
+<b>🎯 AKTİF GÖREVLER</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
             for camp in campaigns:
-                message += f"""📢 <b>{camp['name'][:30]}</b>
-• Ödül: {camp['price_per_task']}₺
-• Kalan: {int(camp['remaining_budget'] / camp['price_per_task'])} kişi
-• ID: <code>{camp['campaign_id']}</code>
+                task_type = "🤖" if camp['task_type'] == 'bot' else "📢" if camp['task_type'] == 'channel' else "👥"
+                message += f"""
+{task_type} <b>{camp['name'][:25]}</b>
+├ <b>Ödül:</b> {camp['price_per_task']}₺
+├ <b>Kalan:</b> {int(camp['remaining_budget'] / camp['price_per_task'])} kişi
+└ <b>ID:</b> <code>{camp['campaign_id']}</code>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
         
         markup = {
             'inline_keyboard': [[
-                {'text': get_translation('back'), 'callback_data': 'menu'}
+                {'text': '🔙 Geri', 'callback_data': 'menu'}
             ]]
         }
+        send_message(user_id, message, markup)
+    
+    def start_campaign_type_selection(self, user_id):
+        message = """
+<b>📢 KAMPANYA OLUŞTUR</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<b>👇 TİP SEÇİN</b>
+
+🤖 <b>BOT KAMPANYASI</b>
+• Görev: Bot mesajı iletme
+• Ödül: 2.5₺ her katılım
+• Durum: Otomatik aktif
+
+📢 <b>KANAL KAMPANYASI</b>
+• Görev: Kanala katılma
+• Ödül: 1.5₺ her katılım
+• Durum: Bot admin olmalı
+
+👥 <b>GRUP KAMPANYASI</b>
+• Görev: Gruba katılma
+• Ödül: 1₺ her katılım
+• Durum: Bot admin olmalı
+"""
+        
+        markup = {
+            'inline_keyboard': [
+                [
+                    {'text': '🤖 Bot Kampanyası', 'callback_data': 'camp_type_bot'},
+                    {'text': '📢 Kanal Kampanyası', 'callback_data': 'camp_type_channel'}
+                ],
+                [
+                    {'text': '👥 Grup Kampanyası', 'callback_data': 'camp_type_group'},
+                    {'text': '🔙 Geri', 'callback_data': 'menu'}
+                ]
+            ]
+        }
+        
+        send_message(user_id, message, markup)
+    
+    def start_campaign_creation(self, user_id, task_type):
+        if task_type == 'bot':
+            self.set_user_state(user_id, 'forward_message', {'task_type': task_type, 'step': 1})
+            send_message(user_id, """
+<b>🤖 BOT KAMPANYASI</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<b>📌 ADIM 1/6</b>
+<b>🤖 Bot mesajı iletin</b>
+
+• <b>Herhangi bir bot mesajı iletin</b>
+• Örnek: @BotFather, @like, @vid, @gamebot
+• Sistem otomatik algılayacak
+
+<code>/cancel</code> iptal etmek için
+""")
+        else:
+            self.set_user_state(user_id, 'creating_campaign', {'task_type': task_type, 'step': 1})
+            type_name = "Kanal" if task_type == 'channel' else "Grup"
+            send_message(user_id, f"""
+<b>📢 {type_name.upper()} KAMPANYASI</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<b>📌 ADIM 1/5</b>
+<b>📛 Kampanya ismi girin</b>
+
+<i>Örnek isimler:</i>
+• Kanalımıza katılın
+• YouTube abone ol
+• Instagram takip et
+
+<code>/cancel</code> iptal etmek için
+""")
+    
+    def handle_user_state(self, user_id, message, user_state):
+        state = user_state['state']
+        data = user_state['data']
+        step = user_state.get('step', 1)
+        
+        # /cancel komutu
+        if 'text' in message and message['text'] == '/cancel':
+            self.clear_user_state(user_id)
+            send_message(user_id, "🔄 İşlem iptal edildi")
+            self.show_main_menu(user_id)
+            return
+        
+        # BOT MESAJ İLETME (1/6)
+        if state == 'forward_message':
+            if 'forward_from' in message:
+                if message['forward_from'].get('is_bot', False):
+                    bot_name = message['forward_from'].get('first_name', 'Bot')
+                    username = message['forward_from'].get('username', '')
+                    
+                    data['forward_from_bot_id'] = str(message['forward_from']['id'])
+                    data['forward_from_bot_name'] = f"{bot_name} (@{username})" if username else bot_name
+                    data['forward_message_id'] = message['message_id']
+                    
+                    # Mesaj içeriği
+                    msg_text = message.get('text', '') or message.get('caption', '') or ''
+                    data['forward_message_text'] = msg_text[:100] + '...' if len(msg_text) > 100 else msg_text
+                    
+                    user_state['step'] = 2
+                    send_message(user_id, f"""
+<b>✅ Bot mesajı alındı!</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<b>🤖 Bot:</b> {data['forward_from_bot_name']}
+<b>📝 Mesaj:</b> {data['forward_message_text'][:50]}...
+
+<b>📌 ADIM 2/6</b>
+<b>📛 Kampanya ismi girin</b>
+
+<i>Örnek: Kanalımıza katılın</i>
+""")
+                else:
+                    send_message(user_id, """
+<b>❌ Sadece BOT mesajı iletin!</b>
+
+⚠️ Normal kullanıcı mesajı iletmeyin
+
+<b>Doğru adımlar:</b>
+1. Bir bot bulun (@BotFather gibi)
+2. Botun mesajını seçin
+3. İletin (forward) butonuna basın
+4. Bu botu seçin
+
+<code>/cancel</code> iptal etmek için
+""")
+        
+        # KAMPANYA OLUŞTURMA
+        elif state == 'creating_campaign':
+            task_type = data['task_type']
+            
+            if step == 1:  # İsim
+                data['name'] = message['text']
+                user_state['step'] = 2
+                type_name = "Kanal" if task_type == 'channel' else "Grup"
+                send_message(user_id, f"""
+<b>✅ İsim kaydedildi</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<b>📛 İsim:</b> {data['name']}
+
+<b>📌 ADIM 2/5</b>
+<b>📄 Açıklama girin</b>
+
+<i>Örnek: Resmi kanalımıza katılın</i>
+""")
+            
+            elif step == 2:  # Açıklama
+                data['description'] = message['text']
+                user_state['step'] = 3
+                send_message(user_id, f"""
+<b>✅ Açıklama kaydedildi</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<b>📌 ADIM 3/5</b>
+<b>🔗 Link girin</b>
+
+<i>Örnek: https://t.me/kanaladi</i>
+""")
+            
+            elif step == 3:  # Link
+                data['link'] = message['text']
+                user_state['step'] = 4
+                type_name = "Kanal" if task_type == 'channel' else "Grup"
+                send_message(user_id, f"""
+<b>✅ Link kaydedildi</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<b>📌 ADIM 4/5</b>
+<b>📢 {type_name} girin</b>
+
+<i>Format: @kanaladi veya https://t.me/kanaladi</i>
+""")
+            
+            elif step == 4:  # Kanal/Grup
+                chat_input = message['text'].strip()
+                
+                # Format kontrolü
+                if not chat_input.startswith('@') and not chat_input.startswith('https://t.me/'):
+                    send_message(user_id, "❌ Geçersiz format! @ ile başlamalı veya link olmalı")
+                    return
+                
+                # Linkten @ çıkar
+                if chat_input.startswith('https://t.me/'):
+                    chat_input = '@' + chat_input.split('/')[-1]
+                
+                # Bot admin kontrolü (ZORUNLU)
+                try:
+                    chat_info = get_chat_info(chat_input)
+                    if not chat_info:
+                        send_message(user_id, "❌ Kanal/Grup bulunamadı!")
+                        return
+                    
+                    is_bot_admin = check_bot_admin(chat_info['id'])
+                    data['target_chat_id'] = str(chat_info['id'])
+                    data['target_chat_name'] = chat_info.get('title', chat_input)
+                    data['is_bot_admin'] = 1 if is_bot_admin else 0
+                    
+                    user_state['step'] = 5
+                    
+                    if not is_bot_admin:
+                        type_name = "kanalda" if task_type == 'channel' else "grupta"
+                        send_message(user_id, f"""
+<b>⚠️ BOT ADMIN DEĞİL!</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<b>{type_name.upper()}:</b> {data['target_chat_name']}
+
+<b>❌ Bot bu {type_name} admin değil!</b>
+<b>✅ Kampanya oluşturmak için:</b>
+1. {type_name} ayarlara gidin
+2. Yöneticiler bölümüne girin
+3. @GorevYapsamBot ekleyin
+4. TÜM yetkileri verin
+5. Özellikle "Üyeleri gör" yetkisi
+
+<b>Admin yaptıktan sonra devam edin</b>
+""")
+                        return
+                    
+                    send_message(user_id, f"""
+<b>✅ {type_name.upper()} kaydedildi</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<b>📢 {type_name}:</b> {data['target_chat_name']}
+<b>👑 Bot Durumu:</b> ✅ ADMIN
+
+<b>📌 ADIM 5/5</b>
+<b>💰 Bütçe girin (₺)</b>
+
+<i>Minimum: 10₺</i>
+<i>Örnek: 50</i>
+""")
+                    
+                except Exception as e:
+                    send_message(user_id, f"❌ Hata: {str(e)}")
+            
+            elif step == 5:  # Bütçe
+                try:
+                    budget = float(message['text'])
+                    if budget < 10:
+                        send_message(user_id, "❌ Minimum bütçe 10₺!")
+                        return
+                    
+                    data['budget'] = budget
+                    
+                    # Kampanya özeti göster
+                    self.show_campaign_summary(user_id, data)
+                    
+                except:
+                    send_message(user_id, "❌ Geçersiz bütçe! Sayı girin")
+        
+        # TXID BEKLEME
+        elif state == 'waiting_txid':
+            txid = message['text'].strip()
+            deposit_data = data
+            
+            if len(txid) < 10:
+                send_message(user_id, "❌ Geçersiz TXID!")
+                return
+            
+            try:
+                # Depoziti tamamla
+                self.db.cursor.execute('''
+                    UPDATE deposits 
+                    SET txid = ?, status = 'completed', completed_at = ?
+                    WHERE deposit_id = ? AND user_id = ?
+                ''', (txid, get_turkey_time().isoformat(), deposit_data['deposit_id'], user_id))
+                
+                # Bakiye ekle
+                user = self.db.get_user(user_id)
+                amount = deposit_data['amount']
+                bonus = deposit_data['bonus']
+                new_balance = user.get('balance', 0) + amount + bonus
+                
+                self.db.update_user(user_id, {
+                    'balance': new_balance,
+                    'total_deposited': user.get('total_deposited', 0) + amount,
+                    'deposit_count': user.get('deposit_count', 0) + 1,
+                    'total_bonus': user.get('total_bonus', 0) + bonus
+                })
+                
+                self.db.conn.commit()
+                
+                # Başarı mesajı
+                send_message(user_id, f"""
+<b>✅ BAKİYE YÜKLENDİ</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+💰 <b>Toplam:</b> {amount + bonus:.2f}₺
+• Yatırım: {amount:.2f}₺
+• Bonus: {bonus:.2f}₺
+• Yeni Bakiye: {new_balance:.2f}₺
+
+🎉 <b>Hemen görev yap!</b>
+""")
+                
+                self.clear_user_state(user_id)
+                time.sleep(2)
+                self.show_main_menu(user_id)
+                
+            except Exception as e:
+                print(f"❌ TXID hatası: {e}")
+                send_message(user_id, "❌ İşlem hatası!")
+    
+    def show_campaign_summary(self, user_id, data):
+        task_type = data['task_type']
+        type_name = "Bot" if task_type == 'bot' else "Kanal" if task_type == 'channel' else "Grup"
+        price = 2.5 if task_type == 'bot' else 1.5 if task_type == 'channel' else 1.0
+        budget = data['budget']
+        max_participants = int(budget / price)
+        
+        message = f"""
+<b>📋 KAMPANYA ÖZETİ</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<b>🎯 Tip:</b> {type_name} Kampanyası
+<b>📛 İsim:</b> {data['name']}
+<b>📄 Açıklama:</b> {data['description'][:50]}...
+<b>🔗 Link:</b> {data['link'][:30]}...
+"""
+        
+        if task_type == 'bot':
+            message += f"<b>🤖 Bot:</b> {data.get('forward_from_bot_name', 'Bilinmiyor')}\n"
+        else:
+            admin_status = "✅ ADMIN" if data.get('is_bot_admin', 0) == 1 else "❌ ADMIN DEĞİL"
+            message += f"<b>📢 {type_name}:</b> {data.get('target_chat_name', 'Bilinmiyor')}\n"
+            message += f"<b>👑 Bot Durumu:</b> {admin_status}\n"
+        
+        message += f"""
+<b>💰 Bütçe:</b> {budget:.2f}₺
+<b>🎁 Ödül:</b> {price}₺
+<b>👥 Katılımcı:</b> {max_participants} kişi
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+<b>✅ Onaylıyor musunuz?</b>
+"""
+        
+        markup = {
+            'inline_keyboard': [
+                [
+                    {'text': '✅ Onayla', 'callback_data': 'campaign_confirm'},
+                    {'text': '❌ İptal', 'callback_data': 'menu'}
+                ]
+            ]
+        }
+        
         send_message(user_id, message, markup)
     
     def show_profile(self, user_id):
         user = self.db.get_user(user_id)
         
         message = f"""
-<b>{get_translation('profile')}</b>
+<b>👤 PROFİL BİLGİLERİ</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-👤 <b>İsim:</b> {user.get('name', 'Kullanıcı')}
-🆔 <b>ID:</b> <code>{user_id}</code>
+<b>👤 İsim:</b> {user.get('name', 'Kullanıcı')}
+<b>🆔 ID:</b> <code>{user_id}</code>
 
-💰 <b>Bakiye:</b> {user.get('balance', 0):.2f}₺
-🎯 <b>Görev:</b> {user.get('tasks_completed', 0)}
-👥 <b>Referans:</b> {user.get('referrals', 0)}
+<b>💰 Bakiye:</b> {user.get('balance', 0):.2f}₺
+<b>🎯 Görev:</b> {user.get('tasks_completed', 0)}
+<b>👥 Referans:</b> {user.get('referrals', 0)}
 
-📈 <b>İstatistik:</b>
+<b>📈 İstatistik:</b>
 • Toplam Yatırım: {user.get('total_deposited', 0):.2f}₺
 • Toplam Bonus: {user.get('total_bonus', 0):.2f}₺
 • Referans Kazancı: {user.get('ref_earned', 0):.2f}₺
@@ -761,35 +933,109 @@ class BotSystem:
         
         markup = {
             'inline_keyboard': [
-                [{'text': get_translation('deposit'), 'callback_data': 'deposit'},
-                 {'text': get_translation('referral'), 'callback_data': 'referral'}],
-                [{'text': get_translation('back'), 'callback_data': 'menu'}]
+                [
+                    {'text': '💰 Bakiye Yükle', 'callback_data': 'deposit'},
+                    {'text': '👥 Referans', 'callback_data': 'referral'}
+                ],
+                [
+                    {'text': '🔙 Geri', 'callback_data': 'menu'}
+                ]
             ]
         }
+        
         send_message(user_id, message, markup)
+    
+    def show_referral_menu(self, user_id):
+        user = self.db.get_user(user_id)
+        referral_link = f"https://t.me/GorevYapsamBot?start=ref_{user_id}"
+        
+        message = f"""
+<b>👥 REFERANS SİSTEMİ</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<b>👥 Toplam Referans:</b> {user.get('referrals', 0)}
+<b>💰 Kazanç:</b> {user.get('ref_earned', 0):.2f}₺
+
+<b>🔗 Referans Linkiniz:</b>
+<code>{referral_link}</code>
+
+<b>💡 Her referans için 1₺ kazan!</b>
+"""
+        
+        markup = {
+            'inline_keyboard': [
+                [
+                    {'text': '📋 Linki Kopyala', 'callback_data': 'referral_copy'},
+                    {'text': '📤 Paylaş', 'callback_data': 'referral_share'}
+                ],
+                [
+                    {'text': '🔙 Geri', 'callback_data': 'menu'}
+                ]
+            ]
+        }
+        
+        send_message(user_id, message, markup)
+    
+    def copy_referral_link(self, user_id):
+        referral_link = f"https://t.me/GorevYapsamBot?start=ref_{user_id}"
+        send_message(user_id, f"""
+<b>🔗 REFERANS LİNKİ</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<code>{referral_link}</code>
+
+📋 <b>Yukarıdaki linki kopyalayın</b>
+💡 <b>Paylaşın ve para kazanın!</b>
+""")
+    
+    def share_referral_link(self, user_id):
+        referral_link = f"https://t.me/GorevYapsamBot?start=ref_{user_id}"
+        
+        markup = {
+            'inline_keyboard': [[
+                {'text': '📤 Telegramda Paylaş', 
+                 'url': f'https://t.me/share/url?url={referral_link}&text=Görev+Yapsam+Bot+ile+para+kazanın!'}
+            ]]
+        }
+        
+        send_message(user_id, """
+<b>📤 REFERANS PAYLAŞ</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+👇 <b>Aşağıdaki butona tıklayarak paylaşabilirsiniz</b>
+
+💡 <b>Her davet için 1₺ kazanacaksınız!</b>
+""", markup)
     
     def show_deposit_menu(self, user_id):
         self.update_trx_price()
         
         message = f"""
-<b>{get_translation('deposit')}</b>
+<b>💰 BAKİYE YÜKLE</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-💰 <b>TRX Fiyatı:</b> {self.trx_price:.2f}₺
-🎁 <b>Bonus:</b> %{DEPOSIT_BONUS_PERCENT}
+<b>₿ TRX Fiyatı:</b> {self.trx_price:.2f}₺
+<b>🎁 Bonus:</b> %{DEPOSIT_BONUS_PERCENT}
 
 👇 <b>Tutar Seçin:</b>
 """
         
         markup = {
             'inline_keyboard': [
-                [{'text': f'25₺ ({(25/self.trx_price):.2f} TRX)', 'callback_data': 'deposit_amount_25'},
-                 {'text': f'50₺ ({(50/self.trx_price):.2f} TRX)', 'callback_data': 'deposit_amount_50'}],
-                [{'text': f'100₺ ({(100/self.trx_price):.2f} TRX)', 'callback_data': 'deposit_amount_100'},
-                 {'text': f'200₺ ({(200/self.trx_price):.2f} TRX)', 'callback_data': 'deposit_amount_200'}],
-                [{'text': get_translation('back'), 'callback_data': 'menu'}]
+                [
+                    {'text': f'25₺', 'callback_data': 'deposit_amount_25'},
+                    {'text': f'50₺', 'callback_data': 'deposit_amount_50'}
+                ],
+                [
+                    {'text': f'100₺', 'callback_data': 'deposit_amount_100'},
+                    {'text': f'200₺', 'callback_data': 'deposit_amount_200'}
+                ],
+                [
+                    {'text': '🔙 Geri', 'callback_data': 'menu'}
+                ]
             ]
         }
+        
         send_message(user_id, message, markup)
     
     def start_deposit(self, user_id, amount):
@@ -797,21 +1043,23 @@ class BotSystem:
         bonus = amount * DEPOSIT_BONUS_PERCENT / 100
         
         message = f"""
-<b>{get_translation('deposit')} Bilgileri</b>
+<b>💰 ÖDEME BİLGİLERİ</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-💵 <b>Tutar:</b> {amount:.2f}₺
-₿ <b>TRX Tutarı:</b> {trx_amount:.4f} TRX
-🎁 <b>Bonus:</b> {bonus:.2f}₺ (%{DEPOSIT_BONUS_PERCENT})
-💰 <b>Toplam:</b> {amount + bonus:.2f}₺
+<b>💵 Tutar:</b> {amount:.2f}₺
+<b>₿ TRX Tutarı:</b> {trx_amount:.4f} TRX
+<b>🎁 Bonus:</b> {bonus:.2f}₺
+<b>💰 Toplam:</b> {amount + bonus:.2f}₺
 
-🔗 <b>TRX Adresi:</b>
+<b>🔗 TRX Adresi:</b>
 <code>{TRX_ADDRESS}</code>
 
-📝 <b>Adımlar:</b>
-1. Yukarıdaki adrese {trx_amount:.4f} TRX gönderin
-2. İşlem tamamlandığında TXID'yi bota gönderin
-3. Bakiyeniz otomatik yüklenecek
+<b>📝 Adımlar:</b>
+1. Yukarıdaki adrese {trx_amount:.4f} TRX gönder
+2. İşlem tamamlanınca TXID'yi gönder
+3. Bakiye otomatik yüklenecek
+
+<code>/cancel</code> iptal etmek için
 """
         
         deposit_id = hashlib.md5(f"{user_id}{time.time()}".encode()).hexdigest()[:10].upper()
@@ -830,122 +1078,146 @@ class BotSystem:
             print(f"❌ Depozit hatası: {e}")
             send_message(user_id, "❌ Depozit oluşturulamadı!")
     
-    def show_bot_info(self, user_id):
-        message = """
-<b>🤖 BOT BİLGİSİ</b>
+    def show_withdraw_menu(self, user_id):
+        user = self.db.get_user(user_id)
+        
+        message = f"""
+<b>🏧 PARA ÇEKME</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-📢 <b>Kanal:</b> @GY_Refim
-💰 <b>TRX Adresi:</b>
-<code>TVJKGbdBQrbvQzq6WZhb3kaGa3LYgVrMSK</code>
+<b>💰 Mevcut Bakiye:</b> {user.get('balance', 0):.2f}₺
+<b>💳 Çekilebilir:</b> {user.get('balance', 0):.2f}₺
 
-🎁 <b>Bonus Sistemi:</b>
-• Depozit: %35 bonus
-• Referans: 1₺ her davet
+<b>⚠️ Minimum Çekim:</b> 10₺
+<b>⏳ İşlem Süresi:</b> 24 saat
 
-⚡ <b>Özellikler:</b>
-• Görev yap para kazan
-• Kampanya oluştur
-• TRX ile ödeme
-• Referans sistemi
-
-📞 <b>Destek:</b>
-Admin ile iletişime geçin.
+👇 <b>Çekim yapmak için admin ile iletişime geçin</b>
 """
         
         markup = {
             'inline_keyboard': [[
-                {'text': get_translation('back'), 'callback_data': 'menu'}
+                {'text': '🔙 Geri', 'callback_data': 'menu'}
             ]]
+        }
+        
+        send_message(user_id, message, markup)
+    
+    def show_my_campaigns(self, user_id):
+        self.db.cursor.execute('''
+            SELECT * FROM campaigns 
+            WHERE creator_id = ? 
+            ORDER BY created_at DESC 
+            LIMIT 5
+        ''', (user_id,))
+        campaigns = self.db.cursor.fetchall()
+        
+        if not campaigns:
+            message = """
+<b>📋 KAMPANYALARIM</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📭 <b>Henüz kampanyanız yok</b>
+
+💡 <b>İlk kampanyanızı oluşturun!</b>
+"""
+        else:
+            message = """
+<b>📋 KAMPANYALARIM</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+            for camp in campaigns:
+                status = "🟢" if camp['status'] == 'active' else "🟡" if camp['status'] == 'pending' else "🔴"
+                message += f"""
+{status} <b>{camp['name'][:20]}</b>
+├ <b>Durum:</b> {camp['status']}
+├ <b>Bütçe:</b> {camp['budget']:.1f}₺
+└ <b>Katılım:</b> {camp['current_participants']}/{camp['max_participants']}
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+        
+        markup = {
+            'inline_keyboard': [
+                [
+                    {'text': '📢 Yeni Kampanya', 'callback_data': 'create_campaign'},
+                    {'text': '🔙 Geri', 'callback_data': 'menu'}
+                ]
+            ]
         }
         send_message(user_id, message, markup)
     
     def show_help(self, user_id):
         message = """
-<b>❓ YARDIM</b>
+<b>❓ YARDIM VE BİLGİ</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 <b>🤖 Bot Nasıl Çalışır?</b>
-1. Kanala katılın
+1. Kanala katılın (@GY_Refim)
 2. Bakiye yükleyin veya görev yapın
 3. Para kazanın!
 
 <b>💰 Bakiye Nasıl Yüklenir?</b>
-1. /deposit komutunu kullanın
+1. Bakiye butonuna basın
 2. Tutar seçin
 3. TRX gönderin
-4. TXID'yi girin
+4. TXID'yi gönderin
 
 <b>📢 Kampanya Nasıl Oluşturulur?</b>
-1. "Kampanya" butonuna basın
-2. Tip seçin
-3. Bilgileri doldurun
+1. Kampanya butonuna basın
+2. Tip seçin (Bot/Kanal/Grup)
+3. Adımları takip edin
 4. Onaylayın
 
 <b>👥 Referans Sistemi</b>
 • Her davet: 1₺ bonus
-• Referans linkinizi paylaşın
+• Linkinizi paylaşın
 • Arkadaşlarınızı davet edin
+
+<b>📞 Destek:</b>
+Admin ile iletişime geçin.
 """
         
         markup = {
             'inline_keyboard': [[
-                {'text': get_translation('back'), 'callback_data': 'menu'}
+                {'text': '🔙 Geri', 'callback_data': 'menu'}
             ]]
         }
         send_message(user_id, message, markup)
-    
-    def toggle_notifications(self, user_id):
-        user = self.db.get_user(user_id)
-        current = user.get('notification_enabled', 1)
-        new_status = 0 if current == 1 else 1
-        
-        self.db.update_user(user_id, {'notification_enabled': new_status})
-        
-        if new_status == 1:
-            message = "🔔 <b>Bildirimler açıldı!</b>"
-        else:
-            message = "🔕 <b>Bildirimler kapatıldı!</b>"
-        
-        send_message(user_id, message)
-        self.show_main_menu(user_id)
     
     def show_admin_panel(self, user_id):
         if user_id != ADMIN_ID:
             send_message(user_id, "❌ Yetkiniz yok!")
             return
         
-        # İstatistikler
         self.db.cursor.execute("SELECT COUNT(*) FROM users")
         total_users = self.db.cursor.fetchone()[0]
         
         self.db.cursor.execute("SELECT SUM(balance) FROM users")
         total_balance = self.db.cursor.fetchone()[0] or 0
         
-        self.db.cursor.execute("SELECT COUNT(*) FROM campaigns WHERE status = 'active'")
-        active_campaigns = self.db.cursor.fetchone()[0]
-        
         message = f"""
 <b>👑 ADMIN PANELİ</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-📊 <b>İstatistikler</b>
+<b>📊 İstatistik</b>
 • 👥 Kullanıcı: {total_users}
 • 💰 Toplam Bakiye: {total_balance:.2f}₺
-• 📢 Aktif Kampanya: {active_campaigns}
 
-🛠️ <b>Araçlar</b>
+<b>🛠️ Araçlar</b>
 """
         
         markup = {
             'inline_keyboard': [
-                [{'text': '📊 İstatistik', 'callback_data': 'admin_stats'},
-                 {'text': '📢 Kampanyalar', 'callback_data': 'admin_campaigns'}],
-                [{'text': '👥 Kullanıcılar', 'callback_data': 'admin_users'},
-                 {'text': '💰 Depozitler', 'callback_data': 'admin_deposits'}],
-                [{'text': '📣 Duyuru', 'callback_data': 'admin_broadcast'},
-                 {'text': '⚙️ Ayarlar', 'callback_data': 'admin_settings'}],
-                [{'text': get_translation('back'), 'callback_data': 'menu'}]
+                [
+                    {'text': '📊 İstatistik', 'callback_data': 'admin_stats'},
+                    {'text': '📢 Kampanyalar', 'callback_data': 'admin_campaigns'}
+                ],
+                [
+                    {'text': '👥 Kullanıcılar', 'callback_data': 'admin_users'},
+                    {'text': '💰 Depozitler', 'callback_data': 'admin_deposits'}
+                ],
+                [
+                    {'text': '🔙 Geri', 'callback_data': 'menu'}
+                ]
             ]
         }
         
@@ -955,36 +1227,34 @@ Admin ile iletişime geçin.
         if user_id != ADMIN_ID:
             return
         
-        self.db.cursor.execute("SELECT * FROM bot_stats WHERE stat_id = 1")
-        stats = self.db.cursor.fetchone()
+        self.db.cursor.execute("SELECT COUNT(*) FROM users")
+        total_users = self.db.cursor.fetchone()[0]
         
-        if stats:
-            total_users = stats['total_users']
-            total_deposits = stats['total_deposits']
-            total_campaigns = stats['total_campaigns']
-            total_tasks = stats['total_tasks_completed']
-            total_balance = stats['total_balance']
-        else:
-            total_users = total_deposits = total_campaigns = total_tasks = 0
-            total_balance = 0.0
+        self.db.cursor.execute("SELECT COUNT(*) FROM campaigns")
+        total_campaigns = self.db.cursor.fetchone()[0]
+        
+        self.db.cursor.execute("SELECT COUNT(*) FROM deposits WHERE status = 'completed'")
+        total_deposits = self.db.cursor.fetchone()[0]
         
         message = f"""
-<b>📊 DETAYLI İSTATİSTİKLER</b>
+<b>📊 DETAYLI İSTATİSTİK</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-👥 <b>Toplam Kullanıcı:</b> {total_users}
-💰 <b>Toplam Bakiye:</b> {total_balance:.2f}₺
+<b>👥 Kullanıcı İstatistikleri</b>
+• Toplam Kullanıcı: {total_users}
 
-💳 <b>Toplam Depozit:</b> {total_deposits}
-📢 <b>Toplam Kampanya:</b> {total_campaigns}
-🎯 <b>Toplam Görev:</b> {total_tasks}
+<b>💰 Finansal İstatistikler</b>
+• Toplam Depozit: {total_deposits}
 
-⏰ <b>Sistem Durumu:</b> ✅ ÇALIŞIYOR
+<b>📢 Kampanya İstatistikleri</b>
+• Toplam Kampanya: {total_campaigns}
+
+<b>⏰ Sistem Durumu:</b> ✅ ÇALIŞIYOR
 """
         
         markup = {
             'inline_keyboard': [[
-                {'text': get_translation('back'), 'callback_data': 'admin_panel'}
+                {'text': '🔙 Geri', 'callback_data': 'admin_panel'}
             ]]
         }
         send_message(user_id, message, markup)
@@ -1001,22 +1271,21 @@ Admin ile iletişime geçin.
         campaigns = self.db.cursor.fetchall()
         
         if not campaigns:
-            message = "📭 <b>Hiç kampanya bulunamadı!</b>"
+            message = "📭 <b>Hiç kampanya yok</b>"
         else:
             message = "<b>📢 TÜM KAMPANYALAR</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             for camp in campaigns:
                 status = "🟢" if camp['status'] == 'active' else "🟡" if camp['status'] == 'pending' else "🔴"
                 message += f"""{status} <b>{camp['name'][:20]}</b>
-• Durum: {camp['status']}
-• Bütçe: {camp['budget']:.1f}₺
-• Katılım: {camp['current_participants']}/{camp['max_participants']}
-• ID: <code>{camp['campaign_id']}</code>
+├ <b>ID:</b> <code>{camp['campaign_id']}</code>
+├ <b>Durum:</b> {camp['status']}
+└ <b>Oluşturan:</b> {camp['creator_name']}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
         
         markup = {
             'inline_keyboard': [[
-                {'text': get_translation('back'), 'callback_data': 'admin_panel'}
+                {'text': '🔙 Geri', 'callback_data': 'admin_panel'}
             ]]
         }
         send_message(user_id, message, markup)
@@ -1033,21 +1302,20 @@ Admin ile iletişime geçin.
         users = self.db.cursor.fetchall()
         
         if not users:
-            message = "👥 <b>Hiç kullanıcı bulunamadı!</b>"
+            message = "👥 <b>Hiç kullanıcı yok</b>"
         else:
             message = "<b>👥 TÜM KULLANICILAR</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             for usr in users:
-                referred = "✅" if usr['referred_by'] else "❌"
                 message += f"""👤 <b>{usr['name'][:15]}</b>
-• ID: <code>{usr['user_id']}</code>
-• Bakiye: {usr['balance']:.1f}₺
-• Referans: {usr['referrals']} {referred}
+├ <b>ID:</b> <code>{usr['user_id']}</code>
+├ <b>Bakiye:</b> {usr['balance']:.1f}₺
+└ <b>Referans:</b> {usr['referrals']}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
         
         markup = {
             'inline_keyboard': [[
-                {'text': get_translation('back'), 'callback_data': 'admin_panel'}
+                {'text': '🔙 Geri', 'callback_data': 'admin_panel'}
             ]]
         }
         send_message(user_id, message, markup)
@@ -1064,203 +1332,30 @@ Admin ile iletişime geçin.
         deposits = self.db.cursor.fetchall()
         
         if not deposits:
-            message = "💰 <b>Hiç depozit bulunamadı!</b>"
+            message = "💰 <b>Hiç depozit yok</b>"
         else:
             message = "<b>💰 TÜM DEPOZİTLER</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             for dep in deposits:
                 status = "✅" if dep['status'] == 'completed' else "⏳" if dep['status'] == 'pending' else "❌"
-                message += f"""{status} <b>Depozit #{dep['deposit_id'][:8]}</b>
-• Kullanıcı: <code>{dep['user_id']}</code>
-• Tutar: {dep['amount_try']:.2f}₺
-• Durum: {dep['status']}
-• Zaman: {dep['created_at'][:16]}
+                message += f"""{status} <b>#{dep['deposit_id'][:8]}</b>
+├ <b>Kullanıcı:</b> <code>{dep['user_id']}</code>
+├ <b>Tutar:</b> {dep['amount_try']:.2f}₺
+└ <b>Durum:</b> {dep['status']}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
         
         markup = {
             'inline_keyboard': [[
-                {'text': get_translation('back'), 'callback_data': 'admin_panel'}
+                {'text': '🔙 Geri', 'callback_data': 'admin_panel'}
             ]]
         }
         send_message(user_id, message, markup)
-    
-    def show_admin_broadcast(self, user_id):
-        if user_id != ADMIN_ID:
-            return
-        
-        message = """
-<b>📣 TOPLU MESAJ GÖNDER</b>
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-⚠️ <b>Bu özellik henüz tamamlanmadı.</b>
-
-💡 <b>Yakında Eklenecek:</b>
-• Tüm kullanıcılara mesaj
-• Filtreli gönderim
-• Zamanlı gönderim
-"""
-        
-        markup = {
-            'inline_keyboard': [[
-                {'text': get_translation('back'), 'callback_data': 'admin_panel'}
-            ]]
-        }
-        send_message(user_id, message, markup)
-    
-    def show_admin_settings(self, user_id):
-        if user_id != ADMIN_ID:
-            return
-        
-        message = """
-<b>⚙️ AYARLAR</b>
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-⚠️ <b>Bu özellik henüz tamamlanmadı.</b>
-
-💡 <b>Yakında Eklenecek:</b>
-• Bot ayarları
-• Komut yönetimi
-• Sistem ayarları
-"""
-        
-        markup = {
-            'inline_keyboard': [[
-                {'text': get_translation('back'), 'callback_data': 'admin_panel'}
-            ]]
-        }
-        send_message(user_id, message, markup)
-    
-    def start_campaign_type_selection(self, user_id):
-        message = """
-<b>📢 KAMPANYA OLUŞTUR</b>
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-👇 <b>Kampanya Tipi Seçin:</b>
-
-🤖 <b>Bot Kampanyası</b>
-• Görev: Bot mesajı
-• Ödül: 2.5₺
-• Otomatik aktif
-
-📢 <b>Kanal Kampanyası</b>
-• Görev: Kanala katılma
-• Ödül: 1.5₺
-• Bot admin olmalı
-
-👥 <b>Grup Kampanyası</b>
-• Görev: Gruba katılma
-• Ödül: 1₺
-• Bot admin olmalı
-"""
-        
-        markup = {
-            'inline_keyboard': [
-                [{'text': '🤖 Bot Kampanyası', 'callback_data': 'camp_type_bot'}],
-                [{'text': '📢 Kanal Kampanyası', 'callback_data': 'camp_type_channel'}],
-                [{'text': '👥 Grup Kampanyası', 'callback_data': 'camp_type_group'}],
-                [{'text': get_translation('back'), 'callback_data': 'menu'}]
-            ]
-        }
-        
-        send_message(user_id, message, markup)
-    
-    def start_campaign_creation(self, user_id, task_type):
-        # Basit kampanya oluşturma - geliştirilecek
-        send_message(user_id, f"📢 <b>Kampanya oluşturma özelliği geliştiriliyor...</b>\n\nSeçilen tip: {task_type}")
-        time.sleep(2)
-        self.show_main_menu(user_id)
-    
-    def show_my_campaigns(self, user_id):
-        self.db.cursor.execute('''
-            SELECT * FROM campaigns 
-            WHERE creator_id = ? 
-            ORDER BY created_at DESC 
-            LIMIT 5
-        ''', (user_id,))
-        campaigns = self.db.cursor.fetchall()
-        
-        if not campaigns:
-            message = "📭 <b>Henüz kampanyanız yok.</b>"
-        else:
-            message = "<b>📋 KAMPANYALARIM</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            for camp in campaigns:
-                status = "🟢" if camp['status'] == 'active' else "🟡" if camp['status'] == 'pending' else "🔴"
-                message += f"""{status} <b>{camp['name'][:20]}</b>
-• Durum: {camp['status']}
-• Bütçe: {camp['budget']:.1f}₺
-• Katılım: {camp['current_participants']}/{camp['max_participants']}
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
-        
-        markup = {
-            'inline_keyboard': [
-                [{'text': '📢 Yeni Kampanya', 'callback_data': 'create_campaign'}],
-                [{'text': get_translation('back'), 'callback_data': 'menu'}]
-            ]
-        }
-        send_message(user_id, message, markup)
-    
-    def handle_user_state(self, user_id, message, user_state):
-        # TXID bekleniyorsa
-        if user_state['state'] == 'waiting_txid' and 'text' in message:
-            txid = message['text'].strip()
-            data = user_state['data']
-            
-            if len(txid) < 10:
-                send_message(user_id, "❌ Geçersiz TXID!")
-                return
-            
-            try:
-                deposit_id = data['deposit_id']
-                amount = data['amount']
-                bonus = data['bonus']
-                
-                # Depoziti tamamla
-                self.db.cursor.execute('''
-                    UPDATE deposits 
-                    SET txid = ?, status = 'completed', completed_at = ?
-                    WHERE deposit_id = ? AND user_id = ?
-                ''', (txid, get_turkey_time().isoformat(), deposit_id, user_id))
-                
-                # Bakiye ekle
-                user = self.db.get_user(user_id)
-                new_balance = user.get('balance', 0) + amount + bonus
-                self.db.update_user(user_id, {
-                    'balance': new_balance,
-                    'total_deposited': user.get('total_deposited', 0) + amount,
-                    'deposit_count': user.get('deposit_count', 0) + 1,
-                    'total_bonus': user.get('total_bonus', 0) + bonus
-                })
-                
-                self.db.conn.commit()
-                self.db.update_bot_stats('deposit')
-                
-                # Başarı mesajı
-                send_message(user_id, f"""
-✅ <b>BAKİYE YÜKLENDİ!</b>
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-💰 <b>+{amount + bonus:.2f}₺ bakiyenize eklendi!</b>
-• Yatırım: {amount:.2f}₺
-• Bonus: {bonus:.2f}₺
-• Yeni Bakiye: {new_balance:.2f}₺
-
-🎉 <b>Hemen görev yapmaya başlayabilirsiniz!</b>
-""")
-                
-                self.clear_user_state(user_id)
-                time.sleep(2)
-                self.show_main_menu(user_id)
-                
-            except Exception as e:
-                print(f"❌ TXID hatası: {e}")
-                send_message(user_id, "❌ İşlem kaydedilemedi!")
 
 # Ana Program
 def main():
     print("""
     ╔════════════════════════════════════════════════════════════════╗
-    ║                    GÖREV YAPSAM BOT v16.0                      ║
+    ║                    GÖREV YAPSAM BOT v17.0                      ║
     ║   TRX DEPOZİT + OTOMATİK GÖREV + REKLAM BAKİYESİ + BONUS SİSTEM║
     ║   + REFERANS SİSTEMİ + ADMIN PANEL + SQLITE                    ║
     ╚════════════════════════════════════════════════════════════════╝
