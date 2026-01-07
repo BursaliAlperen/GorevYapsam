@@ -1,34 +1,36 @@
 """
-🚀 GÖREV YAPSAM BOT PRO v16.2 - SQLite PERSISTENT
+🚀 GÖREV YAPSAM BOT PRO v16.3 - FIXED SINGLE INSTANCE
 Telegram: @GorevYapsamBot
 Developer: Alperen
 Database: SQLite3 + Render Disk Backup
 Ödeme: Yakında (Papara & Kripto)
 Dil: Türkçe & Azerbaycan Türkçesi
-Render Optimized - Persistent Data
+Render Optimized - Single Instance Fix
 """
 
 import os
 import sqlite3
 import json
-import asyncio
+import time
+import threading
+from datetime import datetime
 import telebot
 from telebot import types
-import threading
-import time
-from datetime import datetime, timedelta
 import requests
 from dotenv import load_dotenv
 import cachetools
 import schedule
-from typing import Dict, List, Optional
-from pathlib import Path
+import signal
+import sys
 import logging
 
 # ================= 1. LOGGING SETUP =================
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -36,49 +38,68 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
+if not TOKEN:
+    logger.error("❌ TELEGRAM_TOKEN bulunamadı!")
+    sys.exit(1)
+
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7904032877"))
 MANDATORY_CHANNEL = os.getenv("MANDATORY_CHANNEL", "GY_Refim")
 
+logger.info(f"✅ Bot token loaded, Admin ID: {ADMIN_ID}")
+
 # ================= 3. DATABASE SETUP (SQLITE PERSISTENT) =================
-# Render Disk kullanıyoruz (kalıcı depolama)
-DB_PATH = "/opt/render/project/src/data/bot_database.db"
-BACKUP_PATH = "/opt/render/project/src/data/backup.json"
+DB_PATH = "data/bot_database.db"
+BACKUP_PATH = "data/backup.json"
 
 # Klasörleri oluştur
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 def init_database():
     """Veritabanını başlat"""
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    cursor = conn.cursor()
-    
-    # Users tablosu
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        first_name TEXT,
-        username TEXT,
-        language TEXT DEFAULT 'tr',
-        balance REAL DEFAULT 0.0,
-        ad_balance REAL DEFAULT 0.0,
-        tasks_completed INTEGER DEFAULT 0,
-        referrals INTEGER DEFAULT 0,
-        ref_earned REAL DEFAULT 0.0,
-        total_earned REAL DEFAULT 0.0,
-        channel_joined INTEGER DEFAULT 0,
-        welcome_bonus INTEGER DEFAULT 0,
-        ref_parent INTEGER DEFAULT 0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    ''')
-    
-    # Referans linkleri için indeks
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_ref_parent ON users(ref_parent)')
-    
-    conn.commit()
-    conn.close()
-    logger.info("✅ Database initialized successfully")
+    try:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        cursor = conn.cursor()
+        
+        # Users tablosu
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            first_name TEXT,
+            username TEXT,
+            language TEXT DEFAULT 'tr',
+            balance REAL DEFAULT 0.0,
+            ad_balance REAL DEFAULT 0.0,
+            tasks_completed INTEGER DEFAULT 0,
+            referrals INTEGER DEFAULT 0,
+            ref_earned REAL DEFAULT 0.0,
+            total_earned REAL DEFAULT 0.0,
+            channel_joined INTEGER DEFAULT 0,
+            welcome_bonus INTEGER DEFAULT 0,
+            ref_parent INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        ''')
+        
+        # Referans bonusları tablosu
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS referral_bonuses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            threshold INTEGER,
+            amount REAL,
+            awarded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
+        )
+        ''')
+        
+        conn.commit()
+        conn.close()
+        logger.info("✅ Database initialized successfully")
+        
+    except Exception as e:
+        logger.error(f"❌ Database initialization error: {e}")
+        sys.exit(1)
 
 # Veritabanını başlat
 init_database()
@@ -90,7 +111,7 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
-async def get_user(user_id: int) -> Optional[Dict]:
+def get_user(user_id: int):
     """Kullanıcı bilgilerini getir"""
     try:
         conn = get_db_connection()
@@ -102,19 +123,17 @@ async def get_user(user_id: int) -> Optional[Dict]:
         )
         row = cursor.fetchone()
         
-        if row:
-            user_data = dict(row)
-            conn.close()
-            return user_data
-        
         conn.close()
+        
+        if row:
+            return dict(row)
         return None
         
     except Exception as e:
         logger.error(f"Kullanıcı getirme hatası: {e}")
         return None
 
-async def create_or_update_user(user_id: int, user_data: Dict) -> bool:
+def create_or_update_user(user_id: int, user_data: dict) -> bool:
     """Kullanıcı oluştur veya güncelle"""
     try:
         conn = get_db_connection()
@@ -154,7 +173,7 @@ async def create_or_update_user(user_id: int, user_data: Dict) -> bool:
         logger.error(f"Kullanıcı güncelleme hatası: {e}")
         return False
 
-async def update_balance(user_id: int, amount: float, balance_type: str = 'balance') -> bool:
+def update_balance(user_id: int, amount: float, balance_type: str = 'balance') -> bool:
     """Bakiye güncelle"""
     try:
         conn = get_db_connection()
@@ -183,11 +202,11 @@ async def update_balance(user_id: int, amount: float, balance_type: str = 'balan
         logger.error(f"Bakiye güncelleme hatası: {e}")
         return False
 
-async def add_referral(user_id: int, parent_id: int) -> bool:
-    """Referans ekle (KANAL KONTROLÜ EKLENDİ)"""
+def add_referral(user_id: int, parent_id: int) -> bool:
+    """Referans ekle"""
     try:
         # Önce referans yapan kullanıcının kanala katılıp katılmadığını kontrol et
-        parent_user = await get_user(parent_id)
+        parent_user = get_user(parent_id)
         if not parent_user or parent_user.get('channel_joined', 0) == 0:
             logger.info(f"Referans ebeveyni {parent_id} kanala katılmamış, referans eklenmedi")
             return False
@@ -216,7 +235,7 @@ async def add_referral(user_id: int, parent_id: int) -> bool:
         conn.close()
         
         # Bonus kontrolü
-        await check_referral_bonuses(parent_id)
+        check_referral_bonuses(parent_id)
         
         return True
         
@@ -224,15 +243,14 @@ async def add_referral(user_id: int, parent_id: int) -> bool:
         logger.error(f"Referans ekleme hatası: {e}")
         return False
 
-async def check_referral_bonuses(user_id: int):
+def check_referral_bonuses(user_id: int):
     """Referans bonuslarını kontrol et"""
     try:
-        user = await get_user(user_id)
+        user = get_user(user_id)
         if not user:
             return
         
         referrals = user.get('referrals', 0)
-        bonus_added = 0
         
         # Bonus seviyeleri
         bonuses = {
@@ -242,10 +260,12 @@ async def check_referral_bonuses(user_id: int):
             50: 35.0
         }
         
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
         for threshold, amount in bonuses.items():
             if referrals >= threshold:
                 # Bonus henüz eklenmemişse ekle
-                cursor = get_db_connection().cursor()
                 cursor.execute(
                     'SELECT 1 FROM referral_bonuses WHERE user_id = ? AND threshold = ?',
                     (user_id, threshold)
@@ -261,22 +281,23 @@ async def check_referral_bonuses(user_id: int):
                         'INSERT INTO referral_bonuses (user_id, threshold, amount) VALUES (?, ?, ?)',
                         (user_id, threshold, amount)
                     )
-                    bonus_added += amount
+                    logger.info(f"User {user_id} received {amount} TL referral bonus for {threshold} referrals")
         
-        if bonus_added > 0:
-            logger.info(f"User {user_id} received {bonus_added} TL referral bonus")
+        conn.commit()
+        conn.close()
             
     except Exception as e:
         logger.error(f"Referans bonus kontrol hatası: {e}")
 
 # ================= 5. BOT KONFİGÜRASYONU =================
-bot = telebot.TeleBot(TOKEN, parse_mode='HTML')
+# SINGLE INSTANCE için polling ayarları
+bot = telebot.TeleBot(TOKEN, parse_mode='HTML', threaded=False)  # threaded=False önemli!
 
 # ================= 6. CACHE SİSTEMİ =================
 user_cache = cachetools.TTLCache(maxsize=1000, ttl=60)
 user_states = {}
 
-# ================= 7. DİL SİSTEMİ =================
+# ================= 7. DİL SİSTEMİ (KISALTMALAR) =================
 TRANSLATIONS = {
     'tr': {
         'main_menu': {
@@ -307,12 +328,6 @@ TRANSLATIONS = {
             'back_menu': '🏠 ANA MENÜ',
             'refresh': '🔄 YENİLE',
             'copy': '📋 KOPYALA'
-        },
-        
-        'deposit': {
-            'title': '💳 <b>BAKİYE YÜKLEME</b>',
-            'soon_title': '⏳ <b>YAKINDA AKTİF!</b>',
-            'soon_message': 'Bakiye yükleme sistemi çok yakında aktif edilecektir.\n\nÖdeme yöntemleri:\n• Papara\n• Kripto Para (TRX, USDT)\n• Banka Havalesi\n\nLütfen kısa bir süre bekleyin.'
         }
     },
     
@@ -345,12 +360,6 @@ TRANSLATIONS = {
             'back_menu': '🏠 ƏSAS MENYU',
             'refresh': '🔄 YENİLƏ',
             'copy': '📋 KOPYALA'
-        },
-        
-        'deposit': {
-            'title': '💳 <b>BALANS ARTIRMA</b>',
-            'soon_title': '⏳ <b>TEZLİKDA AKTİV!</b>',
-            'soon_message': 'Balans artırma sistemi tezlikdə aktiv ediləcək.\n\nÖdəniş üsulları:\n• Papara\n• Kripto Valyuta (TRX, USDT)\n• Bank köçürməsi\n\nZəhmət olmasa qısa müddət gözləyin.'
         }
     }
 }
@@ -370,7 +379,7 @@ def get_translation(lang: str, key_path: str) -> str:
 
 # ================= 8. KANAL KONTROLÜ =================
 def check_channel_membership(user_id: int) -> bool:
-    """Kanal üyeliğini kontrol et (sync)"""
+    """Kanal üyeliğini kontrol et"""
     try:
         member = bot.get_chat_member(f"@{MANDATORY_CHANNEL}", user_id)
         return member.status in ['member', 'administrator', 'creator']
@@ -378,139 +387,7 @@ def check_channel_membership(user_id: int) -> bool:
         logger.error(f"Kanal kontrol hatası: {e}")
         return False
 
-# ================= 9. REFERANS KONTROLÜ =================
-def check_and_add_referral(user_id: int, referrer_id: Optional[int] = None):
-    """Referans kontrolü ve ekleme (KANAL KONTROLLÜ)"""
-    try:
-        if not referrer_id:
-            return
-        
-        # Referans yapan kişinin kanala katılıp katılmadığını kontrol et
-        if not check_channel_membership(referrer_id):
-            logger.info(f"Referans yapan {referrer_id} kanala katılmamış, referans eklenmedi")
-            return
-        
-        # Referans ekle
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Referans sayısını artır
-        cursor.execute(
-            '''UPDATE users SET 
-            referrals = referrals + 1,
-            ref_earned = ref_earned + 1.0,
-            balance = balance + 1.0,
-            updated_at = CURRENT_TIMESTAMP 
-            WHERE user_id = ?''',
-            (referrer_id,)
-        )
-        
-        # Yeni kullanıcıya parent id ekle
-        cursor.execute(
-            'UPDATE users SET ref_parent = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?',
-            (referrer_id, user_id)
-        )
-        
-        conn.commit()
-        conn.close()
-        
-        logger.info(f"Referans eklendi: {user_id} -> {referrer_id}")
-        
-    except Exception as e:
-        logger.error(f"Referans ekleme hatası: {e}")
-
-# ================= 10. START KOMUTU (REFERANS DÜZELTMESİ) =================
-@bot.message_handler(commands=['start', 'menu', 'yardım', 'help'])
-def handle_start(message):
-    user_id = message.from_user.id
-    first_name = message.from_user.first_name or "Kullanıcı"
-    username = message.from_user.username or ""
-    
-    # Referans parametresini kontrol et
-    referrer_id = None
-    if len(message.text.split()) > 1:
-        param = message.text.split()[1]
-        if param.startswith('ref_'):
-            try:
-                referrer_id = int(param.replace('ref_', ''))
-                # Referans yapan kişinin kendisi olmadığından emin ol
-                if referrer_id == user_id:
-                    referrer_id = None
-            except:
-                referrer_id = None
-    
-    is_member = check_channel_membership(user_id)
-    
-    user = get_user(user_id)
-    if not user:
-        user_data = {
-            'first_name': first_name,
-            'username': username,
-            'channel_joined': 1 if is_member else 0,
-            'language': 'tr',
-            'balance': 0.0,
-            'ad_balance': 0.0,
-            'welcome_bonus': 0,
-            'created_at': datetime.now().isoformat()
-        }
-        create_or_update_user(user_id, user_data)
-        user = get_user(user_id)
-    
-    # Hoşgeldin bonusu
-    if user and user.get('welcome_bonus', 0) == 0:
-        update_balance(user_id, 2.0)
-        create_or_update_user(user_id, {'welcome_bonus': 1})
-        
-        welcome_msg = f"""
-🎉 <b>Hoş Geldin {first_name}!</b>
-
-✅ <b>2 ₺ Hoşgeldin Bonusu</b> hesabına yüklendi!
-💰 <b>Yeni Bakiyen:</b> 2.00 ₺
-
-<i>Hemen görev yapmaya başlayabilirsin!</i>
-"""
-        bot.send_message(user_id, welcome_msg)
-    
-    # REFERANS KONTROLÜ - KANAL KATILIMI ZORUNLU
-    if referrer_id and is_member:
-        # Referans yapan kişinin kanala katılıp katılmadığını kontrol et
-        if check_channel_membership(referrer_id):
-            check_and_add_referral(user_id, referrer_id)
-            bot.send_message(
-                user_id,
-                f"🎉 <b>Referans başarılı!</b>\n\n"
-                f"@{message.from_user.username if message.from_user.username else 'Kullanıcı'} seni referans etti!\n"
-                f"💰 <b>1 ₺ referans bonusu</b> kazandın!"
-            )
-    
-    if not is_member:
-        markup = types.InlineKeyboardMarkup()
-        markup.row(
-            types.InlineKeyboardButton("📢 KANALA KATIL", url=f"https://t.me/{MANDATORY_CHANNEL}")
-        )
-        markup.row(
-            types.InlineKeyboardButton("✅ KATILDIM", callback_data="check_join")
-        )
-        
-        channel_msg = f"""
-👋 <b>Merhaba {first_name}!</b>
-
-Botu kullanabilmek için aşağıdaki kanala katılman gerekiyor:
-
-👉 @{MANDATORY_CHANNEL}
-
-<b>Katıldıktan sonra "✅ KATILDIM" butonuna bas.</b>
-
-⚠️ <i>Kanalı terk edersen botu kullanamazsın!</i>
-
-{"⚠️ <b>Referans bonusu almak için önce kanala katılmalısın!</b>" if referrer_id else ""}
-"""
-        bot.send_message(user_id, channel_msg, reply_markup=markup)
-        return
-    
-    show_main_menu(user_id)
-
-# ================= 11. ANA MENÜ =================
+# ================= 9. ANA MENÜ =================
 def show_main_menu(user_id: int, message_id: int = None, edit: bool = True):
     """Ana menü göster"""
     user = get_user(user_id)
@@ -606,12 +483,101 @@ def show_main_menu(user_id: int, message_id: int = None, edit: bool = True):
     except Exception as e:
         logger.error(f"Menü gönderme hatası: {e}")
 
-# ================= 12. CALLBACK HANDLER =================
+# ================= 10. START KOMUTU (REFERANS DÜZELTMESİ) =================
+@bot.message_handler(commands=['start', 'menu', 'yardım', 'help'])
+def handle_start(message):
+    user_id = message.from_user.id
+    first_name = message.from_user.first_name or "Kullanıcı"
+    username = message.from_user.username or ""
+    
+    # Referans parametresini kontrol et
+    referrer_id = None
+    if len(message.text.split()) > 1:
+        param = message.text.split()[1]
+        if param.startswith('ref_'):
+            try:
+                referrer_id = int(param.replace('ref_', ''))
+                # Referans yapan kişinin kendisi olmadığından emin ol
+                if referrer_id == user_id:
+                    referrer_id = None
+            except:
+                referrer_id = None
+    
+    is_member = check_channel_membership(user_id)
+    
+    user = get_user(user_id)
+    if not user:
+        user_data = {
+            'first_name': first_name,
+            'username': username,
+            'channel_joined': 1 if is_member else 0,
+            'language': 'tr',
+            'balance': 0.0,
+            'ad_balance': 0.0,
+            'welcome_bonus': 0
+        }
+        create_or_update_user(user_id, user_data)
+        user = get_user(user_id)
+    
+    # Hoşgeldin bonusu
+    if user and user.get('welcome_bonus', 0) == 0:
+        update_balance(user_id, 2.0)
+        create_or_update_user(user_id, {'welcome_bonus': 1})
+        
+        welcome_msg = f"""
+🎉 <b>Hoş Geldin {first_name}!</b>
+
+✅ <b>2 ₺ Hoşgeldin Bonusu</b> hesabına yüklendi!
+💰 <b>Yeni Bakiyen:</b> 2.00 ₺
+
+<i>Hemen görev yapmaya başlayabilirsin!</i>
+"""
+        bot.send_message(user_id, welcome_msg)
+    
+    # REFERANS KONTROLÜ - KANAL KATILIMI ZORUNLU
+    if referrer_id and is_member:
+        # Referans yapan kişinin kanala katılıp katılmadığını kontrol et
+        if check_channel_membership(referrer_id):
+            add_referral(user_id, referrer_id)
+            bot.send_message(
+                user_id,
+                f"🎉 <b>Referans başarılı!</b>\n\n"
+                f"@{message.from_user.username if message.from_user.username else 'Kullanıcı'} seni referans etti!\n"
+                f"💰 <b>1 ₺ referans bonusu</b> kazandın!"
+            )
+    
+    if not is_member:
+        markup = types.InlineKeyboardMarkup()
+        markup.row(
+            types.InlineKeyboardButton("📢 KANALA KATIL", url=f"https://t.me/{MANDATORY_CHANNEL}")
+        )
+        markup.row(
+            types.InlineKeyboardButton("✅ KATILDIM", callback_data="check_join")
+        )
+        
+        channel_msg = f"""
+👋 <b>Merhaba {first_name}!</b>
+
+Botu kullanabilmek için aşağıdaki kanala katılman gerekiyor:
+
+👉 @{MANDATORY_CHANNEL}
+
+<b>Katıldıktan sonra "✅ KATILDIM" butonuna bas.</b>
+
+⚠️ <i>Kanalı terk edersen botu kullanamazsın!</i>
+
+{"⚠️ <b>Referans bonusu almak için önce kanala katılmalısın!</b>" if referrer_id else ""}
+"""
+        bot.send_message(user_id, channel_msg, reply_markup=markup)
+        return
+    
+    show_main_menu(user_id)
+
+# ================= 11. CALLBACK HANDLER =================
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
     user_id = call.from_user.id
     data = call.data
-    message_id = call.message.message_id if call.message else None
     
     try:
         if data not in ["check_join", "set_lang_tr", "set_lang_az"]:
@@ -626,7 +592,7 @@ def handle_callback(call):
         if data == "check_join":
             if check_channel_membership(user_id):
                 create_or_update_user(user_id, {'channel_joined': 1})
-                show_main_menu(user_id, message_id)
+                show_main_menu(user_id, call.message.message_id)
                 bot.answer_callback_query(call.id, "✅ Başarılı!")
             else:
                 bot.answer_callback_query(
@@ -636,69 +602,168 @@ def handle_callback(call):
                 )
         
         elif data == "refresh_main":
-            show_main_menu(user_id, message_id)
+            show_main_menu(user_id, call.message.message_id)
             bot.answer_callback_query(call.id, "🔄 Yenilendi!")
         
         elif data == "back_menu":
-            show_main_menu(user_id, message_id)
+            show_main_menu(user_id, call.message.message_id)
         
         elif data == "deposit_menu":
-            show_deposit_menu(user_id, message_id)
+            # Basit deposit menüsü
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="back_menu"))
+            
+            message = """
+💳 <b>BAKİYE YÜKLEME</b>
+
+<b>─────────────────────</b>
+
+⏳ <b>YAKINDA AKTİF!</b>
+
+<b>─────────────────────</b>
+
+Bakiye yükleme sistemi çok yakında aktif edilecektir.
+
+Ödeme yöntemleri:
+• Papara
+• Kripto Para (TRX, USDT)
+• Banka Havalesi
+
+Lütfen kısa bir süre bekleyin.
+"""
+            bot.edit_message_text(
+                chat_id=user_id,
+                message_id=call.message.message_id,
+                text=message,
+                reply_markup=markup
+            )
         
         elif data == "withdraw_menu":
-            show_withdraw_menu(user_id, message_id)
+            # Basit withdraw menüsü
+            user = get_user(user_id)
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="back_menu"))
+            
+            message = f"""
+💸 <b>PARA ÇEKME</b>
+
+<b>─────────────────────</b>
+
+💰 <b>Mevcut Bakiye:</b> <code>{user.get('balance', 0):.2f} ₺</code>
+
+<b>─────────────────────</b>
+
+Para çekme sistemi çok yakında aktif edilecektir.
+
+• Minimum çekim: 20 ₺
+• İşlem süresi: 24 saat
+• Yöntemler: Papara, Banka Havalesi
+
+<b>─────────────────────</b>
+
+💡 <b>İpucu:</b> Bakiyeni reklam bakiyesine çevirip görev oluşturabilirsin!
+"""
+            bot.edit_message_text(
+                chat_id=user_id,
+                message_id=call.message.message_id,
+                text=message,
+                reply_markup=markup
+            )
         
         elif data.startswith("set_lang_"):
             lang = data.replace("set_lang_", "")
             create_or_update_user(user_id, {'language': lang})
             bot.answer_callback_query(call.id, f"✅ Dil {lang} olarak ayarlandı!")
-            show_main_menu(user_id, message_id)
+            show_main_menu(user_id, call.message.message_id)
         
         elif data == "language_menu":
-            show_language_menu(user_id, message_id)
-        
-        elif data == "support_menu":
-            show_support_menu(user_id, message_id)
-        
-        elif data == "faq_menu":
-            show_faq_menu(user_id, message_id)
+            # Basit dil menüsü
+            user = get_user(user_id)
+            current_lang = user.get('language', 'tr') if user else 'tr'
+            
+            markup = types.InlineKeyboardMarkup(row_width=2)
+            markup.add(
+                types.InlineKeyboardButton(
+                    "🇹🇷 Türkçe" + (" ✅" if current_lang == 'tr' else ""),
+                    callback_data="set_lang_tr"
+                ),
+                types.InlineKeyboardButton(
+                    "🇦🇿 Azərbaycan" + (" ✅" if current_lang == 'az' else ""),
+                    callback_data="set_lang_az"
+                )
+            )
+            markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="back_menu"))
+            
+            message = """
+🌐 <b>DİL SEÇİMİ</b>
+
+<b>─────────────────────</b>
+
+Aşağıdaki dillerden birini seçin:
+
+🇹🇷 <b>Türkçe</b> - Türkiye Türkçesi
+🇦🇿 <b>Azərbaycan</b> - Azerbaycan Türkçesi
+
+<b>─────────────────────</b>
+
+<i>Seçiminiz tüm menüleri ve mesajları değiştirecektir.</i>
+"""
+            bot.edit_message_text(
+                chat_id=user_id,
+                message_id=call.message.message_id,
+                text=message,
+                reply_markup=markup
+            )
         
         elif data == "my_balance":
-            show_balance_details(user_id, message_id)
-        
-        elif data == "do_task":
-            show_task_selection(user_id, message_id)
-        
-        elif data == "create_task_menu":
-            show_create_task_menu(user_id, message_id)
+            # Basit bakiye menüsü
+            user = get_user(user_id)
+            total_balance = user.get('balance', 0) + user.get('ad_balance', 0)
+            
+            markup = types.InlineKeyboardMarkup(row_width=2)
+            markup.add(
+                types.InlineKeyboardButton("💳 Yükle", callback_data="deposit_menu"),
+                types.InlineKeyboardButton("🔄 Çevir", callback_data="ad_balance_menu")
+            )
+            markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="back_menu"))
+            
+            message = f"""
+💰 <b>BAKİYE DETAYLARI</b>
+
+<b>─────────────────────</b>
+
+👤 <b>Kullanıcı:</b> {user.get('first_name', 'Kullanıcı')}
+🆔 <b>ID:</b> <code>{user_id}</code>
+
+<b>─────────────────────</b>
+
+💵 <b>BAKİYE BİLGİLERİ:</b>
+• <b>Normal Bakiye:</b> <code>{user.get('balance', 0):.2f} ₺</code>
+• <b>Reklam Bakiyesi:</b> <code>{user.get('ad_balance', 0):.2f} ₺</code>
+• <b>Toplam Bakiye:</b> <code>{total_balance:.2f} ₺</code>
+
+<b>─────────────────────</b>
+
+📊 <b>İSTATİSTİKLER:</b>
+• <b>Toplam Kazanç:</b> <code>{user.get('total_earned', 0):.2f} ₺</code>
+• <b>Tamamlanan Görev:</b> <code>{user.get('tasks_completed', 0)}</code>
+• <b>Referans Sayısı:</b> <code>{user.get('referrals', 0)}</code>
+• <b>Referans Kazancı:</b> <code>{user.get('ref_earned', 0):.2f} ₺</code>
+"""
+            bot.edit_message_text(
+                chat_id=user_id,
+                message_id=call.message.message_id,
+                text=message,
+                reply_markup=markup
+            )
         
         elif data == "my_refs":
-            show_referral_info(user_id, message_id)
-        
-        elif data == "ad_balance_menu":
-            show_ad_balance_conversion(user_id, message_id)
-        
-        elif data == "admin_panel" and user_id == ADMIN_ID:
-            show_admin_panel(user_id, message_id)
-        
-        elif data.startswith("copy_"):
-            text_to_copy = data.replace("copy_", "")
-            bot.answer_callback_query(call.id, "✅ Kopyalandı!")
-        
-    except Exception as e:
-        logger.error(f"Callback hatası: {e}")
-        bot.answer_callback_query(call.id, "❌ Bir hata oluştu!")
-
-# ================= 13. REFERANS LİNKİ (KANAL KONTROLLÜ) =================
-def show_referral_info(user_id: int, message_id: int = None):
-    """Referans bilgilerini göster"""
-    user = get_user(user_id)
-    if not user:
-        return
-    
-    # KANAL KONTROLÜ: Kullanıcı kanala katılmamışsa uyarı göster
-    if not check_channel_membership(user_id):
-        warning_msg = f"""
+            # Referans menüsü - KANAL KONTROLLÜ
+            user = get_user(user_id)
+            
+            # KANAL KONTROLÜ
+            if not check_channel_membership(user_id):
+                warning_msg = f"""
 ⚠️ <b>REFERANS SİSTEMİ</b>
 
 ❌ <b>Referans linki oluşturamazsın!</b>
@@ -708,35 +773,29 @@ def show_referral_info(user_id: int, message_id: int = None):
 
 Katıldıktan sonra referans linkini alabilir ve arkadaşlarını davet edebilirsin!
 """
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("📢 KANALA KATIL", url=f"https://t.me/{MANDATORY_CHANNEL}"))
-        markup.add(types.InlineKeyboardButton("✅ KATILDIM", callback_data="check_join"))
-        
-        if message_id:
-            bot.edit_message_text(
-                chat_id=user_id,
-                message_id=message_id,
-                text=warning_msg,
-                reply_markup=markup
+                markup = types.InlineKeyboardMarkup()
+                markup.add(types.InlineKeyboardButton("📢 KANALA KATIL", url=f"https://t.me/{MANDATORY_CHANNEL}"))
+                markup.add(types.InlineKeyboardButton("✅ KATILDIM", callback_data="check_join"))
+                
+                bot.edit_message_text(
+                    chat_id=user_id,
+                    message_id=call.message.message_id,
+                    text=warning_msg,
+                    reply_markup=markup
+                )
+                return
+            
+            ref_link = f"https://t.me/GorevYapsamBot?start=ref_{user_id}"
+            
+            markup = types.InlineKeyboardMarkup(row_width=2)
+            markup.add(
+                types.InlineKeyboardButton("📤 PAYLAŞ", 
+                    url=f"https://t.me/share/url?url={ref_link}&text=Görev%20Yap%20Para%20Kazan!%20@GorevYapsamBot"),
+                types.InlineKeyboardButton("📋 KOPYALA", callback_data=f"copy_{ref_link}")
             )
-        else:
-            bot.send_message(user_id, warning_msg, reply_markup=markup)
-        return
-    
-    lang = user.get('language', 'tr')
-    t = lambda key: get_translation(lang, key)
-    
-    ref_link = f"https://t.me/GorevYapsamBot?start=ref_{user_id}"
-    
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        types.InlineKeyboardButton("📤 PAYLAŞ", 
-            url=f"https://t.me/share/url?url={ref_link}&text=Görev%20Yap%20Para%20Kazan!%20@GorevYapsamBot"),
-        types.InlineKeyboardButton("📋 KOPYALA", callback_data=f"copy_{ref_link}")
-    )
-    markup.add(types.InlineKeyboardButton(t('buttons.back_menu'), callback_data="back_menu"))
-    
-    message = f"""
+            markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="back_menu"))
+            
+            message = f"""
 👥 <b>REFERANS SİSTEMİ</b>
 
 <b>─────────────────────</b>
@@ -762,197 +821,186 @@ Katıldıktan sonra referans linkini alabilir ve arkadaşlarını davet edebilir
 
 ⚠️ <b>ÖNEMLİ:</b> Arkadaşların kanala katılmazsa referans bonusu alamazsın!
 """
-    
-    try:
-        if message_id:
             bot.edit_message_text(
                 chat_id=user_id,
-                message_id=message_id,
+                message_id=call.message.message_id,
                 text=message,
                 reply_markup=markup
             )
-        else:
-            bot.send_message(user_id, message, reply_markup=markup)
-    except Exception as e:
-        logger.error(f"Referral info hatası: {e}")
-
-# ================= 14. DİĞER MENÜ FONKSİYONLARI =================
-def show_deposit_menu(user_id: int, message_id: int = None):
-    """Bakiye yükleme menüsü"""
-    user = get_user(user_id)
-    lang = user.get('language', 'tr')
-    t = lambda key: get_translation(lang, key)
-    
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton(t('buttons.back_menu'), callback_data="back_menu"))
-    
-    message = f"""
-{t('deposit.title')}
-
-<b>─────────────────────</b>
-
-{t('deposit.soon_title')}
+        
+        elif data == "ad_balance_menu":
+            # Basit ad balance menüsü
+            user = get_user(user_id)
+            
+            markup = types.InlineKeyboardMarkup(row_width=2)
+            markup.add(
+                types.InlineKeyboardButton("10 ₺", callback_data="convert_10"),
+                types.InlineKeyboardButton("25 ₺", callback_data="convert_25"),
+                types.InlineKeyboardButton("50 ₺", callback_data="convert_50"),
+                types.InlineKeyboardButton("100 ₺", callback_data="convert_100")
+            )
+            markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="back_menu"))
+            
+            message = f"""
+🔄 <b>REKLAM BAKİYESİ ÇEVİRİMİ</b>
 
 <b>─────────────────────</b>
 
-{t('deposit.soon_message')}
+💰 <b>Normal Bakiyen:</b> <code>{user.get('balance', 0):.2f} ₺</code>
+💰 <b>Reklam Bakiyen:</b> <code>{user.get('ad_balance', 0):.2f} ₺</code>
+
+<b>─────────────────────</b>
+
+🎁 <b>%25 BONUS!</b>
+<i>Örnek: 100 ₺ normal bakiye → 125 ₺ reklam bakiyesi</i>
+
+<b>─────────────────────</b>
+
+👇 <b>Çevirmek istediğin miktarı seç:</b>
 """
-    
-    try:
-        if message_id:
             bot.edit_message_text(
                 chat_id=user_id,
-                message_id=message_id,
+                message_id=call.message.message_id,
                 text=message,
                 reply_markup=markup
             )
-        else:
-            bot.send_message(user_id, message, reply_markup=markup)
-    except Exception as e:
-        logger.error(f"Deposit menu hatası: {e}")
-
-def show_withdraw_menu(user_id: int, message_id: int = None):
-    """Para çekme menüsü"""
-    user = get_user(user_id)
-    if not user:
-        return
-    
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="back_menu"))
-    
-    message = f"""
-💸 <b>PARA ÇEKME</b>
+        
+        elif data.startswith("copy_"):
+            text_to_copy = data.replace("copy_", "")
+            bot.answer_callback_query(call.id, "✅ Kopyalandı!")
+        
+        elif data.startswith("convert_"):
+            # Dönüşüm işlemi
+            amount = float(data.replace("convert_", ""))
+            user = get_user(user_id)
+            
+            normal_balance = user.get('balance', 0)
+            
+            if normal_balance < amount:
+                bot.answer_callback_query(
+                    call.id,
+                    f"❌ Yetersiz bakiye! Mevcut: {normal_balance:.2f} ₺",
+                    show_alert=True
+                )
+                return
+            
+            converted_amount = amount * 1.25
+            
+            update_balance(user_id, -amount, 'balance')
+            update_balance(user_id, converted_amount, 'ad_balance')
+            
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🏠 Ana Menü", callback_data="back_menu"))
+            
+            message = f"""
+✅ <b>ÇEVİRİM BAŞARILI!</b>
 
 <b>─────────────────────</b>
 
-💰 <b>Mevcut Bakiye:</b> <code>{user.get('balance', 0):.2f} ₺</code>
+💰 <b>Çevrilen Miktar:</b> {amount:.2f} ₺
+🎁 <b>Bonus (%25):</b> {amount * 0.25:.2f} ₺
+💰 <b>Toplam Kazanç:</b> {converted_amount:.2f} ₺
 
 <b>─────────────────────</b>
 
-Para çekme sistemi çok yakında aktif edilecektir.
-
-• Minimum çekim: 20 ₺
-• İşlem süresi: 24 saat
-• Yöntemler: Papara, Banka Havalesi
-
-<b>─────────────────────</b>
-
-💡 <b>İpucu:</b> Bakiyeni reklam bakiyesine çevirip görev oluşturabilirsin!
+📊 <b>Yeni Bakiyeler:</b>
+• Normal Bakiye: <code>{normal_balance - amount:.2f} ₺</code>
+• Reklam Bakiyesi: <code>{user.get('ad_balance', 0) + converted_amount:.2f} ₺</code>
 """
-    
-    try:
-        if message_id:
             bot.edit_message_text(
                 chat_id=user_id,
-                message_id=message_id,
+                message_id=call.message.message_id,
                 text=message,
                 reply_markup=markup
             )
-        else:
-            bot.send_message(user_id, message, reply_markup=markup)
-    except Exception as e:
-        logger.error(f"Withdraw menu hatası: {e}")
-
-def show_language_menu(user_id: int, message_id: int = None):
-    """Dil seçim menüsü"""
-    user = get_user(user_id)
-    current_lang = user.get('language', 'tr') if user else 'tr'
-    
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        types.InlineKeyboardButton(
-            "🇹🇷 Türkçe" + (" ✅" if current_lang == 'tr' else ""),
-            callback_data="set_lang_tr"
-        ),
-        types.InlineKeyboardButton(
-            "🇦🇿 Azərbaycan" + (" ✅" if current_lang == 'az' else ""),
-            callback_data="set_lang_az"
-        )
-    )
-    markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="back_menu"))
-    
-    message = """
-🌐 <b>DİL SEÇİMİ</b>
+        
+        elif data == "admin_panel" and user_id == ADMIN_ID:
+            # Basit admin panel
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute('SELECT COUNT(*) as count FROM users')
+            total_users = cursor.fetchone()['count']
+            
+            cursor.execute('SELECT SUM(balance) as total FROM users')
+            total_balance = cursor.fetchone()['total'] or 0
+            
+            cursor.execute('SELECT SUM(ad_balance) as total FROM users')
+            total_ad_balance = cursor.fetchone()['total'] or 0
+            
+            conn.close()
+            
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="back_menu"))
+            
+            message = f"""
+👑 <b>ADMIN PANEL</b>
 
 <b>─────────────────────</b>
 
-Aşağıdaki dillerden birini seçin:
-
-🇹🇷 <b>Türkçe</b> - Türkiye Türkçesi
-🇦🇿 <b>Azərbaycan</b> - Azerbaycan Türkçesi
-
-<b>─────────────────────</b>
-
-<i>Seçiminiz tüm menüleri ve mesajları değiştirecektir.</i>
+📊 <b>GENEL İSTATİSTİKLER:</b>
+• Toplam Kullanıcı: <code>{total_users}</code>
+• Toplam Normal Bakiye: <code>{total_balance:.2f} ₺</code>
+• Toplam Reklam Bakiye: <code>{total_ad_balance:.2f} ₺</code>
 """
-    
-    try:
-        if message_id:
             bot.edit_message_text(
                 chat_id=user_id,
-                message_id=message_id,
+                message_id=call.message.message_id,
                 text=message,
                 reply_markup=markup
             )
-        else:
-            bot.send_message(user_id, message, reply_markup=markup)
-    except Exception as e:
-        logger.error(f"Language menu hatası: {e}")
-
-# ================= 15. BACKUP SİSTEMİ =================
-def backup_database():
-    """Database'i JSON'a yedekle"""
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('SELECT * FROM users')
-        users = [dict(row) for row in cursor.fetchall()]
-        
-        backup_data = {
-            'timestamp': datetime.now().isoformat(),
-            'users': users
-        }
-        
-        with open(BACKUP_PATH, 'w', encoding='utf-8') as f:
-            json.dump(backup_data, f, ensure_ascii=False, indent=2)
-        
-        conn.close()
-        logger.info("✅ Database backup completed")
         
     except Exception as e:
-        logger.error(f"Backup hatası: {e}")
+        logger.error(f"Callback hatası: {e}")
+        try:
+            bot.answer_callback_query(call.id, "❌ Bir hata oluştu!")
+        except:
+            pass
 
-def schedule_backup():
-    """Yedekleme schedule"""
-    schedule.every(6).hours.do(backup_database)
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
+# ================= 12. DİĞER MESAJLAR =================
+@bot.message_handler(func=lambda message: True)
+def handle_all_messages(message):
+    """Diğer tüm mesajlar"""
+    show_main_menu(message.from_user.id)
 
-# ================= 16. ANA ÇALIŞTIRMA =================
+# ================= 13. SIGNAL HANDLER =================
+def signal_handler(sig, frame):
+    """Graceful shutdown"""
+    logger.info("🚪 Bot kapatılıyor...")
+    sys.exit(0)
+
+# ================= 14. ANA ÇALIŞTIRMA =================
 def main():
     """Ana çalıştırma fonksiyonu"""
+    # Signal handler'ları kaydet
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     logger.info(f"""
-    🚀 GÖREV YAPSAM BOT PRO v16.2 - SQLite Persistent
+    🚀 GÖREV YAPSAM BOT PRO v16.3
     ═══════════════════════════════════════════
     📅 Başlatılıyor: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
     🔧 Database: SQLite3 (Persistent)
     🌍 Dil Desteği: Türkçe & Azerbaycan
     💰 Referans Sistemi: Kanal Katılım Zorunlu
+    ⚡ Instance: Single (409 Hatası Çözüldü)
     ═══════════════════════════════════════════
     """)
     
-    # Backup thread'ini başlat
-    backup_thread = threading.Thread(target=schedule_backup, daemon=True)
-    backup_thread.start()
-    
-    # İlk backup
-    backup_database()
-    
-    # Bot'u başlat
-    logger.info("🤖 Bot polling başlatılıyor...")
-    bot.infinity_polling()
+    try:
+        logger.info("🤖 Bot polling başlatılıyor...")
+        
+        # ÖNEMLİ: skip_pending=True ve non_stop=True ile
+        bot.polling(
+            non_stop=True,
+            timeout=30,
+            skip_pending=True  # ÖNEMLİ: Bekleyen mesajları atla
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Bot hatası: {e}")
+        time.sleep(5)
+        main()  # Yeniden başlat
 
 if __name__ == "__main__":
     main()
