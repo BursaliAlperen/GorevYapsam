@@ -1,10 +1,10 @@
 """
-🚀 GÖREV YAPSAM BOT - ULTRA SIMPLE
+🚀 GÖREV YAPSAM BOT - TAM VERSİYON
 Telegram: @GorevYapsamBot
 Developer: Alperen
-Database: Memory (Geçici) - Sonra SQLite ekleriz
-Dil: Türkçe
 Kanal: @GY_Refim
+Tarih: 2026-01-07
+Versiyon: 1.0.0
 """
 
 import os
@@ -14,258 +14,442 @@ from datetime import datetime
 import telebot
 from telebot import types
 from dotenv import load_dotenv
-import signal
-import sys
 
-# ================= 1. SETUP =================
+# ================= 1. AYARLAR =================
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7904032877"))
 MANDATORY_CHANNEL = os.getenv("MANDATORY_CHANNEL", "GY_Refim")
 
-print(f"🤖 Bot başlatılıyor... {datetime.now()}")
+print("=" * 50)
+print("🤖 GÖREV YAPSAM BOT BAŞLATILIYOR")
+print(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print(f"👑 Admin ID: {ADMIN_ID}")
+print(f"📢 Zorunlu Kanal: @{MANDATORY_CHANNEL}")
+print("=" * 50)
 
-# ================= 2. BASİT DATABASE (JSON) =================
-users_file = "users.json"
+# ================= 2. VERİTABANI (JSON) =================
+DB_FILE = "users_data.json"
 
-def load_users():
-    """Kullanıcıları yükle"""
+def load_database():
+    """Veritabanını yükle"""
     try:
-        if os.path.exists(users_file):
-            with open(users_file, 'r', encoding='utf-8') as f:
+        if os.path.exists(DB_FILE):
+            with open(DB_FILE, 'r', encoding='utf-8') as f:
                 return json.load(f)
     except:
         pass
     return {}
 
-def save_users(users_data):
-    """Kullanıcıları kaydet"""
+def save_database(data):
+    """Veritabanını kaydet"""
     try:
-        with open(users_file, 'w', encoding='utf-8') as f:
-            json.dump(users_data, f, ensure_ascii=False, indent=2)
-    except:
-        pass
+        with open(DB_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"💾 Kaydetme hatası: {e}")
 
-users = load_users()
+# Veritabanını yükle
+users_db = load_database()
 
-# ================= 3. BOT INIT =================
+# ================= 3. BOT OLUŞTURMA =================
 bot = telebot.TeleBot(TOKEN, parse_mode='HTML')
 
-# ================= 4. KANAL KONTROLÜ =================
-def check_channel(user_id):
-    """Kanal üyeliğini kontrol et"""
+# ================= 4. KANAL KONTROL FONKSİYONU =================
+def check_channel_membership(user_id):
+    """Kullanıcının kanalda olup olmadığını kontrol et"""
     try:
         chat = bot.get_chat(f"@{MANDATORY_CHANNEL}")
         member = bot.get_chat_member(chat.id, user_id)
         return member.status in ['member', 'administrator', 'creator']
-    except:
+    except Exception as e:
+        print(f"📢 Kanal kontrol hatası: {e}")
         return False
 
-# ================= 5. START HANDLER =================
-@bot.message_handler(commands=['start', 'menu'])
+# ================= 5. REFERANS SİSTEMİ =================
+def add_referral(new_user_id, referrer_id):
+    """Referans ekle (KANAL KONTROLLÜ)"""
+    try:
+        new_user_id = str(new_user_id)
+        referrer_id = str(referrer_id)
+        
+        # 1. Referans yapan kanalda mı?
+        if referrer_id not in users_db:
+            print(f"⚠️ Referans yapan ({referrer_id}) kayıtlı değil")
+            return False
+        
+        referrer_data = users_db[referrer_id]
+        if not referrer_data.get('channel_joined', False):
+            print(f"⚠️ Referans yapan ({referrer_id}) kanalda değil")
+            return False
+        
+        # 2. Referans ekle
+        referrer_data['referrals'] = referrer_data.get('referrals', 0) + 1
+        referrer_data['ref_earned'] = referrer_data.get('ref_earned', 0) + 1.0
+        referrer_data['balance'] = referrer_data.get('balance', 0) + 1.0
+        
+        # 3. Yeni kullanıcıya referans bilgisi ekle
+        if new_user_id in users_db:
+            users_db[new_user_id]['ref_by'] = referrer_id
+        
+        # 4. Bonus kontrolü
+        check_referral_bonus(referrer_id)
+        
+        save_database(users_db)
+        print(f"✅ Referans eklendi: {new_user_id} -> {referrer_id}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Referans ekleme hatası: {e}")
+        return False
+
+def check_referral_bonus(user_id):
+    """Referans bonuslarını kontrol et"""
+    try:
+        user_id = str(user_id)
+        if user_id not in users_db:
+            return
+        
+        user = users_db[user_id]
+        ref_count = user.get('referrals', 0)
+        bonuses_given = user.get('bonuses_given', [])
+        
+        # Bonus seviyeleri
+        bonus_levels = {
+            5: 2.0,
+            10: 5.0,
+            25: 15.0,
+            50: 35.0
+        }
+        
+        total_bonus = 0
+        for level, amount in bonus_levels.items():
+            if ref_count >= level and level not in bonuses_given:
+                user['balance'] = user.get('balance', 0) + amount
+                bonuses_given.append(level)
+                total_bonus += amount
+                print(f"🎁 Bonus verildi: {user_id} - {level} referans için {amount}₺")
+        
+        if total_bonus > 0:
+            user['bonuses_given'] = bonuses_given
+            save_database(users_db)
+            return total_bonus
+        
+        return 0
+        
+    except Exception as e:
+        print(f"❌ Bonus kontrol hatası: {e}")
+        return 0
+
+# ================= 6. START KOMUTU =================
+@bot.message_handler(commands=['start', 'menu', 'basla'])
 def handle_start(message):
     user_id = str(message.from_user.id)
-    name = message.from_user.first_name or "Kullanıcı"
+    first_name = message.from_user.first_name or "Kullanıcı"
+    username = message.from_user.username or ""
+    
+    print(f"🆕 Yeni kullanıcı: {user_id} - {first_name}")
     
     # Kanal kontrolü
-    in_channel = check_channel(message.from_user.id)
+    in_channel = check_channel_membership(message.from_user.id)
     
-    # Referans kontrolü
-    referrer = None
+    # Referans parametresi
+    referrer_id = None
     if len(message.text.split()) > 1:
-        ref = message.text.split()[1]
-        if ref.startswith('ref_'):
-            referrer = ref.replace('ref_', '')
+        param = message.text.split()[1]
+        if param.startswith('ref_'):
+            try:
+                referrer_id = param.replace('ref_', '')
+                # Kendi kendine referans olmasın
+                if referrer_id == user_id:
+                    referrer_id = None
+            except:
+                referrer_id = None
     
-    # Kullanıcıyı kaydet
-    if user_id not in users:
-        users[user_id] = {
-            'name': name,
-            'username': message.from_user.username or '',
+    # Kullanıcı verilerini oluştur
+    if user_id not in users_db:
+        users_db[user_id] = {
+            'first_name': first_name,
+            'username': username,
             'balance': 0.0,
             'ad_balance': 0.0,
-            'tasks': 0,
-            'refs': 0,
+            'tasks_completed': 0,
+            'referrals': 0,
             'ref_earned': 0.0,
-            'in_channel': in_channel,
+            'total_earned': 0.0,
+            'channel_joined': in_channel,
             'welcome_bonus': False,
-            'ref_parent': referrer if referrer and referrer != user_id else None
+            'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'bonuses_given': [],
+            'ref_by': referrer_id if referrer_id else None
         }
-        save_users(users)
+        
+        # Hoşgeldin bonusu
+        users_db[user_id]['balance'] += 2.0
+        users_db[user_id]['welcome_bonus'] = True
+        users_db[user_id]['total_earned'] += 2.0
+        
+        save_database(users_db)
+        
+        bot.send_message(
+            user_id,
+            f"""🎉 <b>Hoş Geldin {first_name}!</b>
+
+✅ <b>2 ₺ Hoşgeldin Bonusu</b> hesabına yüklendi!
+💰 <b>Yeni Bakiyen:</b> 2.00 ₺
+
+<i>Hemen görev yapmaya başlayabilirsin!</i>"""
+        )
     
-    user = users[user_id]
-    
-    # Hoşgeldin bonusu
-    if not user.get('welcome_bonus', False):
-        user['balance'] += 2.0
-        user['welcome_bonus'] = True
-        bot.send_message(user_id, f"🎉 Hoşgeldin {name}!\n✅ 2₺ bonus yüklendi!\n💰 Yeni bakiyen: {user['balance']}₺")
-        save_users(users)
+    user_data = users_db[user_id]
     
     # REFERANS SİSTEMİ - KANAL KONTROLLÜ
-    if referrer and referrer != user_id and in_channel:
-        # Referans yapan kanalda mı?
-        if referrer in users and users[referrer].get('in_channel', False):
-            # Referans bonusu ver
-            users[referrer]['refs'] += 1
-            users[referrer]['ref_earned'] += 1.0
-            users[referrer]['balance'] += 1.0
-            user['ref_parent'] = referrer
-            
-            bot.send_message(user_id, "🎉 Referans başarılı! 1₺ bonus kazandın!")
-            save_users(users)
+    if referrer_id and in_channel:
+        # Referans yapan kişi kanalda mı?
+        if referrer_id in users_db and users_db[referrer_id].get('channel_joined', False):
+            if add_referral(user_id, referrer_id):
+                bot.send_message(
+                    user_id,
+                    f"""🎉 <b>Referans başarılı!</b>
+
+👤 @{username if username else 'Kullanıcı'} seni referans etti!
+💰 <b>1 ₺ referans bonusu</b> kazandın!
+
+Artık sen de arkadaşlarını davet ederek para kazanabilirsin!"""
+                )
     
-    # Kanal katılımı kontrolü
+    # KANAL KONTROLÜ
     if not in_channel:
         markup = types.InlineKeyboardMarkup()
         markup.row(
             types.InlineKeyboardButton("📢 KANALA KATIL", url=f"https://t.me/{MANDATORY_CHANNEL}")
         )
         markup.row(
-            types.InlineKeyboardButton("✅ KATILDIM", callback_data="joined")
+            types.InlineKeyboardButton("✅ KATILDIM", callback_data="check_join")
         )
         
-        msg = f"""👋 Merhaba {name}!
+        bot.send_message(
+            user_id,
+            f"""👋 <b>Merhaba {first_name}!</b>
 
-⚠️ Botu kullanmak için kanala katılmalısın:
+Botu kullanabilmek için aşağıdaki kanala katılman gerekiyor:
+
 👉 @{MANDATORY_CHANNEL}
 
-Katıldıktan sonra "✅ KATILDIM" butonuna bas.
+<b>Katıldıktan sonra "✅ KATILDIM" butonuna bas.</b>
 
-{"⚠️ Referans bonusu için önce kanala katıl!" if referrer else ""}
-"""
-        bot.send_message(user_id, msg, reply_markup=markup)
+⚠️ <i>Kanalı terk edersen botu kullanamazsın!</i>
+
+{"⚠️ <b>Referans bonusu almak için önce kanala katılmalısın!</b>" if referrer_id else ""}""",
+            reply_markup=markup
+        )
         return
     
-    # Ana menüyü göster
-    show_menu(user_id)
+    # ANA MENÜ
+    show_main_menu(user_id, user_data)
 
-# ================= 6. ANA MENÜ =================
-def show_menu(user_id, edit_msg_id=None):
+# ================= 7. ANA MENÜ =================
+def show_main_menu(user_id, user_data=None, edit_msg_id=None):
+    """Ana menüyü göster"""
     user_id = str(user_id)
-    user = users.get(user_id, {})
     
-    total = user.get('balance', 0) + user.get('ad_balance', 0)
+    if user_data is None:
+        user_data = users_db.get(user_id, {})
+    
+    first_name = user_data.get('first_name', 'Kullanıcı')
+    balance = user_data.get('balance', 0.0)
+    ad_balance = user_data.get('ad_balance', 0.0)
+    total_balance = balance + ad_balance
+    tasks = user_data.get('tasks_completed', 0)
+    refs = user_data.get('referrals', 0)
     
     markup = types.InlineKeyboardMarkup(row_width=2)
+    
+    # Satır 1
     markup.add(
-        types.InlineKeyboardButton("🤖 GÖREV YAP", callback_data="tasks"),
-        types.InlineKeyboardButton("💰 BAKİYEM", callback_data="balance")
-    )
-    markup.add(
-        types.InlineKeyboardButton("👥 REFERANSLAR", callback_data="refs"),
-        types.InlineKeyboardButton("🔄 ÇEVİR", callback_data="convert")
-    )
-    markup.add(
-        types.InlineKeyboardButton("💳 YÜKLE", callback_data="deposit"),
-        types.InlineKeyboardButton("💸 ÇEK", callback_data="withdraw")
-    )
-    markup.add(
-        types.InlineKeyboardButton("🛠 DESTEK", callback_data="help"),
-        types.InlineKeyboardButton("🔄 YENİLE", callback_data="refresh")
+        types.InlineKeyboardButton("🤖 GÖREV YAP", callback_data="do_task"),
+        types.InlineKeyboardButton("📢 GÖREV OLUŞTUR", callback_data="create_task")
     )
     
+    # Satır 2
+    markup.add(
+        types.InlineKeyboardButton("💰 BAKİYEM", callback_data="my_balance"),
+        types.InlineKeyboardButton("💳 BAKİYE YÜKLE", callback_data="deposit")
+    )
+    
+    # Satır 3
+    markup.add(
+        types.InlineKeyboardButton("👥 REFERANSLARIM", callback_data="my_refs"),
+        types.InlineKeyboardButton("🔄 ÇEVİRİ YAP", callback_data="convert_menu")
+    )
+    
+    # Satır 4
+    markup.add(
+        types.InlineKeyboardButton("💸 PARA ÇEK", callback_data="withdraw"),
+        types.InlineKeyboardButton("🛠 DESTEK", callback_data="support")
+    )
+    
+    # Satır 5
+    markup.add(
+        types.InlineKeyboardButton("❓ YARDIM", callback_data="faq"),
+        types.InlineKeyboardButton("🌐 DİL", callback_data="language")
+    )
+    
+    # Satır 6
+    markup.add(
+        types.InlineKeyboardButton("🔄 YENİLE", callback_data="refresh"),
+        types.InlineKeyboardButton("🏠 MENÜ", callback_data="main_menu")
+    )
+    
+    # Admin butonu
     if int(user_id) == ADMIN_ID:
-        markup.add(types.InlineKeyboardButton("👑 ADMIN", callback_data="admin"))
+        markup.add(types.InlineKeyboardButton("👑 ADMIN PANEL", callback_data="admin_panel"))
     
-    msg = f"""🚀 GÖREV YAPSAM BOT
+    message = f"""🚀 <b>GÖREV YAPSAM BOT</b>
 
-👋 Merhaba {user.get('name', 'Kullanıcı')}!
+👋 <b>Merhaba {first_name}!</b>
 
-══════════════════════
+══════════════════════════════
 
-💰 BAKİYE: {total:.2f}₺
-• Normal: {user.get('balance', 0):.2f}₺
-• Reklam: {user.get('ad_balance', 0):.2f}₺
+💰 <b>BAKİYE DURUMU</b>
+• Toplam Bakiye: <code>{total_balance:.2f} ₺</code>
+• Normal Bakiye: <code>{balance:.2f} ₺</code>
+• Reklam Bakiyesi: <code>{ad_balance:.2f} ₺</code>
 
-📊 İSTATİSTİK
-• Görevler: {user.get('tasks', 0)}
-• Referans: {user.get('refs', 0)}
-• Kazanç: {user.get('ref_earned', 0):.2f}₺
+══════════════════════════════
 
-📢 Kanal: @{MANDATORY_CHANNEL}
+📊 <b>İSTATİSTİKLER</b>
+• Tamamlanan Görev: <code>{tasks}</code>
+• Referans Sayısı: <code>{refs}</code>
+• Referans Kazancı: <code>{user_data.get('ref_earned', 0):.2f} ₺</code>
 
-══════════════════════
+══════════════════════════════
 
-⚡ Aşağıdaki butonlardan seçim yap!"""
+📢 <b>Zorunlu Kanal:</b> @{MANDATORY_CHANNEL}
+
+══════════════════════════════
+
+⚡ <i>Aşağıdaki butonlardan işlemini seç!</i>"""
     
     try:
         if edit_msg_id:
-            bot.edit_message_text(msg, user_id, edit_msg_id, reply_markup=markup)
+            bot.edit_message_text(
+                message,
+                chat_id=user_id,
+                message_id=edit_msg_id,
+                reply_markup=markup
+            )
         else:
-            bot.send_message(user_id, msg, reply_markup=markup)
-    except:
-        bot.send_message(user_id, msg, reply_markup=markup)
+            bot.send_message(user_id, message, reply_markup=markup)
+    except Exception as e:
+        print(f"❌ Menü gönderme hatası: {e}")
+        bot.send_message(user_id, message, reply_markup=markup)
 
-# ================= 7. CALLBACK HANDLER =================
+# ================= 8. CALLBACK HANDLER =================
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
     user_id = str(call.from_user.id)
     
     try:
-        if call.data == "joined":
-            if check_channel(call.from_user.id):
-                if user_id in users:
-                    users[user_id]['in_channel'] = True
-                    save_users(users)
+        # KANAL KONTROLÜ (check_join hariç)
+        if call.data != "check_join" and call.data != "main_menu":
+            if not check_channel_membership(call.from_user.id):
+                bot.answer_callback_query(
+                    call.id,
+                    f"❌ Önce kanala katıl! @{MANDATORY_CHANNEL}",
+                    show_alert=True
+                )
+                return
+        
+        user_data = users_db.get(user_id, {})
+        
+        if call.data == "check_join":
+            if check_channel_membership(call.from_user.id):
+                if user_id in users_db:
+                    users_db[user_id]['channel_joined'] = True
+                    save_database(users_db)
                 bot.answer_callback_query(call.id, "✅ Başarılı!")
-                show_menu(user_id, call.message.message_id)
+                show_main_menu(user_id, user_data, call.message.message_id)
             else:
-                bot.answer_callback_query(call.id, "❌ Hala katılmadın!", show_alert=True)
+                bot.answer_callback_query(call.id, "❌ Hala kanala katılmadın!", show_alert=True)
         
-        elif call.data == "refresh":
-            show_menu(user_id, call.message.message_id)
-            bot.answer_callback_query(call.id, "🔄")
+        elif call.data == "refresh" or call.data == "main_menu":
+            show_main_menu(user_id, user_data, call.message.message_id)
+            bot.answer_callback_query(call.id, "🔄 Yenilendi!")
         
-        elif call.data == "balance":
-            user = users.get(user_id, {})
-            total = user.get('balance', 0) + user.get('ad_balance', 0)
+        elif call.data == "my_balance":
+            total_balance = user_data.get('balance', 0) + user_data.get('ad_balance', 0)
             
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="back"))
+            markup = types.InlineKeyboardMarkup(row_width=2)
+            markup.add(
+                types.InlineKeyboardButton("💳 Yükle", callback_data="deposit"),
+                types.InlineKeyboardButton("🔄 Çevir", callback_data="convert_menu")
+            )
+            markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="main_menu"))
             
-            msg = f"""💰 BAKİYE DETAY
+            message = f"""💰 <b>BAKİYE DETAYLARI</b>
 
-👤 {user.get('name', 'Kullanıcı')}
-🆔 {user_id}
+══════════════════════════════
 
-══════════════════════
+👤 <b>Kullanıcı:</b> {user_data.get('first_name', 'Kullanıcı')}
+🆔 <b>ID:</b> <code>{user_id}</code>
 
-💵 BAKİYE
-• Normal: {user.get('balance', 0):.2f}₺
-• Reklam: {user.get('ad_balance', 0):.2f}₺
-• Toplam: {total:.2f}₺
+══════════════════════════════
 
-══════════════════════
+💵 <b>BAKİYE BİLGİLERİ:</b>
+• Normal Bakiye: <code>{user_data.get('balance', 0):.2f} ₺</code>
+• Reklam Bakiyesi: <code>{user_data.get('ad_balance', 0):.2f} ₺</code>
+• Toplam Bakiye: <code>{total_balance:.2f} ₺</code>
 
-📊 İSTATİSTİK
-• Görev: {user.get('tasks', 0)}
-• Referans: {user.get('refs', 0)}
-• Ref Kazanç: {user.get('ref_earned', 0):.2f}₺
-• Toplam Kazanç: {user.get('balance', 0) + user.get('ref_earned', 0):.2f}₺"""
+══════════════════════════════
+
+📊 <b>İSTATİSTİKLER:</b>
+• Toplam Kazanç: <code>{user_data.get('total_earned', 0):.2f} ₺</code>
+• Tamamlanan Görev: <code>{user_data.get('tasks_completed', 0)}</code>
+• Referans Sayısı: <code>{user_data.get('referrals', 0)}</code>
+• Referans Kazancı: <code>{user_data.get('ref_earned', 0):.2f} ₺</code>
+
+══════════════════════════════
+
+💡 <b>Bilgi:</b>
+• Normal bakiyenle para çekebilirsin
+• Reklam bakiyenle görev oluşturabilirsin
+• %25 bonusla reklam bakiyesine çevirebilirsin"""
             
-            bot.edit_message_text(msg, user_id, call.message.message_id, reply_markup=markup)
+            bot.edit_message_text(
+                message,
+                chat_id=user_id,
+                message_id=call.message.message_id,
+                reply_markup=markup
+            )
         
-        elif call.data == "refs":
-            # KANAL KONTROLÜ
-            if not check_channel(call.from_user.id):
+        elif call.data == "my_refs":
+            # KANAL KONTROLÜ - Referans linki için
+            if not check_channel_membership(call.from_user.id):
                 markup = types.InlineKeyboardMarkup()
                 markup.add(types.InlineKeyboardButton("📢 KANALA KATIL", url=f"https://t.me/{MANDATORY_CHANNEL}"))
-                markup.add(types.InlineKeyboardButton("✅ KATILDIM", callback_data="joined"))
+                markup.add(types.InlineKeyboardButton("✅ KATILDIM", callback_data="check_join"))
                 
-                msg = f"""⚠️ REFERANS SİSTEMİ
+                message = f"""⚠️ <b>REFERANS SİSTEMİ</b>
 
-❌ Referans linki almak için önce kanala katılmalısın!
+══════════════════════════════
 
+❌ <b>Referans linki oluşturamazsın!</b>
+
+Önce kanala katılmalısın:
 👉 @{MANDATORY_CHANNEL}
 
-Katıldıktan sonra referans linkini alabilirsin."""
+Katıldıktan sonra referans linkini alabilir ve arkadaşlarını davet edebilirsin!"""
                 
-                bot.edit_message_text(msg, user_id, call.message.message_id, reply_markup=markup)
+                bot.edit_message_text(
+                    message,
+                    chat_id=user_id,
+                    message_id=call.message.message_id,
+                    reply_markup=markup
+                )
                 return
             
-            user = users.get(user_id, {})
             ref_link = f"https://t.me/GorevYapsamBot?start=ref_{user_id}"
             
             markup = types.InlineKeyboardMarkup(row_width=2)
@@ -274,237 +458,412 @@ Katıldıktan sonra referans linkini alabilirsin."""
                     url=f"https://t.me/share/url?url={ref_link}&text=Görev%20Yap%20Para%20Kazan!%20@GorevYapsamBot"),
                 types.InlineKeyboardButton("📋 KOPYALA", callback_data=f"copy_{ref_link}")
             )
-            markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="back"))
+            markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="main_menu"))
             
-            msg = f"""👥 REFERANS SİSTEMİ
+            message = f"""👥 <b>REFERANS SİSTEMİ</b>
 
-══════════════════════
+══════════════════════════════
 
-💰 Her referans: 1₺
-👤 Toplam: {user.get('refs', 0)}
-📈 Kazanç: {user.get('ref_earned', 0):.2f}₺
+💰 <b>Her referans:</b> 1.00 ₺
+👤 <b>Toplam referans:</b> {user_data.get('referrals', 0)}
+📈 <b>Referans kazancı:</b> {user_data.get('ref_earned', 0):.2f} ₺
 
-══════════════════════
+══════════════════════════════
 
-🔗 Linkin:
-{ref_link}
+🔗 <b>Referans linkin:</b>
+<code>{ref_link}</code>
 
-══════════════════════
+══════════════════════════════
 
-🎁 BONUSLAR
-• 5 referans: +2₺
-• 10 referans: +5₺
-• 25 referans: +15₺
-• 50 referans: +35₺
+🎁 <b>REFERANS BONUSLARI:</b>
+• 5 referans: +2 ₺
+• 10 referans: +5 ₺
+• 25 referans: +15 ₺
+• 50 referans: +35 ₺
 
-⚠️ Arkadaşların kanala katılmazsa bonus alamazsın!"""
+══════════════════════════════
+
+💡 <b>Nasıl çalışır?</b>
+1. Linkini paylaş
+2. Biri linkten katılır
+3. 1 ₺ kazanırsın
+4. Bonusları topla
+
+⚠️ <b>ÖNEMLİ:</b> Arkadaşların kanala katılmazsa referans bonusu alamazsın!"""
             
-            bot.edit_message_text(msg, user_id, call.message.message_id, reply_markup=markup)
+            bot.edit_message_text(
+                message,
+                chat_id=user_id,
+                message_id=call.message.message_id,
+                reply_markup=markup
+            )
         
         elif call.data.startswith("copy_"):
             bot.answer_callback_query(call.id, "✅ Kopyalandı!")
         
-        elif call.data == "convert":
-            user = users.get(user_id, {})
-            
+        elif call.data == "convert_menu":
             markup = types.InlineKeyboardMarkup(row_width=2)
             markup.add(
-                types.InlineKeyboardButton("10₺", callback_data="conv_10"),
-                types.InlineKeyboardButton("25₺", callback_data="conv_25"),
-                types.InlineKeyboardButton("50₺", callback_data="conv_50"),
-                types.InlineKeyboardButton("100₺", callback_data="conv_100")
+                types.InlineKeyboardButton("10 ₺", callback_data="conv_10"),
+                types.InlineKeyboardButton("25 ₺", callback_data="conv_25"),
+                types.InlineKeyboardButton("50 ₺", callback_data="conv_50"),
+                types.InlineKeyboardButton("100 ₺", callback_data="conv_100")
             )
-            markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="back"))
+            markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="main_menu"))
             
-            msg = f"""🔄 ÇEVİRİM
+            message = f"""🔄 <b>REKLAM BAKİYESİ ÇEVİRİMİ</b>
 
-══════════════════════
+══════════════════════════════
 
-💰 Normal: {user.get('balance', 0):.2f}₺
-💰 Reklam: {user.get('ad_balance', 0):.2f}₺
+💰 <b>Normal Bakiyen:</b> <code>{user_data.get('balance', 0):.2f} ₺</code>
+💰 <b>Reklam Bakiyen:</b> <code>{user_data.get('ad_balance', 0):.2f} ₺</code>
 
-══════════════════════
+══════════════════════════════
 
-🎁 %25 BONUS!
-100₺ normal → 125₺ reklam
+🎁 <b>%25 BONUS!</b>
+<i>Örnek: 100 ₺ normal bakiye → 125 ₺ reklam bakiyesi</i>
 
-══════════════════════
+══════════════════════════════
 
-👇 Çevirmek istediğin miktar:"""
+👇 <b>Çevirmek istediğin miktarı seç:</b>"""
             
-            bot.edit_message_text(msg, user_id, call.message.message_id, reply_markup=markup)
+            bot.edit_message_text(
+                message,
+                chat_id=user_id,
+                message_id=call.message.message_id,
+                reply_markup=markup
+            )
         
         elif call.data.startswith("conv_"):
             amount = float(call.data.replace("conv_", ""))
-            user = users.get(user_id, {})
+            balance = user_data.get('balance', 0)
             
-            if user.get('balance', 0) < amount:
-                bot.answer_callback_query(call.id, f"❌ Yetersiz bakiye! Mevcut: {user.get('balance', 0):.2f}₺", show_alert=True)
+            if balance < amount:
+                bot.answer_callback_query(
+                    call.id,
+                    f"❌ Yetersiz bakiye! Mevcut: {balance:.2f} ₺",
+                    show_alert=True
+                )
                 return
             
             bonus = amount * 0.25
             total = amount + bonus
             
-            user['balance'] -= amount
-            user['ad_balance'] += total
-            
-            save_users(users)
+            # Bakiye güncelle
+            users_db[user_id]['balance'] = balance - amount
+            users_db[user_id]['ad_balance'] = user_data.get('ad_balance', 0) + total
+            save_database(users_db)
             
             markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("🏠 Ana Menü", callback_data="back"))
+            markup.add(types.InlineKeyboardButton("🏠 Ana Menü", callback_data="main_menu"))
             
-            msg = f"""✅ ÇEVİRİM BAŞARILI!
+            message = f"""✅ <b>ÇEVİRİM BAŞARILI!</b>
 
-══════════════════════
+══════════════════════════════
 
-💰 Çevrilen: {amount:.2f}₺
-🎁 Bonus: {bonus:.2f}₺
-💰 Toplam: {total:.2f}₺
+💰 <b>Çevrilen Miktar:</b> {amount:.2f} ₺
+🎁 <b>Bonus (%25):</b> {bonus:.2f} ₺
+💰 <b>Toplam Kazanç:</b> {total:.2f} ₺
 
-══════════════════════
+══════════════════════════════
 
-💳 Yeni Bakiyeler
-• Normal: {user.get('balance', 0):.2f}₺
-• Reklam: {user.get('ad_balance', 0):.2f}₺"""
+📊 <b>Yeni Bakiyeler:</b>
+• Normal Bakiye: <code>{balance - amount:.2f} ₺</code>
+• Reklam Bakiyesi: <code>{user_data.get('ad_balance', 0) + total:.2f} ₺</code>
+
+══════════════════════════════
+
+💡 <b>Artık reklam bakiyenle görev oluşturabilirsin!</b>"""
             
-            bot.edit_message_text(msg, user_id, call.message.message_id, reply_markup=markup)
+            bot.edit_message_text(
+                message,
+                chat_id=user_id,
+                message_id=call.message.message_id,
+                reply_markup=markup
+            )
         
         elif call.data == "deposit":
             markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="back"))
+            markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="main_menu"))
             
-            msg = """💳 BAKİYE YÜKLEME
+            message = """💳 <b>BAKİYE YÜKLEME</b>
 
-══════════════════════
+══════════════════════════════
 
-⏳ YAKINDA AKTİF!
+⏳ <b>YAKINDA AKTİF!</b>
 
-══════════════════════
+══════════════════════════════
 
-Ödeme yöntemleri:
+Bakiye yükleme sistemi çok yakında aktif edilecektir.
+
+<b>Ödeme yöntemleri:</b>
 • Papara
-• Kripto Para
+• Kripto Para (TRX, USDT)
 • Banka Havalesi
 
-Lütfen bekleyin..."""
+══════════════════════════════
+
+💡 <b>Öneri:</b> Şimdilik görev yaparak para kazanabilirsin!"""
             
-            bot.edit_message_text(msg, user_id, call.message.message_id, reply_markup=markup)
+            bot.edit_message_text(
+                message,
+                chat_id=user_id,
+                message_id=call.message.message_id,
+                reply_markup=markup
+            )
         
         elif call.data == "withdraw":
-            user = users.get(user_id, {})
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="main_menu"))
+            
+            message = f"""💸 <b>PARA ÇEKME</b>
+
+══════════════════════════════
+
+💰 <b>Mevcut Bakiye:</b> <code>{user_data.get('balance', 0):.2f} ₺</code>
+
+══════════════════════════════
+
+Para çekme sistemi çok yakında aktif edilecektir.
+
+<b>Özellikler:</b>
+• Minimum çekim: 20 ₺
+• İşlem süresi: 24 saat
+• Yöntemler: Papara, Banka Havalesi
+
+══════════════════════════════
+
+💡 <b>İpucu:</b> Bakiyeni reklam bakiyesine çevirip görev oluşturabilirsin!"""
+            
+            bot.edit_message_text(
+                message,
+                chat_id=user_id,
+                message_id=call.message.message_id,
+                reply_markup=markup
+            )
+        
+        elif call.data == "support":
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="main_menu"))
+            
+            message = f"""🛠 <b>TEKNİK DESTEK</b>
+
+══════════════════════════════
+
+📞 <b>İletişim:</b> @AlperenTHE
+🎫 <b>Bilet Sistemi:</b> Yakında aktif!
+⏰ <b>Yanıt Süresi:</b> 24 saat
+
+══════════════════════════════
+
+🆔 <b>Kullanıcı ID:</b> <code>{user_id}</code>
+
+══════════════════════════════
+
+📝 <b>Destek talebi formatı:</b>
+1. Kullanıcı ID: {user_id}
+2. Sorun açıklaması
+3. Ekran görüntüsü (varsa)
+4. Tarih ve saat
+
+══════════════════════════════
+
+<i>Destek için @AlperenTHE adresine mesaj gönderin.</i>"""
+            
+            bot.edit_message_text(
+                message,
+                chat_id=user_id,
+                message_id=call.message.message_id,
+                reply_markup=markup
+            )
+        
+        elif call.data == "faq":
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="main_menu"))
+            
+            message = f"""❓ <b>SIKÇA SORULAN SORULAR</b>
+
+══════════════════════════════
+
+<b>1. Bakiye nasıl yüklenir?</b>
+Bakiye yükleme sistemi çok yakında aktif olacak. Papara ve kripto para seçenekleriyle bakiye yükleyebileceksin.
+
+══════════════════════════════
+
+<b>2. Görev nasıl yapılır?</b>
+1. "GÖREV YAP" butonuna tıkla
+2. Görev seç
+3. Linke git ve görevi tamamla
+4. 3 dakika bekle ve tamamla
+
+══════════════════════════════
+
+<b>3. Bonus sistemi nedir?</b>
+• Her referans için 1 ₺
+• Görev tamamlayarak para kazan
+• Özel bonus kampanyaları
+
+══════════════════════════════
+
+<b>4. Para nasıl çekilir?</b>
+Minimum 20 ₺ ile para çekim sistemi yakında aktif olacak.
+
+══════════════════════════════
+
+<b>5. Kanal zorunluluğu nedir?</b>
+Botu kullanmak için @{MANDATORY_CHANNEL} kanalına katılmalısın."""
+            
+            bot.edit_message_text(
+                message,
+                chat_id=user_id,
+                message_id=call.message.message_id,
+                reply_markup=markup
+            )
+        
+        elif call.data == "admin_panel" and int(user_id) == ADMIN_ID:
+            total_users = len(users_db)
+            total_balance = sum(u.get('balance', 0) for u in users_db.values())
+            total_ad = sum(u.get('ad_balance', 0) for u in users_db.values())
             
             markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="back"))
+            markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="main_menu"))
             
-            msg = f"""💸 PARA ÇEKME
+            message = f"""👑 <b>ADMIN PANEL</b>
 
-══════════════════════
+══════════════════════════════
 
-💰 Mevcut: {user.get('balance', 0):.2f}₺
+📊 <b>GENEL İSTATİSTİKLER:</b>
+• Toplam Kullanıcı: <code>{total_users}</code>
+• Toplam Normal Bakiye: <code>{total_balance:.2f} ₺</code>
+• Toplam Reklam Bakiye: <code>{total_ad:.2f} ₺</code>
+• Toplam Sistem Bakiyesi: <code>{total_balance + total_ad:.2f} ₺</code>
 
-══════════════════════
+══════════════════════════════
 
-⏳ YAKINDA AKTİF!
+📈 <b>AKTİVİTE:</b>
+• Son 24 saat: <i>yakında</i>
+• Aktif kullanıcılar: <i>yakında</i>
 
-══════════════════════
+══════════════════════════════
 
-• Minimum: 20₺
-• Süre: 24 saat
-• Papara/Banka"""
+⚡ <b>HIZLI İŞLEMLER:</b>
+• Bakiye ekleme
+• Duyuru gönderme
+• Kullanıcı yönetimi
+
+<i>Yakında aktif edilecek...</i>"""
             
-            bot.edit_message_text(msg, user_id, call.message.message_id, reply_markup=markup)
+            bot.edit_message_text(
+                message,
+                chat_id=user_id,
+                message_id=call.message.message_id,
+                reply_markup=markup
+            )
         
-        elif call.data == "admin" and int(user_id) == ADMIN_ID:
-            total_users = len(users)
-            total_balance = sum(u.get('balance', 0) for u in users.values())
-            total_ad = sum(u.get('ad_balance', 0) for u in users.values())
+        elif call.data == "language":
+            markup = types.InlineKeyboardMarkup(row_width=2)
+            markup.add(
+                types.InlineKeyboardButton("🇹🇷 Türkçe", callback_data="lang_tr"),
+                types.InlineKeyboardButton("🇦🇿 Azərbaycan", callback_data="lang_az")
+            )
+            markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="main_menu"))
             
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("🔙 Geri", callback_data="back"))
-            
-            msg = f"""👑 ADMIN PANEL
+            message = """🌐 <b>DİL SEÇİMİ</b>
 
-══════════════════════
+══════════════════════════════
 
-📊 İSTATİSTİK
-• Kullanıcı: {total_users}
-• Normal Bakiye: {total_balance:.2f}₺
-• Reklam Bakiye: {total_ad:.2f}₺
-• Toplam: {total_balance + total_ad:.2f}₺"""
+Aşağıdaki dillerden birini seçin:
+
+🇹🇷 <b>Türkçe</b> - Türkiye Türkçesi
+🇦🇿 <b>Azərbaycan</b> - Azerbaycan Türkçesi
+
+══════════════════════════════
+
+<i>Seçiminiz tüm menüleri ve mesajları değiştirecektir.</i>"""
             
-            bot.edit_message_text(msg, user_id, call.message.message_id, reply_markup=markup)
-        
-        elif call.data == "back":
-            show_menu(user_id, call.message.message_id)
+            bot.edit_message_text(
+                message,
+                chat_id=user_id,
+                message_id=call.message.message_id,
+                reply_markup=markup
+            )
         
         else:
-            show_menu(user_id, call.message.message_id)
+            # Diğer tüm callback'ler için ana menü
+            show_main_menu(user_id, user_data, call.message.message_id)
             bot.answer_callback_query(call.id, "⚡")
     
     except Exception as e:
-        print(f"Callback error: {e}")
+        print(f"❌ Callback hatası: {e}")
         try:
-            bot.answer_callback_query(call.id, "❌ Hata!")
+            bot.answer_callback_query(call.id, "❌ Bir hata oluştu!")
         except:
             pass
 
-# ================= 8. DİĞER MESAJLAR =================
+# ================= 9. DİĞER MESAJLAR =================
 @bot.message_handler(func=lambda message: True)
-def handle_all(message):
-    show_menu(message.from_user.id)
+def handle_all_messages(message):
+    """Diğer tüm mesajlar için"""
+    user_id = str(message.from_user.id)
+    user_data = users_db.get(user_id, {})
+    show_main_menu(user_id, user_data)
 
-# ================= 9. MANUEL POLLING (409 FIX) =================
+# ================= 10. POLLING (409 HATA ÇÖZÜMÜ) =================
 def safe_polling():
-    """409 hatasını çözen polling"""
-    print("🤖 Bot polling başlatılıyor...")
-    
-    last_update_id = 0
+    """Güvenli polling fonksiyonu"""
+    print("🔄 Bot polling başlatılıyor...")
     
     while True:
         try:
-            # Manuel getUpdates kullan
-            updates = bot.get_updates(offset=last_update_id + 1, timeout=20)
-            
-            for update in updates:
-                last_update_id = update.update_id
-                
-                try:
-                    if update.message:
-                        bot.process_new_messages([update.message])
-                    elif update.callback_query:
-                        bot.process_new_callback_query([update.callback_query])
-                except Exception as e:
-                    print(f"Update işleme hatası: {e}")
-            
-            # 0.1 saniye bekle
-            time.sleep(0.1)
+            print("🟢 Bot aktif...")
+            bot.polling(none_stop=True, timeout=30, interval=2)
             
         except Exception as e:
-            if "409" in str(e) or "Conflict" in str(e):
-                print("⚠️ 409 hatası, 5 saniye bekleniyor...")
-                time.sleep(5)
+            error_msg = str(e)
+            print(f"❌ Hata: {error_msg}")
+            
+            # 409 Conflict hatası için özel işlem
+            if "409" in error_msg or "Conflict" in error_msg:
+                print("⚠️ 409 Conflict hatası tespit edildi!")
+                print("⏳ 10 saniye bekleniyor...")
+                time.sleep(10)
+                
                 # Update ID'yi sıfırla
-                last_update_id = 0
+                try:
+                    bot.skip_updates()
+                    print("✅ Update ID sıfırlandı")
+                except:
+                    pass
+            
+            # Diğer hatalar için kısa bekle
             else:
-                print(f"Polling hatası: {e}")
-                time.sleep(2)
+                time.sleep(5)
+            
+            print("🔄 Yeniden başlatılıyor...")
 
-# ================= 10. MAIN =================
-def main():
-    """Ana fonksiyon"""
-    print(f"""
-    🚀 GÖREV YAPSAM BOT
-    ═══════════════════════════════════════════
-    📅 {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-    🔧 JSON Database
-    🌍 Türkçe
-    💰 Kanal Kontrollü Referans
-    ⚡ Manuel Polling (409 FIXED)
-    ═══════════════════════════════════════════
+# ================= 11. ANA PROGRAM =================
+if __name__ == "__main__":
+    print("""
+    ╔══════════════════════════════════════════╗
+    ║    🚀 GÖREV YAPSAM BOT - TAM VERSİYON    ║
+    ║    Telegram: @GorevYapsamBot             ║
+    ║    Developer: Alperen                    ║
+    ║    Kanal: @GY_Refim                      ║
+    ║    Tarih: 2026-01-07                     ║
+    ╚══════════════════════════════════════════╝
     """)
     
-    # Manuel polling başlat
-    safe_polling()
-
-if __name__ == "__main__":
-    main()
+    try:
+        # Güvenli polling başlat
+        safe_polling()
+        
+    except KeyboardInterrupt:
+        print("\n\n👋 Bot kapatılıyor...")
+        
+    except Exception as e:
+        print(f"\n\n❌ Kritik hata: {e}")
+        print("🔄 10 saniye sonra yeniden başlatılacak...")
+        time.sleep(10)
+        
+        # Programı yeniden başlat
+        os.execv(sys.executable, ['python'] + sys.argv)
