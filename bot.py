@@ -1,7 +1,7 @@
 """
 ╔════════════════════════════════════════════════════════════════╗
-║                    GÖREV YAPSAM BOT v7.0                       ║
-║            PARA ÇEKİM + KAMPANYA SİSTEMİ + ADMIN YETKİ         ║
+║                    GÖREV YAPSAM BOT v10.0                      ║
+║        FORWARD SİSTEMİ + BOT ADMIN KONTROLÜ + 5 ADIMLI ONAY    ║
 ╚════════════════════════════════════════════════════════════════╝
 """
 
@@ -21,7 +21,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ================= 2. TELEGRAM AYARLARI =================
-# Render'da environment variables'dan al
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ADMIN_ID = os.environ.get("ADMIN_ID", "7904032877")
 MANDATORY_CHANNEL = os.environ.get("MANDATORY_CHANNEL", "GY_Refim")
@@ -31,10 +30,10 @@ if not TOKEN:
 
 BASE_URL = f"https://api.telegram.org/bot{TOKEN}/"
 
-print("=" * 50)
-print("🤖 GÖREV YAPSAM BOT v7.0")
-print("💰 PARA ÇEKİM + KAMPANYA SİSTEMİ")
-print("=" * 50)
+print("=" * 60)
+print("🤖 GÖREV YAPSAM BOT v10.0")
+print("🔄 FORWARD SİSTEMİ + BOT ADMIN KONTROLÜ")
+print("=" * 60)
 
 # ================= 3. SQLITE VERİTABANI =================
 class Database:
@@ -64,11 +63,14 @@ class Database:
                 created_at TEXT,
                 welcome_bonus INTEGER DEFAULT 0,
                 withdrawal_total REAL DEFAULT 0.0,
-                withdrawal_count INTEGER DEFAULT 0
+                withdrawal_count INTEGER DEFAULT 0,
+                referred_by TEXT DEFAULT NULL,
+                last_active TEXT,
+                is_active INTEGER DEFAULT 1
             )
         ''')
         
-        # Görevler/Kampanyalar tablosu
+        # Kampanyalar tablosu - FORWARD MESAJ ID EKLENDİ
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS campaigns (
                 campaign_id TEXT PRIMARY KEY,
@@ -76,18 +78,21 @@ class Database:
                 description TEXT,
                 link TEXT,
                 budget REAL,
+                remaining_budget REAL,
                 creator_id TEXT,
                 creator_name TEXT,
-                task_type TEXT,
+                task_type TEXT CHECK(task_type IN ('bot', 'group', 'channel')),
                 price_per_task REAL,
                 max_participants INTEGER,
                 current_participants INTEGER DEFAULT 0,
-                status TEXT DEFAULT 'draft', -- draft, pending, active, completed, cancelled
-                requires_forward INTEGER DEFAULT 0,
-                forward_channel TEXT,
+                status TEXT DEFAULT 'pending', -- pending, active, completed, cancelled
                 created_at TEXT,
-                admin_approved INTEGER DEFAULT 0,
-                steps TEXT -- JSON formatında adımlar
+                is_active INTEGER DEFAULT 0,
+                total_spent REAL DEFAULT 0.0,
+                forward_message_id TEXT, -- Forward edilecek mesaj ID'si (sadece bot kampanyası için)
+                target_chat_id TEXT, -- Kanal/Grup ID'si (kanal/grup kampanyası için)
+                requires_admin_check INTEGER DEFAULT 0, -- Bot admin mi kontrolü
+                admin_checked INTEGER DEFAULT 0 -- Admin kontrolü yapıldı mı?
             )
         ''')
         
@@ -97,27 +102,14 @@ class Database:
                 participation_id TEXT PRIMARY KEY,
                 user_id TEXT,
                 campaign_id TEXT,
-                status TEXT DEFAULT 'pending', -- pending, completed, verified, rejected
+                status TEXT DEFAULT 'pending',
                 proof_text TEXT,
                 screenshot_id TEXT,
                 created_at TEXT,
                 verified_at TEXT,
-                reward_paid INTEGER DEFAULT 0
-            )
-        ''')
-        
-        # Para çekim talepleri tablosu
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS withdrawals (
-                withdrawal_id TEXT PRIMARY KEY,
-                user_id TEXT,
-                amount REAL,
-                method TEXT, -- papara, bank, crypto
-                account_info TEXT,
-                status TEXT DEFAULT 'pending', -- pending, processing, completed, rejected
-                created_at TEXT,
-                processed_at TEXT,
-                admin_notes TEXT
+                reward_paid INTEGER DEFAULT 0,
+                reward_amount REAL DEFAULT 0.0,
+                forward_message_id TEXT -- Kullanıcının forward ettiği mesaj ID
             )
         ''')
         
@@ -128,7 +120,20 @@ class Database:
                 chat_title TEXT,
                 is_admin INTEGER DEFAULT 0,
                 added_by TEXT,
-                added_at TEXT
+                added_at TEXT,
+                last_checked TEXT
+            )
+        ''')
+        
+        # Forward mesajları tablosu
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS forward_messages (
+                message_id TEXT PRIMARY KEY,
+                from_user_id TEXT,
+                from_chat_id TEXT,
+                message_text TEXT,
+                created_at TEXT,
+                is_active INTEGER DEFAULT 1
             )
         ''')
         
@@ -141,17 +146,21 @@ class Database:
         user = self.cursor.fetchone()
         
         if not user:
-            # Yeni kullanıcı oluştur
             now = datetime.now().isoformat()
             self.cursor.execute('''
                 INSERT INTO users 
-                (user_id, name, username, balance, created_at, welcome_bonus)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (user_id, '', '', 0.0, now, 0))
+                (user_id, name, username, balance, created_at, welcome_bonus, last_active, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (user_id, '', '', 0.0, now, 0, now, 1))
             self.conn.commit()
             
             self.cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
             user = self.cursor.fetchone()
+        else:
+            self.cursor.execute('''
+                UPDATE users SET last_active = ? WHERE user_id = ?
+            ''', (datetime.now().isoformat(), user_id))
+            self.conn.commit()
         
         return dict(user) if user else {}
     
@@ -185,28 +194,44 @@ class Database:
     def create_campaign(self, campaign_data):
         """Yeni kampanya oluştur"""
         try:
+            # Fiyatları belirle
+            price_map = {
+                'bot': 2.5,
+                'channel': 1.5,
+                'group': 1.0
+            }
+            
+            task_type = campaign_data['task_type']
+            price_per_task = price_map.get(task_type, 1.0)
+            budget = campaign_data['budget']
+            max_participants = int(budget / price_per_task)
+            
             self.cursor.execute('''
                 INSERT INTO campaigns 
-                (campaign_id, name, description, link, budget, creator_id, 
-                 creator_name, task_type, price_per_task, max_participants, 
-                 status, requires_forward, forward_channel, created_at, steps)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (campaign_id, name, description, link, budget, remaining_budget,
+                 creator_id, creator_name, task_type, price_per_task, max_participants,
+                 status, created_at, is_active, forward_message_id, target_chat_id,
+                 requires_admin_check, admin_checked)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 campaign_data['campaign_id'],
                 campaign_data['name'],
                 campaign_data['description'],
                 campaign_data['link'],
-                campaign_data['budget'],
+                budget,
+                budget,
                 campaign_data['creator_id'],
                 campaign_data['creator_name'],
-                campaign_data['task_type'],
-                campaign_data['price_per_task'],
-                campaign_data['max_participants'],
-                campaign_data.get('status', 'draft'),
-                campaign_data.get('requires_forward', 0),
-                campaign_data.get('forward_channel', ''),
+                task_type,
+                price_per_task,
+                max_participants,
+                'pending',  # Admin onayı bekliyor
                 datetime.now().isoformat(),
-                campaign_data.get('steps', '[]')
+                0,  # Başlangıçta pasif
+                campaign_data.get('forward_message_id', ''),
+                campaign_data.get('target_chat_id', ''),
+                campaign_data.get('requires_admin_check', 0),
+                campaign_data.get('admin_checked', 0)
             ))
             self.conn.commit()
             return True
@@ -214,71 +239,98 @@ class Database:
             print(f"❌ Kampanya oluşturma hatası: {e}")
             return False
     
-    def create_withdrawal(self, withdrawal_data):
-        """Para çekim talebi oluştur"""
-        try:
-            self.cursor.execute('''
-                INSERT INTO withdrawals 
-                (withdrawal_id, user_id, amount, method, account_info, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                withdrawal_data['withdrawal_id'],
-                withdrawal_data['user_id'],
-                withdrawal_data['amount'],
-                withdrawal_data['method'],
-                withdrawal_data['account_info'],
-                withdrawal_data.get('status', 'pending'),
-                datetime.now().isoformat()
-            ))
-            
-            # Kullanıcının bakiyesini düş
-            self.cursor.execute('''
-                UPDATE users SET balance = balance - ? WHERE user_id = ?
-            ''', (withdrawal_data['amount'], withdrawal_data['user_id']))
-            
-            self.conn.commit()
-            return True
-        except Exception as e:
-            print(f"❌ Para çekim talebi oluşturma hatası: {e}")
-            return False
-    
-    def check_bot_admin(self, chat_id):
-        """Botun chat'te admin olup olmadığını kontrol et"""
-        self.cursor.execute("SELECT is_admin FROM bot_admin_status WHERE chat_id = ?", (chat_id,))
+    def check_bot_admin_status(self, chat_id):
+        """Bot'un chat'te admin olup olmadığını kontrol et"""
+        self.cursor.execute(
+            "SELECT is_admin, last_checked FROM bot_admin_status WHERE chat_id = ?",
+            (chat_id,)
+        )
         result = self.cursor.fetchone()
-        return result['is_admin'] == 1 if result else False
+        
+        if result:
+            return result['is_admin'] == 1
+        return False
     
-    def set_bot_admin(self, chat_id, chat_title, added_by, is_admin=True):
-        """Botun admin durumunu güncelle"""
+    def update_bot_admin_status(self, chat_id, chat_title, is_admin, added_by=""):
+        """Bot admin durumunu güncelle"""
         try:
             self.cursor.execute('''
                 INSERT OR REPLACE INTO bot_admin_status 
-                (chat_id, chat_title, is_admin, added_by, added_at)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (chat_id, chat_title, 1 if is_admin else 0, added_by, datetime.now().isoformat()))
+                (chat_id, chat_title, is_admin, added_by, added_at, last_checked)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                chat_id,
+                chat_title,
+                1 if is_admin else 0,
+                added_by,
+                datetime.now().isoformat(),
+                datetime.now().isoformat()
+            ))
             self.conn.commit()
             return True
         except Exception as e:
             print(f"❌ Bot admin durumu güncelleme hatası: {e}")
             return False
+    
+    def save_forward_message(self, message_data):
+        """Forward mesajını kaydet"""
+        try:
+            self.cursor.execute('''
+                INSERT INTO forward_messages 
+                (message_id, from_user_id, from_chat_id, message_text, created_at, is_active)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                message_data['message_id'],
+                message_data['from_user_id'],
+                message_data['from_chat_id'],
+                message_data.get('message_text', ''),
+                datetime.now().isoformat(),
+                1
+            ))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            print(f"❌ Forward mesajı kaydetme hatası: {e}")
+            return False
+    
+    def get_latest_forward_messages(self, limit=5):
+        """Son forward mesajlarını getir"""
+        query = '''
+            SELECT * FROM forward_messages 
+            WHERE is_active = 1 
+            ORDER BY created_at DESC 
+            LIMIT ?
+        '''
+        self.cursor.execute(query, (limit,))
+        messages = self.cursor.fetchall()
+        return [dict(msg) for msg in messages]
+    
+    def update_campaign_status(self, campaign_id, status, is_active=None):
+        """Kampanya durumunu güncelle"""
+        try:
+            if is_active is not None:
+                query = '''
+                    UPDATE campaigns 
+                    SET status = ?, is_active = ?
+                    WHERE campaign_id = ?
+                '''
+                self.cursor.execute(query, (status, 1 if is_active else 0, campaign_id))
+            else:
+                query = '''
+                    UPDATE campaigns 
+                    SET status = ?
+                    WHERE campaign_id = ?
+                '''
+                self.cursor.execute(query, (status, campaign_id))
+            
+            self.conn.commit()
+            return True
+        except Exception as e:
+            print(f"❌ Kampanya durumu güncelleme hatası: {e}")
+            return False
 
-# ================= 4. FLASK APP =================
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return jsonify({
-        "status": "online", 
-        "bot": "Görev Yapsam Bot v7.0",
-        "features": ["Para Çekim", "Kampanya Sistemi", "Admin Yetki Kontrolü"]
-    })
-
-@app.route('/health')
-def health():
-    return jsonify({"status": "healthy"}), 200
-
-# ================= 5. TELEGRAM FONKSİYONLARI =================
-def send_telegram_message(chat_id, text, reply_markup=None, parse_mode='HTML'):
+# ================= 4. TELEGRAM FONKSİYONLARI =================
+def send_telegram_message(chat_id, text, reply_markup=None, parse_mode='HTML', reply_to_message_id=None):
     """Telegram'a mesaj gönder"""
     url = BASE_URL + "sendMessage"
     data = {
@@ -291,12 +343,77 @@ def send_telegram_message(chat_id, text, reply_markup=None, parse_mode='HTML'):
     if reply_markup:
         data['reply_markup'] = json.dumps(reply_markup)
     
+    if reply_to_message_id:
+        data['reply_to_message_id'] = reply_to_message_id
+    
     try:
         response = requests.post(url, json=data, timeout=10)
         return response.json()
     except Exception as e:
         print(f"❌ Mesaj gönderme hatası: {e}")
         return None
+
+def forward_message(from_chat_id, to_chat_id, message_id):
+    """Mesaj forward et"""
+    url = BASE_URL + "forwardMessage"
+    data = {
+        'chat_id': to_chat_id,
+        'from_chat_id': from_chat_id,
+        'message_id': message_id
+    }
+    
+    try:
+        response = requests.post(url, json=data, timeout=10)
+        return response.json()
+    except Exception as e:
+        print(f"❌ Forward hatası: {e}")
+        return None
+
+def get_chat(chat_id):
+    """Chat bilgilerini al"""
+    url = BASE_URL + "getChat"
+    data = {'chat_id': chat_id}
+    
+    try:
+        response = requests.post(url, json=data, timeout=10)
+        return response.json()
+    except Exception as e:
+        print(f"❌ Chat bilgisi alma hatası: {e}")
+        return None
+
+def get_chat_administrators(chat_id):
+    """Chat adminlerini getir"""
+    url = BASE_URL + "getChatAdministrators"
+    data = {'chat_id': chat_id}
+    
+    try:
+        response = requests.post(url, json=data, timeout=10)
+        result = response.json()
+        if result.get('ok'):
+            return result['result']
+    except Exception as e:
+        print(f"❌ Admin listesi alma hatası: {e}")
+        pass
+    return []
+
+def get_chat_member(chat_id, user_id):
+    """Kanal/grup üyeliğini kontrol et"""
+    url = BASE_URL + "getChatMember"
+    data = {
+        'chat_id': chat_id,
+        'user_id': int(user_id)
+    }
+    
+    try:
+        response = requests.post(url, json=data, timeout=10)
+        result = response.json()
+        if result.get('ok'):
+            status = result['result']['status']
+            return status in ['member', 'administrator', 'creator']
+    except Exception as e:
+        print(f"❌ Üyelik kontrol hatası: {e}")
+        pass
+    return False
 
 def answer_callback(callback_id, text=None, show_alert=False):
     """Callback'e cevap ver"""
@@ -314,68 +431,28 @@ def answer_callback(callback_id, text=None, show_alert=False):
     except:
         pass
 
-def get_chat_member(chat_id, user_id):
-    """Kanal/grup üyeliğini kontrol et"""
-    url = BASE_URL + "getChatMember"
-    data = {
-        'chat_id': chat_id,
-        'user_id': int(user_id)
-    }
-    
-    try:
-        response = requests.post(url, json=data, timeout=10)
-        result = response.json()
-        if result.get('ok'):
-            status = result['result']['status']
-            return status in ['member', 'administrator', 'creator']
-    except:
-        pass
-    return False
-
-def get_chat_administrators(chat_id):
-    """Chat adminlerini getir"""
-    url = BASE_URL + "getChatAdministrators"
-    data = {'chat_id': chat_id}
-    
-    try:
-        response = requests.post(url, json=data, timeout=10)
-        result = response.json()
-        if result.get('ok'):
-            return result['result']
-    except:
-        pass
-    return []
-
-def get_bot_id():
-    """Botun ID'sini al"""
-    url = BASE_URL + "getMe"
-    try:
-        response = requests.get(url, timeout=10)
-        result = response.json()
-        if result.get('ok'):
-            return str(result['result']['id'])
-    except:
-        pass
-    return None
-
-# ================= 6. BOT SİSTEMİ =================
+# ================= 5. BOT SİSTEMİ =================
 class BotSystem:
     def __init__(self):
         self.db = Database()
         self.running = False
-        self.user_states = {}  # Kullanıcı durumlarını takip et
-        self.campaign_creation = {}  # Kampanya oluşturma sürecini takip et
+        self.user_states = {}
         print("🤖 Bot sistemi başlatıldı")
     
     def set_user_state(self, user_id, state, data=None):
         """Kullanıcı durumunu ayarla"""
         if data is None:
             data = {}
-        self.user_states[user_id] = {'state': state, 'data': data}
+        self.user_states[user_id] = {'state': state, 'data': data, 'step': 1}
     
     def get_user_state(self, user_id):
         """Kullanıcı durumunu getir"""
-        return self.user_states.get(user_id, {'state': None, 'data': {}})
+        return self.user_states.get(user_id, {'state': None, 'data': {}, 'step': 1})
+    
+    def update_user_state_step(self, user_id, step):
+        """Kullanıcı durum adımını güncelle"""
+        if user_id in self.user_states:
+            self.user_states[user_id]['step'] = step
     
     def clear_user_state(self, user_id):
         """Kullanıcı durumunu temizle"""
@@ -422,7 +499,15 @@ class BotSystem:
                                 daemon=True
                             ).start()
                         
-                        # MESAJ GELDİ
+                        # FORWARD EDİLEN MESAJ
+                        elif 'message' in update and 'forward_from' in update['message']:
+                            threading.Thread(
+                                target=self.process_forwarded_message,
+                                args=(update['message'],),
+                                daemon=True
+                            ).start()
+                        
+                        # NORMAL MESAJ
                         elif 'message' in update:
                             threading.Thread(
                                 target=self.process_message,
@@ -430,7 +515,7 @@ class BotSystem:
                                 daemon=True
                             ).start()
                         
-                        # CALLBACK GELDİ
+                        # CALLBACK
                         elif 'callback_query' in update:
                             threading.Thread(
                                 target=self.process_callback,
@@ -447,17 +532,18 @@ class BotSystem:
         try:
             chat = chat_member_update['chat']
             new_status = chat_member_update['new_chat_member']['status']
-            old_status = chat_member_update['old_chat_member']['status']
             
             chat_id = str(chat['id'])
             chat_title = chat.get('title', 'Bilinmeyen')
             
-            print(f"🤖 Bot durumu değişti: {chat_title} - {old_status} -> {new_status}")
+            is_admin = new_status == 'administrator'
+            added_by = str(chat_member_update.get('from', {}).get('id', 'unknown'))
             
-            if new_status == 'administrator':
-                # Bot admin yapıldı
-                added_by = str(chat_member_update.get('from', {}).get('id', 'unknown'))
-                self.db.set_bot_admin(chat_id, chat_title, added_by, True)
+            # Bot admin durumunu güncelle
+            self.db.update_bot_admin_status(chat_id, chat_title, is_admin, added_by)
+            
+            if is_admin:
+                print(f"✅ Bot admin yapıldı: {chat_title} ({chat_id})")
                 
                 # Admin'e bildir
                 admin_msg = (
@@ -468,13 +554,48 @@ class BotSystem:
                     f"⏰ <b>Tarih:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}"
                 )
                 send_telegram_message(ADMIN_ID, admin_msg)
-                
-            elif new_status in ['kicked', 'left']:
-                # Bot gruptan çıkarıldı
-                self.db.set_bot_admin(chat_id, chat_title, '', False)
-                
+            
         except Exception as e:
             print(f"❌ Chat member update hatası: {e}")
+    
+    def process_forwarded_message(self, message):
+        """Forward edilen mesajı işle (BOT KAMPANYASI İÇİN)"""
+        try:
+            if 'from' not in message:
+                return
+            
+            user_id = str(message['from']['id'])
+            user_state = self.get_user_state(user_id)
+            
+            # Eğer kullanıcı forward mesajı bekliyorsa (bot kampanyası oluşturuyorsa)
+            if user_state['state'] == 'waiting_forward_message':
+                # Forward mesajını kaydet
+                forward_data = {
+                    'message_id': str(message['message_id']),
+                    'from_user_id': user_id,
+                    'from_chat_id': str(message['chat']['id']),
+                    'message_text': message.get('text', message.get('caption', ''))
+                }
+                
+                self.db.save_forward_message(forward_data)
+                
+                # Kullanıcının durumunu güncelle
+                user_state['data']['forward_message_id'] = str(message['message_id'])
+                self.set_user_state(user_id, user_state['state'], user_state['data'])
+                
+                # Kullanıcıya teşekkür et
+                send_telegram_message(
+                    user_id,
+                    "✅ <b>Forward mesajı alındı!</b>\n\n"
+                    "Şimdi kampanya oluşturmaya devam edebilirsiniz.\n\n"
+                    "👇 <b>Devam etmek için tıklayın:</b>",
+                    {'inline_keyboard': [[
+                        {'text': "➡️ Devam Et", 'callback_data': 'continue_campaign_creation'}
+                    ]]}
+                )
+            
+        except Exception as e:
+            print(f"❌ Forward mesaj işleme hatası: {e}")
     
     def process_message(self, message):
         """Gelen mesajı işle"""
@@ -508,12 +629,10 @@ class BotSystem:
                     self.show_main_menu(user_id)
                 elif text == '/admin' and user_id == ADMIN_ID:
                     self.show_admin_panel(user_id)
-                elif text == '/checkadmin':
-                    self.check_bot_admin_status(user_id, message)
-                elif text == '/withdraw':
-                    self.show_withdraw(user_id)
                 elif text == '/createcampaign':
-                    self.start_campaign_creation(user_id)
+                    self.start_campaign_type_selection(user_id)
+                elif text == '/forwardtest' and user_id == ADMIN_ID:
+                    self.test_forward_message(user_id)
             
         except Exception as e:
             print(f"❌ Mesaj işleme hatası: {e}")
@@ -522,193 +641,265 @@ class BotSystem:
         """Kullanıcı durumuna göre mesajı işle"""
         state = user_state['state']
         data = user_state['data']
+        step = user_state.get('step', 1)
         
-        if state == 'creating_campaign_name':
-            # Kampanya ismi alındı
-            data['name'] = message['text']
-            self.set_user_state(user_id, 'creating_campaign_desc', data)
+        # KAMPANYA OLUŞTURMA ADIMLARI
+        if state == 'creating_campaign':
+            task_type = data.get('task_type')
             
-            markup = {
-                'inline_keyboard': [
-                    [
-                        {'text': "✅ Onayla", 'callback_data': 'camp_confirm_name'},
-                        {'text': "❌ İptal", 'callback_data': 'camp_cancel'}
-                    ]
-                ]
-            }
-            
-            send_telegram_message(
-                user_id,
-                f"📝 <b>Kampanya İsmi:</b> {message['text']}\n\n"
-                f"✅ Onaylıyor musunuz?",
-                markup
-            )
-        
-        elif state == 'creating_campaign_desc':
-            # Kampanya açıklaması alındı
-            data['description'] = message['text']
-            self.set_user_state(user_id, 'creating_campaign_link', data)
-            
-            markup = {
-                'inline_keyboard': [
-                    [
-                        {'text': "✅ Onayla", 'callback_data': 'camp_confirm_desc'},
-                        {'text': "❌ İptal", 'callback_data': 'camp_cancel'}
-                    ]
-                ]
-            }
-            
-            send_telegram_message(
-                user_id,
-                f"📄 <b>Kampanya Açıklaması:</b>\n{message['text']}\n\n"
-                f"✅ Onaylıyor musunuz?",
-                markup
-            )
-        
-        elif state == 'creating_campaign_link':
-            # Kampanya linki alındı
-            data['link'] = message['text']
-            self.set_user_state(user_id, 'creating_campaign_budget', data)
-            
-            markup = {
-                'inline_keyboard': [
-                    [
-                        {'text': "✅ Onayla", 'callback_data': 'camp_confirm_link'},
-                        {'text': "❌ İptal", 'callback_data': 'camp_cancel'}
-                    ]
-                ]
-            }
-            
-            send_telegram_message(
-                user_id,
-                f"🔗 <b>Kampanya Linki:</b>\n{message['text']}\n\n"
-                f"✅ Onaylıyor musunuz?",
-                markup
-            )
-        
-        elif state == 'creating_campaign_budget':
-            # Kampanya bütçesi alındı
-            try:
-                budget = float(message['text'])
-                data['budget'] = budget
-                self.set_user_state(user_id, 'creating_campaign_final', data)
+            # ADIM 1: Kampanya İsmi
+            if step == 1:
+                data['name'] = message['text']
+                self.update_user_state_step(user_id, 2)
                 
-                # Özet göster
-                user = self.db.get_user(user_id)
-                summary = (
-                    f"🎯 <b>KAMPANYA ÖZETİ</b>\n"
-                    f"══════════════════════════════\n\n"
-                    f"📛 <b>İsim:</b> {data.get('name', 'Belirtilmedi')}\n"
-                    f"📄 <b>Açıklama:</b> {data.get('description', 'Belirtilmedi')}\n"
-                    f"🔗 <b>Link:</b> {data.get('link', 'Belirtilmedi')}\n"
-                    f"💰 <b>Bütçe:</b> {budget:.2f}₺\n"
-                    f"👤 <b>Oluşturan:</b> {user.get('name', 'Kullanıcı')}\n\n"
-                    f"⚠️ <b>Not:</b> Kampanya admin onayından sonra aktif olacaktır."
-                )
-                
-                markup = {
-                    'inline_keyboard': [
-                        [
-                            {'text': "✅ Kampanyayı Oluştur", 'callback_data': 'camp_create_final'},
-                            {'text': "❌ İptal Et", 'callback_data': 'camp_cancel'}
-                        ]
-                    ]
-                }
-                
-                send_telegram_message(user_id, summary, markup)
-                
-            except ValueError:
-                send_telegram_message(
-                    user_id,
-                    "❌ <b>Geçersiz bütçe!</b>\n"
-                    "Lütfen geçerli bir sayı girin (örn: 100, 50.5)"
-                )
-        
-        elif state == 'withdraw_method':
-            # Para çekim yöntemi seçildi
-            if message['text'] in ['Papara', 'Banka', 'Kripto']:
-                data['method'] = message['text']
-                self.set_user_state(user_id, 'withdraw_amount', data)
+                # Admin'e bildir (1/5)
+                self.send_admin_progress(user_id, task_type, 1, data['name'])
                 
                 send_telegram_message(
                     user_id,
-                    f"💸 <b>Para Çekme - Adım 2/3</b>\n\n"
-                    f"✅ <b>Yöntem:</b> {message['text']}\n\n"
-                    f"💰 <b>Çekmek istediğiniz tutarı girin:</b>\n"
-                    f"(Minimum: 20₺, Maksimum: Bakiyeniz)"
+                    f"✅ <b>1/5 - İsim Onaylandı:</b> {data['name']}\n\n"
+                    f"📝 <b>2/5 - Kampanya Açıklaması</b>\n\n"
+                    f"Lütfen kampanya açıklamasını girin:"
                 )
-        
-        elif state == 'withdraw_amount':
-            # Para çekim tutarı alındı
-            try:
-                amount = float(message['text'])
-                user = self.db.get_user(user_id)
-                balance = user.get('balance', 0)
+            
+            # ADIM 2: Açıklama
+            elif step == 2:
+                data['description'] = message['text']
+                self.update_user_state_step(user_id, 3)
                 
-                if amount < 20:
+                # Admin'e bildir (2/5)
+                self.send_admin_progress(user_id, task_type, 2, data['description'])
+                
+                send_telegram_message(
+                    user_id,
+                    f"✅ <b>2/5 - Açıklama Onaylandı</b>\n\n"
+                    f"🔗 <b>3/5 - Kampanya Linki</b>\n\n"
+                    f"Lütfen kampanya linkini girin:"
+                )
+            
+            # ADIM 3: Link
+            elif step == 3:
+                data['link'] = message['text']
+                self.update_user_state_step(user_id, 4)
+                
+                # Admin'e bildir (3/5)
+                self.send_admin_progress(user_id, task_type, 3, data['link'])
+                
+                # KANAL/GRUP KAMPANYASI İSE TARGET CHAT ID İSTE
+                if task_type in ['channel', 'group']:
                     send_telegram_message(
                         user_id,
-                        f"❌ <b>Minimum çekim tutarı 20₺!</b>\n\n"
-                        f"💰 Mevcut bakiye: {balance:.2f}₺"
-                    )
-                elif amount > balance:
-                    send_telegram_message(
-                        user_id,
-                        f"❌ <b>Yetersiz bakiye!</b>\n\n"
-                        f"💰 Mevcut bakiye: {balance:.2f}₺\n"
-                        f"💸 İstenen tutar: {amount:.2f}₺"
+                        f"✅ <b>3/5 - Link Onaylandı</b>\n\n"
+                        f"🎯 <b>4/5 - Hedef Kanal/Grup</b>\n\n"
+                        f"Lütfen katılım yapılacak kanalın veya grubun @kullanıcıadı veya ID'sini girin:\n\n"
+                        f"💡 Örnekler:\n"
+                        f"• @kanal_adi\n"
+                        f"• -1001234567890 (kanal ID)\n"
+                        f"• @grup_adi"
                     )
                 else:
-                    data['amount'] = amount
-                    self.set_user_state(user_id, 'withdraw_account', data)
+                    send_telegram_message(
+                        user_id,
+                        f"✅ <b>3/5 - Link Onaylandı</b>\n\n"
+                        f"💰 <b>4/5 - Kampanya Bütçesi</b>\n\n"
+                        f"Lütfen kampanya bütçesini girin (₺):"
+                    )
+            
+            # ADIM 4: Target Chat ID (Kanal/Grup) veya Bütçe (Bot)
+            elif step == 4:
+                if task_type in ['channel', 'group']:
+                    # Kanal/Grup ID'sini al
+                    target_chat = message['text'].strip()
+                    data['target_chat_id'] = target_chat
                     
-                    method = data.get('method', 'Bilinmiyor')
+                    # Bot'un admin olup olmadığını kontrol et
+                    if not self.check_bot_admin_in_chat(target_chat):
+                        send_telegram_message(
+                            user_id,
+                            f"❌ <b>BOT ADMIN DEĞİL!</b>\n\n"
+                            f"Kanal/Grup: {target_chat}\n\n"
+                            f"⚠️ <b>Önce bot'u bu kanala/gruba ekleyin ve ADMIN yapın!</b>\n\n"
+                            f"💡 Nasıl yapılır:\n"
+                            f"1. Bot'u kanala/gruba ekle\n"
+                            f"2. Tüm yetkileri ver (Admin yap)\n"
+                            f"3. Buraya tekrar kanal/grubun @adını yaz\n\n"
+                            f"🔙 İptal etmek için: /menu"
+                        )
+                        return
+                    
+                    self.update_user_state_step(user_id, 5)
+                    
+                    # Admin'e bildir (4/5)
+                    self.send_admin_progress(user_id, task_type, 4, f"Hedef: {target_chat}")
                     
                     send_telegram_message(
                         user_id,
-                        f"💸 <b>Para Çekme - Adım 3/3</b>\n\n"
-                        f"✅ <b>Yöntem:</b> {method}\n"
-                        f"💰 <b>Tutar:</b> {amount:.2f}₺\n\n"
-                        f"📋 <b>{method} bilgilerinizi girin:</b>\n"
-                        f"• Papara için: Papara numarası\n"
-                        f"• Banka için: IBAN\n"
-                        f"• Kripto için: Cüzdan adresi"
+                        f"✅ <b>4/5 - Hedef Onaylandı:</b> {target_chat}\n\n"
+                        f"💰 <b>5/5 - Kampanya Bütçesi</b>\n\n"
+                        f"Lütfen kampanya bütçesini girin (₺):"
                     )
+                else:
+                    # Bot kampanyası için direkt bütçe
+                    try:
+                        budget = float(message['text'])
+                        data['budget'] = budget
+                        self.update_user_state_step(user_id, 6)  # Bot için son adım
+                        
+                        # Admin'e bildir (4/5)
+                        self.send_admin_progress(user_id, task_type, 4, f"Bütçe: {budget}₺")
+                        
+                        # Son özet ve onay
+                        self.show_campaign_summary(user_id, data)
+                        
+                    except ValueError:
+                        send_telegram_message(
+                            user_id,
+                            "❌ <b>Geçersiz bütçe!</b>\n"
+                            "Lütfen geçerli bir sayı girin (örn: 100, 50.5)"
+                        )
+            
+            # ADIM 5: Bütçe (Kanal/Grup)
+            elif step == 5 and task_type in ['channel', 'group']:
+                try:
+                    budget = float(message['text'])
+                    data['budget'] = budget
+                    self.update_user_state_step(user_id, 6)  # Son adım
                     
-            except ValueError:
-                send_telegram_message(
-                    user_id,
-                    "❌ <b>Geçersiz tutar!</b>\n"
-                    "Lütfen geçerli bir sayı girin (örn: 50, 100.5)"
-                )
+                    # Admin'e bildir (5/5)
+                    self.send_admin_progress(user_id, task_type, 5, f"Bütçe: {budget}₺")
+                    
+                    # Son özet ve onay
+                    self.show_campaign_summary(user_id, data)
+                    
+                except ValueError:
+                    send_telegram_message(
+                        user_id,
+                        "❌ <b>Geçersiz bütçe!</b>\n"
+                        "Lütfen geçerli bir sayı girin (örn: 100, 50.5)"
+                    )
+    
+    def send_admin_progress(self, user_id, task_type, step, content):
+        """Admin'e ilerleme bildirimi gönder"""
+        user = self.db.get_user(user_id)
+        user_name = user.get('name', 'Kullanıcı')
         
-        elif state == 'withdraw_account':
-            # Hesap bilgileri alındı
-            data['account_info'] = message['text']
-            self.set_user_state(user_id, 'withdraw_confirm', data)
-            
-            # Özet göster
-            summary = (
-                f"💸 <b>PARA ÇEKİM ÖZETİ</b>\n"
-                f"══════════════════════════════\n\n"
-                f"👤 <b>Kullanıcı:</b> {self.db.get_user(user_id).get('name', 'Kullanıcı')}\n"
-                f"💰 <b>Tutar:</b> {data.get('amount', 0):.2f}₺\n"
-                f"📋 <b>Yöntem:</b> {data.get('method', 'Bilinmiyor')}\n"
-                f"🔢 <b>Hesap:</b> {message['text']}\n\n"
-                f"⚠️ <b>Not:</b> İşlem 24-48 saat içinde tamamlanacaktır."
-            )
-            
-            markup = {
-                'inline_keyboard': [
-                    [
-                        {'text': "✅ Onayla", 'callback_data': 'withdraw_confirm_final'},
-                        {'text': "❌ İptal", 'callback_data': 'withdraw_cancel'}
-                    ]
+        step_names = {
+            1: "İsim",
+            2: "Açıklama", 
+            3: "Link",
+            4: "Hedef" if task_type in ['channel', 'group'] else "Bütçe",
+            5: "Bütçe"
+        }
+        
+        task_names = {
+            'bot': '🤖 Bot Kampanyası',
+            'channel': '📢 Kanal Kampanyası',
+            'group': '👥 Grup Kampanyası'
+        }
+        
+        admin_msg = (
+            f"📝 <b>KAMPANYA OLUŞTURMA İLERLEMESİ</b>\n"
+            f"══════════════════════════════\n\n"
+            f"👤 <b>Kullanıcı:</b> {user_name}\n"
+            f"🆔 <b>ID:</b> {user_id}\n"
+            f"🎯 <b>Tip:</b> {task_names.get(task_type)}\n"
+            f"📊 <b>Adım:</b> {step}/5 - {step_names.get(step)}\n\n"
+            f"📋 <b>İçerik:</b>\n{content}\n\n"
+            f"⏰ <b>Zaman:</b> {datetime.now().strftime('%H:%M:%S')}"
+        )
+        
+        send_telegram_message(ADMIN_ID, admin_msg)
+    
+    def show_campaign_summary(self, user_id, data):
+        """Kampanya özetini göster ve onay iste"""
+        task_type = data.get('task_type', 'group')
+        task_names = {
+            'bot': '🤖 Bot Kampanyası',
+            'channel': '📢 Kanal Kampanyası',
+            'group': '👥 Grup Kampanyası'
+        }
+        
+        prices = {'bot': 2.5, 'channel': 1.5, 'group': 1.0}
+        price = prices.get(task_type, 1.0)
+        budget = data.get('budget', 0)
+        max_participants = int(budget / price)
+        
+        user = self.db.get_user(user_id)
+        user_balance = user.get('balance', 0)
+        
+        summary = (
+            f"🎯 <b>KAMPANYA ÖZETİ (5/5)</b>\n"
+            f"══════════════════════════════\n\n"
+            f"📛 <b>İsim:</b> {data.get('name', 'Belirtilmedi')}\n"
+            f"📄 <b>Açıklama:</b> {data.get('description', 'Belirtilmedi')}\n"
+            f"🔗 <b>Link:</b> {data.get('link', 'Belirtilmedi')}\n"
+        )
+        
+        if task_type in ['channel', 'group']:
+            summary += f"🎯 <b>Hedef:</b> {data.get('target_chat_id', 'Belirtilmedi')}\n"
+        
+        if task_type == 'bot':
+            summary += f"🔄 <b>Görev:</b> Forward mesajı\n"
+        
+        summary += (
+            f"🎯 <b>Tip:</b> {task_names.get(task_type)}\n"
+            f"💰 <b>Bütçe:</b> {budget:.2f}₺\n"
+            f"💵 <b>Görev Ücreti:</b> {price}₺\n"
+            f"👥 <b>Maksimum Katılım:</b> {max_participants}\n"
+            f"👤 <b>Oluşturan:</b> {user.get('name', 'Kullanıcı')}\n"
+            f"💵 <b>Mevcut Bakiyen:</b> {user_balance:.2f}₺\n\n"
+        )
+        
+        if user_balance < budget:
+            summary += f"❌ <b>YETERSİZ BAKİYE!</b> {user_balance:.2f}₺ / {budget:.2f}₺\n"
+        
+        summary += "👇 <b>Yayınlamak için onay verin:</b>"
+        
+        markup = {
+            'inline_keyboard': [
+                [
+                    {'text': "✅ YAYINLA", 'callback_data': 'campaign_publish'},
+                    {'text': "❌ İPTAL ET", 'callback_data': 'campaign_cancel'}
                 ]
-            }
+            ]
+        }
+        
+        send_telegram_message(user_id, summary, markup)
+    
+    def check_bot_admin_in_chat(self, chat_id):
+        """Bot'un bir chat'te admin olup olmadığını kontrol et"""
+        try:
+            # Önce veritabanından kontrol et
+            if self.db.check_bot_admin_status(chat_id):
+                return True
             
-            send_telegram_message(user_id, summary, markup)
-            self.clear_user_state(user_id)
+            # Telegram API'den kontrol et
+            admins = get_chat_administrators(chat_id)
+            if not admins:
+                return False
+            
+            # Bot ID'sini al
+            bot_info = requests.get(f"{BASE_URL}getMe", timeout=10).json()
+            if not bot_info.get('ok'):
+                return False
+            
+            bot_id = str(bot_info['result']['id'])
+            
+            # Admin listesinde bot var mı kontrol et
+            for admin in admins:
+                if str(admin['user']['id']) == bot_id:
+                    is_admin = admin['status'] == 'administrator'
+                    # Veritabanını güncelle
+                    chat_info = get_chat(chat_id)
+                    chat_title = chat_info.get('result', {}).get('title', 'Bilinmeyen') if chat_info.get('ok') else 'Bilinmeyen'
+                    self.db.update_bot_admin_status(chat_id, chat_title, is_admin)
+                    return is_admin
+            
+            return False
+            
+        except Exception as e:
+            print(f"❌ Bot admin kontrol hatası: {e}")
+            return False
     
     def process_callback(self, callback):
         """Callback işle"""
@@ -720,154 +911,46 @@ class BotSystem:
             # Cevap gönder
             answer_callback(callback_id)
             
-            # Özel callback'ler
-            if data == 'joined':
-                self.handle_joined(user_id)
-            
-            elif data == 'menu':
+            # Callback türlerine göre işle
+            if data == 'menu':
                 self.show_main_menu(user_id)
             
-            elif data == 'withdraw':
-                self.show_withdraw(user_id)
-            
-            elif data == 'start_withdraw':
-                self.start_withdrawal_process(user_id)
-            
-            elif data.startswith('withdraw_confirm_'):
-                if data == 'withdraw_confirm_final':
-                    self.finalize_withdrawal(user_id)
-                elif data == 'withdraw_cancel':
-                    self.clear_user_state(user_id)
-                    send_telegram_message(user_id, "❌ Para çekim işlemi iptal edildi.")
-            
             elif data == 'create_campaign':
-                self.start_campaign_creation(user_id)
+                self.start_campaign_type_selection(user_id)
             
-            elif data.startswith('camp_'):
-                self.handle_campaign_callback(user_id, data)
+            elif data.startswith('camp_type_'):
+                task_type = data.replace('camp_type_', '')
+                self.start_campaign_creation(user_id, task_type)
             
-            elif data == 'check_admin_status':
-                self.check_bot_admin_status(user_id, callback.get('message', {}))
+            elif data == 'continue_campaign_creation':
+                self.continue_campaign_creation(user_id)
             
-            elif data == 'forward_on':
-                self.set_forward_requirement(user_id, True)
+            elif data == 'campaign_publish':
+                self.publish_campaign(user_id)
             
-            elif data == 'forward_off':
-                self.set_forward_requirement(user_id, False)
+            elif data == 'campaign_cancel':
+                self.clear_user_state(user_id)
+                send_telegram_message(user_id, "❌ Kampanya oluşturma iptal edildi.")
+            
+            elif data.startswith('admin_approve_'):
+                campaign_id = data.replace('admin_approve_', '')
+                self.admin_approve_campaign(user_id, campaign_id)
+            
+            elif data.startswith('admin_reject_'):
+                campaign_id = data.replace('admin_reject_', '')
+                self.admin_reject_campaign(user_id, campaign_id)
+            
+            elif data == 'admin_check_bot':
+                self.check_bot_admin_command(user_id, callback.get('message', {}))
             
             else:
-                # Diğer callback'ler (eski sistemle uyumluluk)
-                self.process_legacy_callback(user_id, data)
+                self.handle_general_callback(user_id, data)
                 
         except Exception as e:
             print(f"❌ Callback işleme hatası: {e}")
     
-    def handle_campaign_callback(self, user_id, data):
-        """Kampanya callback'lerini işle"""
-        user_state = self.get_user_state(user_id)
-        
-        if data == 'camp_cancel':
-            self.clear_user_state(user_id)
-            send_telegram_message(user_id, "❌ Kampanya oluşturma iptal edildi.")
-        
-        elif data == 'camp_confirm_name':
-            send_telegram_message(
-                user_id,
-                "📄 <b>Kampanya Açıklaması</b>\n\n"
-                "Lütfen kampanya açıklamasını girin:"
-            )
-        
-        elif data == 'camp_confirm_desc':
-            send_telegram_message(
-                user_id,
-                "🔗 <b>Kampanya Linki</b>\n\n"
-                "Lütfen kampanya linkini girin:"
-            )
-        
-        elif data == 'camp_confirm_link':
-            send_telegram_message(
-                user_id,
-                "💰 <b>Kampanya Bütçesi</b>\n\n"
-                "Lütfen kampanya bütçesini girin (₺):"
-            )
-        
-        elif data == 'camp_create_final':
-            self.finalize_campaign_creation(user_id, user_state['data'])
-    
-    def finalize_campaign_creation(self, user_id, campaign_data):
-        """Kampanya oluşturmayı tamamla"""
-        try:
-            # Kampanya ID oluştur
-            campaign_id = hashlib.md5(
-                f"{user_id}{time.time()}{campaign_data['name']}".encode()
-            ).hexdigest()[:10].upper()
-            
-            # Kampanya verilerini hazırla
-            user = self.db.get_user(user_id)
-            full_data = {
-                'campaign_id': campaign_id,
-                'name': campaign_data.get('name', 'İsimsiz'),
-                'description': campaign_data.get('description', 'Açıklama yok'),
-                'link': campaign_data.get('link', ''),
-                'budget': campaign_data.get('budget', 0),
-                'creator_id': user_id,
-                'creator_name': user.get('name', 'Kullanıcı'),
-                'task_type': 'custom',
-                'price_per_task': 1.0,  # Varsayılan
-                'max_participants': int(campaign_data.get('budget', 0) / 1.0),
-                'status': 'pending',
-                'requires_forward': 0,
-                'forward_channel': '',
-                'steps': json.dumps(['Linke tıkla', 'Formu doldur', 'Ekran görüntüsü al'])
-            }
-            
-            # Veritabanına kaydet
-            if self.db.create_campaign(full_data):
-                # Kullanıcıya bilgi ver
-                send_telegram_message(
-                    user_id,
-                    f"✅ <b>KAMPANYA OLUŞTURULDU!</b>\n\n"
-                    f"📛 <b>İsim:</b> {full_data['name']}\n"
-                    f"💰 <b>Bütçe:</b> {full_data['budget']:.2f}₺\n"
-                    f"🔢 <b>Kampanya ID:</b> <code>{campaign_id}</code>\n\n"
-                    f"⏳ <b>Durum:</b> Admin onayı bekleniyor...\n"
-                    f"✅ Admin onayından sonra kampanya aktif olacaktır."
-                )
-                
-                # Admin'e bildir
-                admin_msg = (
-                    f"🔔 <b>YENİ KAMPANYA ONAY BEKLİYOR</b>\n\n"
-                    f"📛 <b>İsim:</b> {full_data['name']}\n"
-                    f"👤 <b>Oluşturan:</b> {user.get('name', 'Kullanıcı')}\n"
-                    f"🆔 <b>Kullanıcı ID:</b> {user_id}\n"
-                    f"💰 <b>Bütçe:</b> {full_data['budget']:.2f}₺\n"
-                    f"🔗 <b>Link:</b> {full_data['link']}\n"
-                    f"🔢 <b>Kampanya ID:</b> <code>{campaign_id}</code>\n\n"
-                    f"📅 <b>Tarih:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}"
-                )
-                
-                markup = {
-                    'inline_keyboard': [
-                        [
-                            {'text': "✅ Onayla", 'callback_data': f'admin_approve_campaign_{campaign_id}'},
-                            {'text': "❌ Reddet", 'callback_data': f'admin_reject_campaign_{campaign_id}'}
-                        ]
-                    ]
-                }
-                
-                send_telegram_message(ADMIN_ID, admin_msg, markup)
-                
-                self.clear_user_state(user_id)
-            else:
-                send_telegram_message(user_id, "❌ Kampanya oluşturulurken bir hata oluştu!")
-                
-        except Exception as e:
-            print(f"❌ Kampanya oluşturma hatası: {e}")
-            send_telegram_message(user_id, "❌ Kampanya oluşturulurken bir hata oluştu!")
-    
-    def start_campaign_creation(self, user_id):
-        """Kampanya oluşturma sürecini başlat"""
-        # Kanal kontrolü
+    def start_campaign_type_selection(self, user_id):
+        """Kampanya tipi seçimi"""
         if not get_chat_member(f"@{MANDATORY_CHANNEL}", user_id):
             send_telegram_message(
                 user_id,
@@ -875,174 +958,324 @@ class BotSystem:
             )
             return
         
-        self.set_user_state(user_id, 'creating_campaign_name', {})
-        
-        send_telegram_message(
-            user_id,
-            "🎯 <b>YENİ KAMPANYA OLUŞTUR</b>\n"
-            "══════════════════════════════\n\n"
-            "📝 <b>Adım 1/4 - Kampanya İsmi</b>\n\n"
-            "Lütfen kampanya ismini girin:"
-        )
-    
-    def show_withdraw(self, user_id):
-        """PARA ÇEKME MENÜSÜ"""
-        user = self.db.get_user(user_id)
-        balance = user.get('balance', 0)
-        
-        # Son çekimler
-        self.db.cursor.execute(
-            "SELECT * FROM withdrawals WHERE user_id = ? ORDER BY created_at DESC LIMIT 3",
-            (user_id,)
-        )
-        recent_withdrawals = self.db.cursor.fetchall()
-        
         message = (
-            f"💸 <b>PARA ÇEKME</b>\n"
-            f"══════════════════════════════\n\n"
-            f"💰 <b>Mevcut Bakiye:</b> {balance:.2f}₺\n"
-            f"📊 <b>Minimum Çekim:</b> 20₺\n"
-            f"⏰ <b>İşlem Süresi:</b> 24-48 saat\n\n"
-            f"🎯 <b>YÖNTEMLER</b>\n"
-            f"• 📱 Papara\n"
-            f"• 🏦 Banka Havalesi\n"
-            f"• ₿ Kripto Para\n\n"
-            f"📋 <b>SON İŞLEMLER:</b>\n"
+            "🎯 <b>KAMPANYA TİPİ SEÇİN</b>\n"
+            "══════════════════════════════\n\n"
+            "🤖 <b>BOT KAMPANYASI</b>\n"
+            "• Görev: Bot mesajını forward etme\n"
+            "• Ödül: 2.5₺\n"
+            "• Gereksinim: Forward mesajı\n\n"
+            "📢 <b>KANAL KAMPANYASI</b>\n"
+            "• Görev: Kanala katılma\n"
+            "• Ödül: 1.5₺\n"
+            "• Gereksinim: Bot kanalda admin olmalı\n\n"
+            "👥 <b>GRUP KAMPANYASI</b>\n"
+            "• Görev: Gruba katılma\n"
+            "• Ödül: 1₺\n"
+            "• Gereksinim: Bot grupta admin olmalı\n\n"
+            "👇 <b>Hangi tür kampanya oluşturmak istiyorsunuz?</b>"
         )
-        
-        if recent_withdrawals:
-            for wd in recent_withdrawals:
-                status_icon = "✅" if wd['status'] == 'completed' else "⏳" if wd['status'] == 'processing' else "🔄"
-                message += f"{status_icon} {wd['amount']:.2f}₺ - {wd['status']}\n"
-        else:
-            message += "Henüz çekim yapılmamış.\n"
-        
-        message += f"\n⚠️ <i>İşlem ücreti yoktur.</i>"
-        
-        markup = {
-            'inline_keyboard': []
-        }
-        
-        # Minimum kontrolü
-        if balance >= 20.0:
-            markup['inline_keyboard'].append([
-                {'text': "💸 PARA ÇEK", 'callback_data': 'start_withdraw'}
-            ])
-        else:
-            markup['inline_keyboard'].append([
-                {'text': f"❌ Minimum: 20₺ (Bakiyen: {balance:.2f}₺)", 'callback_data': 'none'}
-            ])
-        
-        markup['inline_keyboard'].append([
-            {'text': "📊 Bakiye", 'callback_data': 'balance'},
-            {'text': "🔙 Geri", 'callback_data': 'menu'}
-        ])
-        
-        send_telegram_message(user_id, message, markup)
-    
-    def start_withdrawal_process(self, user_id):
-        """Para çekim sürecini başlat"""
-        user = self.db.get_user(user_id)
-        balance = user.get('balance', 0)
-        
-        if balance < 20.0:
-            send_telegram_message(
-                user_id,
-                f"❌ <b>Minimum çekim tutarı 20₺!</b>\n\n"
-                f"💰 Mevcut bakiye: {balance:.2f}₺"
-            )
-            return
-        
-        self.set_user_state(user_id, 'withdraw_method', {})
         
         markup = {
             'inline_keyboard': [
                 [
-                    {'text': "📱 Papara", 'callback_data': 'withdraw_method_papara'},
-                    {'text': "🏦 Banka", 'callback_data': 'withdraw_method_banka'}
+                    {'text': "🤖 Bot Kampanyası", 'callback_data': 'camp_type_bot'},
+                    {'text': "📢 Kanal Kampanyası", 'callback_data': 'camp_type_channel'}
                 ],
                 [
-                    {'text': "₿ Kripto", 'callback_data': 'withdraw_method_kripto'},
-                    {'text': "❌ İptal", 'callback_data': 'withdraw_cancel'}
+                    {'text': "👥 Grup Kampanyası", 'callback_data': 'camp_type_group'},
+                    {'text': "🔙 Geri", 'callback_data': 'menu'}
                 ]
             ]
         }
         
+        send_telegram_message(user_id, message, markup)
+    
+    def start_campaign_creation(self, user_id, task_type):
+        """Kampanya oluşturma sürecini başlat"""
+        task_names = {
+            'bot': '🤖 Bot Kampanyası',
+            'channel': '📢 Kanal Kampanyası',
+            'group': '👥 Grup Kampanyası'
+        }
+        
+        if task_type == 'bot':
+            # BOT KAMPANYASI: Önce forward mesajı iste
+            self.set_user_state(user_id, 'waiting_forward_message', {
+                'task_type': task_type
+            })
+            
+            # Son forward mesajları göster
+            latest_messages = self.db.get_latest_forward_messages(3)
+            
+            message = (
+                f"🎯 <b>{task_names.get(task_type)} OLUŞTURMA</b>\n"
+                f"══════════════════════════════\n\n"
+                f"🔄 <b>ADIM 1/6 - Forward Mesajı</b>\n\n"
+                f"Lütfen <b>bu bot'tan bir mesajı</b> bana forward edin:\n\n"
+                f"💡 <b>Nasıl yapılır:</b>\n"
+                f"1. Bu bot'tan bir mesaj bulun\n"
+                f"2. Mesajı seçin\n"
+                f"3. 'Forward' butonuna basın\n"
+                f"4. Beni (@{requests.get(f'{BASE_URL}getMe').json()['result']['username']}) seçin\n\n"
+            )
+            
+            if latest_messages:
+                message += f"📋 <b>Son Kullanılan Mesajlar:</b>\n"
+                for i, msg in enumerate(latest_messages, 1):
+                    preview = msg['message_text'][:50] + "..." if len(msg['message_text']) > 50 else msg['message_text']
+                    message += f"{i}. {preview}\n"
+                message += "\n"
+            
+            message += "⏳ <b>Forward mesajınızı bekliyorum...</b>"
+            
+            send_telegram_message(user_id, message)
+            
+        else:
+            # KANAL/GRUP KAMPANYASI: Direkt isimle başla
+            self.set_user_state(user_id, 'creating_campaign', {
+                'task_type': task_type
+            })
+            
+            send_telegram_message(
+                user_id,
+                f"🎯 <b>{task_names.get(task_type)} OLUŞTURMA</b>\n"
+                f"══════════════════════════════\n\n"
+                f"📝 <b>1/5 - Kampanya İsmi</b>\n\n"
+                f"Lütfen kampanya ismini girin:\n\n"
+                f"💡 Örnek: 'Telegram Kanalına Katıl', 'Youtube Abone Ol'"
+            )
+    
+    def continue_campaign_creation(self, user_id):
+        """Forward mesajı alındıktan sonra kampanya oluşturmaya devam et"""
+        user_state = self.get_user_state(user_id)
+        data = user_state['data']
+        
+        # Durumu güncelle
+        self.set_user_state(user_id, 'creating_campaign', data)
+        self.update_user_state_step(user_id, 1)  # İsim adımına geç
+        
         send_telegram_message(
             user_id,
-            f"💸 <b>PARA ÇEKME - Adım 1/3</b>\n\n"
-            f"💰 <b>Mevcut bakiye:</b> {balance:.2f}₺\n\n"
-            f"👇 <b>Para çekme yöntemini seç:</b>",
-            markup
+            f"✅ <b>Forward mesajı kaydedildi!</b>\n\n"
+            f"📝 <b>1/5 - Kampanya İsmi</b>\n\n"
+            f"Lütfen kampanya ismini girin:"
         )
     
-    def finalize_withdrawal(self, user_id):
-        """Para çekim talebini tamamla"""
+    def publish_campaign(self, user_id):
+        """Kampanyayı yayınla (admin onayına gönder)"""
         user_state = self.get_user_state(user_id)
+        data = user_state['data']
         
-        if not user_state['data']:
-            send_telegram_message(user_id, "❌ Geçersiz işlem!")
+        if not data:
+            send_telegram_message(user_id, "❌ Kampanya verisi bulunamadı!")
             return
         
-        # Talep ID oluştur
-        withdrawal_id = hashlib.md5(f"{user_id}{time.time()}".encode()).hexdigest()[:10].upper()
+        # Bakiye kontrolü
+        user = self.db.get_user(user_id)
+        user_balance = user.get('balance', 0)
+        campaign_budget = data.get('budget', 0)
         
-        withdrawal_data = {
-            'withdrawal_id': withdrawal_id,
-            'user_id': user_id,
-            'amount': user_state['data'].get('amount', 0),
-            'method': user_state['data'].get('method', 'Bilinmiyor'),
-            'account_info': user_state['data'].get('account_info', ''),
-            'status': 'pending'
+        if user_balance < campaign_budget:
+            send_telegram_message(
+                user_id,
+                f"❌ <b>YETERSİZ BAKİYE!</b>\n\n"
+                f"💰 <b>Kampanya bütçesi:</b> {campaign_budget:.2f}₺\n"
+                f"💵 <b>Mevcut bakiyen:</b> {user_balance:.2f}₺\n\n"
+                f"⚠️ <b>Lütfen bakiye doldur veya görev yap!</b>"
+            )
+            return
+        
+        # Kampanya ID oluştur
+        campaign_id = hashlib.md5(
+            f"{user_id}{time.time()}{data['name']}".encode()
+        ).hexdigest()[:10].upper()
+        
+        # Kampanya verilerini hazırla
+        full_data = {
+            'campaign_id': campaign_id,
+            'name': data.get('name', 'İsimsiz'),
+            'description': data.get('description', 'Açıklama yok'),
+            'link': data.get('link', ''),
+            'budget': campaign_budget,
+            'creator_id': user_id,
+            'creator_name': user.get('name', 'Kullanıcı'),
+            'task_type': data.get('task_type', 'group'),
+            'forward_message_id': data.get('forward_message_id', ''),
+            'target_chat_id': data.get('target_chat_id', ''),
+            'requires_admin_check': 1 if data.get('task_type') in ['channel', 'group'] else 0,
+            'admin_checked': 1 if data.get('task_type') in ['channel', 'group'] and data.get('target_chat_id') else 0
         }
         
         # Veritabanına kaydet
-        if self.db.create_withdrawal(withdrawal_data):
+        if self.db.create_campaign(full_data):
             # Kullanıcıya bilgi ver
-            user = self.db.get_user(user_id)
-            
-            message = (
-                f"✅ <b>PARA ÇEKİM TALEBİ OLUŞTURULDU!</b>\n\n"
-                f"📋 <b>Talep No:</b> <code>{withdrawal_id}</code>\n"
-                f"💰 <b>Tutar:</b> {withdrawal_data['amount']:.2f}₺\n"
-                f"📋 <b>Yöntem:</b> {withdrawal_data['method']}\n"
-                f"👤 <b>Adınız:</b> {user.get('name', 'Kullanıcı')}\n"
-                f"📅 <b>Tarih:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
-                f"⏳ <b>DURUM:</b> Admin onayı bekleniyor...\n"
-                f"🕐 <b>Süre:</b> 24-48 saat\n\n"
-                f"⚠️ <i>Lütfen bildirimleri açık tutun!</i>"
-            )
-            
-            # Admin'e bildir
-            admin_msg = (
-                f"🔔 <b>YENİ PARA ÇEKİM TALEBİ</b>\n\n"
-                f"👤 <b>Kullanıcı:</b> {user.get('name', 'Kullanıcı')}\n"
-                f"🆔 <b>ID:</b> {user_id}\n"
-                f"💰 <b>Tutar:</b> {withdrawal_data['amount']:.2f}₺\n"
-                f"📋 <b>Yöntem:</b> {withdrawal_data['method']}\n"
-                f"🔢 <b>Hesap:</b> {withdrawal_data['account_info']}\n"
-                f"📅 <b>Tarih:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
-                f"🔢 <b>Talep No:</b> <code>{withdrawal_id}</code>"
-            )
-            
-            markup = {
-                'inline_keyboard': [
-                    [
-                        {'text': "✅ Ödemeyi Yap", 'callback_data': f'admin_complete_withdraw_{withdrawal_id}'},
-                        {'text': "❌ Reddet", 'callback_data': f'admin_reject_withdraw_{withdrawal_id}'}
-                    ]
-                ]
+            task_names = {
+                'bot': '🤖 Bot Kampanyası',
+                'channel': '📢 Kanal Kampanyası',
+                'group': '👥 Grup Kampanyası'
             }
             
-            send_telegram_message(user_id, message)
-            send_telegram_message(ADMIN_ID, admin_msg, markup)
+            send_telegram_message(
+                user_id,
+                f"✅ <b>KAMPANYA OLUŞTURULDU!</b>\n\n"
+                f"📛 <b>İsim:</b> {full_data['name']}\n"
+                f"🎯 <b>Tip:</b> {task_names.get(full_data['task_type'])}\n"
+                f"💰 <b>Bütçe:</b> {full_data['budget']:.2f}₺\n"
+                f"🔢 <b>Kampanya ID:</b> <code>{campaign_id}</code>\n\n"
+                f"⏳ <b>Durum:</b> Admin onayı bekleniyor...\n"
+                f"✅ Onaylandıktan sonra kampanya aktif olacaktır."
+            )
+            
+            # Admin'e onay isteği gönder
+            self.send_admin_approval_request(campaign_id, full_data)
             
             self.clear_user_state(user_id)
         else:
-            send_telegram_message(user_id, "❌ Para çekim talebi oluşturulurken bir hata oluştu!")
+            send_telegram_message(user_id, "❌ Kampanya oluşturulurken bir hata oluştu!")
     
-    def check_bot_admin_status(self, user_id, message=None):
-        """Botun admin durumunu kontrol et"""
+    def send_admin_approval_request(self, campaign_id, campaign_data):
+        """Admin'e onay isteği gönder"""
+        task_names = {
+            'bot': '🤖 Bot Kampanyası',
+            'channel': '📢 Kanal Kampanyası', 
+            'group': '👥 Grup Kampanyası'
+        }
+        
+        prices = {'bot': 2.5, 'channel': 1.5, 'group': 1.0}
+        price = prices.get(campaign_data['task_type'], 1.0)
+        budget = campaign_data['budget']
+        max_participants = int(budget / price)
+        
+        admin_msg = (
+            f"🔔 <b>YENİ KAMPANYA ONAY BEKLİYOR</b>\n"
+            f"══════════════════════════════\n\n"
+            f"📛 <b>İsim:</b> {campaign_data['name']}\n"
+            f"🎯 <b>Tip:</b> {task_names.get(campaign_data['task_type'])}\n"
+            f"👤 <b>Oluşturan:</b> {campaign_data['creator_name']}\n"
+            f"🆔 <b>Kullanıcı ID:</b> {campaign_data['creator_id']}\n"
+            f"💰 <b>Bütçe:</b> {budget:.2f}₺\n"
+            f"💵 <b>Görev Ücreti:</b> {price}₺\n"
+            f"👥 <b>Maksimum Katılım:</b> {max_participants}\n"
+            f"🔗 <b>Link:</b> {campaign_data['link']}\n"
+        )
+        
+        if campaign_data['task_type'] in ['channel', 'group']:
+            admin_msg += f"🎯 <b>Hedef:</b> {campaign_data['target_chat_id']}\n"
+        
+        if campaign_data['task_type'] == 'bot':
+            admin_msg += f"🔄 <b>Forward Mesajı:</b> Evet\n"
+        
+        admin_msg += (
+            f"🔢 <b>Kampanya ID:</b> <code>{campaign_id}</code>\n\n"
+            f"📅 <b>Tarih:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
+            f"👇 <b>Onaylıyor musunuz?</b>"
+        )
+        
+        markup = {
+            'inline_keyboard': [
+                [
+                    {'text': "✅ YAYINLA", 'callback_data': f'admin_approve_{campaign_id}'},
+                    {'text': "❌ REDDET", 'callback_data': f'admin_reject_{campaign_id}'}
+                ]
+            ]
+        }
+        
+        send_telegram_message(ADMIN_ID, admin_msg, markup)
+    
+    def admin_approve_campaign(self, user_id, campaign_id):
+        """Admin kampanyayı onayla"""
+        if user_id != ADMIN_ID:
+            send_telegram_message(user_id, "❌ Bu işlem için yetkiniz yok!")
+            return
+        
+        # Kampanya bilgilerini al
+        self.db.cursor.execute(
+            "SELECT * FROM campaigns WHERE campaign_id = ?",
+            (campaign_id,)
+        )
+        campaign = self.db.cursor.fetchone()
+        
+        if not campaign:
+            send_telegram_message(user_id, "❌ Kampanya bulunamadı!")
+            return
+        
+        campaign = dict(campaign)
+        
+        # Kampanyayı aktif yap
+        self.db.update_campaign_status(campaign_id, 'active', True)
+        
+        # Kullanıcının bakiyesinden düş
+        self.db.add_balance(campaign['creator_id'], -campaign['budget'])
+        
+        # Kullanıcıya bildir
+        task_names = {
+            'bot': '🤖 Bot Kampanyası',
+            'channel': '📢 Kanal Kampanyası',
+            'group': '👥 Grup Kampanyası'
+        }
+        
+        user_msg = (
+            f"✅ <b>KAMPANYANIZ ONAYLANDI!</b>\n\n"
+            f"📛 <b>İsim:</b> {campaign['name']}\n"
+            f"🎯 <b>Tip:</b> {task_names.get(campaign['task_type'])}\n"
+            f"💰 <b>Bütçe:</b> {campaign['budget']:.2f}₺\n"
+            f"🔢 <b>Kampanya ID:</b> <code>{campaign_id}</code>\n\n"
+            f"🎉 <b>Kampanya aktif oldu!</b>\n"
+            f"Kullanıcılar hemen katılmaya başlayabilir."
+        )
+        
+        send_telegram_message(campaign['creator_id'], user_msg)
+        
+        # Admin'e bildir
+        send_telegram_message(
+            ADMIN_ID,
+            f"✅ <b>Kampanya onaylandı:</b> {campaign['name']}\n"
+            f"🔢 ID: <code>{campaign_id}</code>"
+        )
+    
+    def admin_reject_campaign(self, user_id, campaign_id):
+        """Admin kampanyayı reddet"""
+        if user_id != ADMIN_ID:
+            send_telegram_message(user_id, "❌ Bu işlem için yetkiniz yok!")
+            return
+        
+        # Kampanya bilgilerini al
+        self.db.cursor.execute(
+            "SELECT * FROM campaigns WHERE campaign_id = ?",
+            (campaign_id,)
+        )
+        campaign = self.db.cursor.fetchone()
+        
+        if not campaign:
+            send_telegram_message(user_id, "❌ Kampanya bulunamadı!")
+            return
+        
+        campaign = dict(campaign)
+        
+        # Kampanyayı reddedildi olarak işaretle
+        self.db.update_campaign_status(campaign_id, 'rejected', False)
+        
+        # Kullanıcıya bildir
+        user_msg = (
+            f"❌ <b>KAMPANYANIZ REDDEDİLDİ</b>\n\n"
+            f"📛 <b>İsim:</b> {campaign['name']}\n"
+            f"🔢 <b>Kampanya ID:</b> <code>{campaign_id}</code>\n\n"
+            f"⚠️ <b>Sebep:</b> Admin tarafından reddedildi.\n\n"
+            f"💡 Daha uygun bir kampanya ile tekrar deneyebilirsiniz."
+        )
+        
+        send_telegram_message(campaign['creator_id'], user_msg)
+        
+        # Admin'e bildir
+        send_telegram_message(
+            ADMIN_ID,
+            f"❌ <b>Kampanya reddedildi:</b> {campaign['name']}\n"
+            f"🔢 ID: <code>{campaign_id}</code>"
+        )
+    
+    def check_bot_admin_command(self, user_id, message):
+        """Bot'un admin durumunu kontrol et"""
         if not message or 'chat' not in message:
             send_telegram_message(
                 user_id,
@@ -1053,76 +1286,108 @@ class BotSystem:
         chat_id = str(message['chat']['id'])
         chat_title = message['chat'].get('title', 'Bilinmeyen')
         
-        # Adminleri kontrol et
-        admins = get_chat_administrators(chat_id)
-        bot_id = get_bot_id()
-        
-        is_admin = False
-        for admin in admins:
-            if str(admin['user']['id']) == bot_id:
-                is_admin = admin['status'] == 'administrator'
-                break
-        
-        # Veritabanını güncelle
-        self.db.set_bot_admin(chat_id, chat_title, user_id, is_admin)
+        # Bot'un admin olup olmadığını kontrol et
+        is_admin = self.check_bot_admin_in_chat(chat_id)
         
         if is_admin:
-            status_msg = "✅ <b>Bot bu grupta admin!</b>"
-        else:
-            status_msg = "❌ <b>Bot bu grupta admin değil!</b>"
-        
-        message_text = (
-            f"🤖 <b>BOT ADMIN DURUMU</b>\n"
-            f"══════════════════════════════\n\n"
-            f"📢 <b>Grup/Kanal:</b> {chat_title}\n"
-            f"🆔 <b>ID:</b> <code>{chat_id}</code>\n"
-            f"🔍 <b>Durum:</b> {status_msg}\n\n"
-            f"💡 <i>Kampanya oluşturmak için botu admin yapın.</i>"
-        )
-        
-        markup = {
-            'inline_keyboard': [
-                [
-                    {'text': "🔄 Tekrar Kontrol Et", 'callback_data': 'check_admin_status'},
-                    {'text': "🔙 Geri", 'callback_data': 'menu'}
-                ]
-            ]
-        } if is_admin else {
-            'inline_keyboard': [
-                [
-                    {'text': "🔄 Tekrar Kontrol Et", 'callback_data': 'check_admin_status'},
-                    {'text': "❓ Nasıl Admin Yapılır?", 'callback_data': 'how_to_admin'}
-                ]
-            ]
-        }
-        
-        send_telegram_message(user_id, message_text, markup)
-    
-    def set_forward_requirement(self, user_id, require_forward):
-        """Forward gereksinimini ayarla"""
-        user_state = self.get_user_state(user_id)
-        
-        if 'campaign_data' in user_state['data']:
-            user_state['data']['campaign_data']['requires_forward'] = 1 if require_forward else 0
-            self.set_user_state(user_id, user_state['state'], user_state['data'])
-            
-            status = "AKTİF" if require_forward else "PASİF"
-            send_telegram_message(
-                user_id,
-                f"✅ <b>Forward gereksinimi {status} yapıldı!</b>\n\n"
-                f"Kampanya oluşturmaya devam edebilirsiniz."
+            status_msg = (
+                f"✅ <b>BOT BU GRUPTA/KANALDA ADMIN!</b>\n\n"
+                f"📢 <b>Grup/Kanal:</b> {chat_title}\n"
+                f"🆔 <b>ID:</b> <code>{chat_id}</code>\n\n"
+                f"🎯 Artık bu kanal/grup için kampanya oluşturabilirsiniz!"
             )
         else:
-            send_telegram_message(user_id, "❌ Kampanya bulunamadı!")
+            status_msg = (
+                f"❌ <b>BOT BU GRUPTA/KANALDA ADMIN DEĞİL!</b>\n\n"
+                f"📢 <b>Grup/Kanal:</b> {chat_title}\n"
+                f"🆔 <b>ID:</b> <code>{chat_id}</code>\n\n"
+                f"💡 <b>Nasıl admin yapılır:</b>\n"
+                f"1. Gruba/kanala botu ekleyin\n"
+                f"2. Tüm yetkileri verin (Admin yapın)\n"
+                f"3. Bu komutu tekrar gönderin\n\n"
+                f"⚠️ Bot admin olmadan kampanya oluşturamazsınız!"
+            )
+        
+        send_telegram_message(user_id, status_msg)
+    
+    def test_forward_message(self, user_id):
+        """Admin için forward mesaj testi"""
+        if user_id != ADMIN_ID:
+            return
+        
+        # Test mesajı gönder
+        test_msg = send_telegram_message(
+            user_id,
+            "📝 <b>TEST FORWARD MESAJI</b>\n\n"
+            "Bu mesajı forward ederek bot kampanyası oluşturmayı test edebilirsiniz.\n\n"
+            "1. Bu mesajı seçin\n"
+            "2. Forward butonuna basın\n"
+            "3. Bot'u seçin\n"
+            "4. '/createcampaign' yazın\n"
+            "5. Bot kampanyası seçin\n"
+            "6. Bu mesajı forward edin"
+        )
+        
+        if test_msg and 'result' in test_msg:
+            message_id = str(test_msg['result']['message_id'])
+            
+            # Mesajı kaydet
+            forward_data = {
+                'message_id': message_id,
+                'from_user_id': user_id,
+                'from_chat_id': str(user_id),
+                'message_text': 'TEST FORWARD MESAJI'
+            }
+            
+            self.db.save_forward_message(forward_data)
+            
+            send_telegram_message(
+                user_id,
+                f"✅ <b>Test mesajı gönderildi ve kaydedildi!</b>\n\n"
+                f"📋 Mesaj ID: <code>{message_id}</code>\n\n"
+                f"Şimdi bu mesajı forward ederek bot kampanyası oluşturmayı test edebilirsiniz."
+            )
+    
+    def handle_general_callback(self, user_id, data):
+        """Genel callback'leri işle"""
+        if data == 'joined':
+            if get_chat_member(f"@{MANDATORY_CHANNEL}", user_id):
+                self.db.update_user(user_id, {'in_channel': 1})
+                self.show_main_menu(user_id)
+            else:
+                send_telegram_message(
+                    user_id,
+                    f"❌ Hala kanala katılmadın!\n\n"
+                    f"👉 @{MANDATORY_CHANNEL}"
+                )
+        
+        elif data == 'profile':
+            self.show_profile(user_id)
+        
+        elif data == 'balance':
+            self.show_balance(user_id)
+        
+        elif data == 'daily_bonus':
+            self.handle_daily_bonus(user_id)
+        
+        elif data == 'referral':
+            self.show_referral(user_id)
+        
+        elif data == 'help':
+            self.show_help(user_id)
+        
+        elif data == 'withdraw':
+            self.show_withdraw(user_id)
+        
+        else:
+            self.show_main_menu(user_id)
     
     def handle_start(self, user_id, text):
         """START KOMUTU"""
-        # Kanal kontrolü
         in_channel = get_chat_member(f"@{MANDATORY_CHANNEL}", user_id)
         
         user = self.db.get_user(user_id)
         
-        # HOŞGELDİN BONUSU (2₺)
         if not user.get('welcome_bonus'):
             self.db.add_balance(user_id, 2.0)
             self.db.update_user(user_id, {
@@ -1138,20 +1403,22 @@ class BotSystem:
                 f"⚡ <i>Hemen görev yapmaya başlayabilirsin!</i>"
             )
         
-        # REFERANS KONTROLÜ
         if ' ' in text:
             parts = text.split()
             if len(parts) > 1 and parts[1].startswith('ref_'):
                 referrer_id = parts[1].replace('ref_', '')
-                if referrer_id != user_id:
+                
+                if referrer_id and referrer_id != user_id:
                     referrer = self.db.get_user(referrer_id)
                     if referrer:
-                        # Referans bonusu (1₺)
                         self.db.add_balance(referrer_id, 1.0)
                         self.db.update_user(referrer_id, {
                             'referrals': referrer.get('referrals', 0) + 1,
                             'ref_earned': referrer.get('ref_earned', 0) + 1.0
                         })
+                        
+                        # Referans bildirimi
+                        self.send_referral_notification(referrer_id, user_id, user.get('name', 'Yeni Kullanıcı'))
                         
                         send_telegram_message(
                             user_id,
@@ -1160,7 +1427,6 @@ class BotSystem:
                             "👥 Artık sen de arkadaşlarını davet ederek para kazanabilirsin!"
                         )
         
-        # KANAL KONTROLÜ
         if not in_channel:
             markup = {
                 'inline_keyboard': [
@@ -1183,145 +1449,81 @@ class BotSystem:
             )
             return
         
-        # Ana menü göster
         self.show_main_menu(user_id)
+    
+    def send_referral_notification(self, referrer_id, referred_id, referred_name):
+        """Referans bildirimi gönder"""
+        referrer = self.db.get_user(referrer_id)
+        if not referrer:
+            return
+        
+        referrals = referrer.get('referrals', 0)
+        
+        message = (
+            f"🎉 <b>YENİ REFERANS!</b>\n\n"
+            f"👤 <b>Arkadaşınız:</b> {referred_name}\n"
+            f"🆔 <b>ID:</b> <code>{referred_id}</code>\n\n"
+            f"💰 <b>1₺ referans bonusu</b> hesabınıza yüklendi!\n"
+            f"📊 <b>Toplam referans:</b> {referrals}\n\n"
+            f"🏆 <b>Bonus Seviyeleri:</b>\n"
+            f"• 5 referans: +2₺\n"
+            f"• 10 referans: +5₺\n"
+            f"• 25 referans: +15₺\n"
+            f"• 50 referans: +35₺\n\n"
+            f"👥 Daha fazla arkadaşını davet et, daha çok kazan!"
+        )
+        
+        send_telegram_message(referrer_id, message)
     
     def show_main_menu(self, user_id):
         """ANA MENÜ"""
         user = self.db.get_user(user_id)
         
         message = (
-            f"🚀 <b>GÖREV YAPSAM BOT v7.0</b>\n"
+            f"🚀 <b>GÖREV YAPSAM BOT v10.0</b>\n"
             f"══════════════════════════════\n\n"
             f"👋 <b>Merhaba {user.get('name', 'Kullanıcı')}!</b>\n\n"
             f"💰 <b>Bakiyen:</b> {user.get('balance', 0):.2f}₺\n"
             f"📊 <b>Görevler:</b> {user.get('tasks_completed', 0)}\n"
             f"👥 <b>Referans:</b> {user.get('referrals', 0)}\n\n"
-            f"🎯 <b>YENİ ÖZELLİKLER:</b>\n"
-            f"• 💸 Para Çekim Sistemi\n"
-            f"• 🎯 Kampanya Oluşturma\n"
-            f"• 🤖 Admin Kontrolü\n\n"
+            f"🎯 <b>YENİ SİSTEM:</b>\n"
+            f"• 🤖 Bot: Forward mesajı\n"
+            f"• 📢 Kanal: Bot admin kontrolü\n"
+            f"• 👥 Grup: Bot admin kontrolü\n"
+            f"• 👑 5 adımlı onay sistemi\n\n"
             f"📢 <b>Kanal:</b> @{MANDATORY_CHANNEL}"
         )
         
         markup = {
             'inline_keyboard': [
                 [
-                    {'text': "🤖 GÖREV YAP", 'callback_data': 'tasks'},
-                    {'text': "🎯 KAMPANYA OLUŞTUR", 'callback_data': 'create_campaign'}
+                    {'text': "📢 KAMPANYA OLUŞTUR", 'callback_data': 'create_campaign'},
+                    {'text': "🎯 GÖREV YAP", 'callback_data': 'active_campaigns'}
                 ],
                 [
                     {'text': "💰 BAKİYEM", 'callback_data': 'balance'},
+                    {'text': "👤 PROFİL", 'callback_data': 'profile'}
+                ],
+                [
+                    {'text': "🎁 GÜNLÜK BONUS", 'callback_data': 'daily_bonus'},
+                    {'text': "👥 REFERANS", 'callback_data': 'referral'}
+                ],
+                [
+                    {'text': "❓ YARDIM", 'callback_data': 'help'},
                     {'text': "💸 PARA ÇEK", 'callback_data': 'withdraw'}
-                ],
-                [
-                    {'text': "👤 PROFİL", 'callback_data': 'profile'},
-                    {'text': "🎁 GÜNLÜK BONUS", 'callback_data': 'daily_bonus'}
-                ],
-                [
-                    {'text': "👥 REFERANS", 'callback_data': 'referral'},
-                    {'text': "❓ YARDIM", 'callback_data': 'help'}
                 ]
             ]
         }
         
         if user_id == ADMIN_ID:
             markup['inline_keyboard'].append([
-                {'text': "👑 ADMIN PANEL", 'callback_data': 'admin'}
+                {'text': "👑 ADMIN", 'callback_data': 'admin'}
             ])
         
         send_telegram_message(user_id, message, markup)
     
-    def show_admin_panel(self, user_id):
-        """ADMIN PANELİ"""
-        if user_id != ADMIN_ID:
-            send_telegram_message(user_id, "❌ Bu işlem için yetkiniz yok!")
-            return
-        
-        # İstatistikler
-        self.db.cursor.execute("SELECT COUNT(*) FROM users")
-        total_users = self.db.cursor.fetchone()[0]
-        
-        self.db.cursor.execute("SELECT COUNT(*) FROM campaigns")
-        total_campaigns = self.db.cursor.fetchone()[0]
-        
-        self.db.cursor.execute("SELECT COUNT(*) FROM campaigns WHERE status = 'pending'")
-        pending_campaigns = self.db.cursor.fetchone()[0]
-        
-        self.db.cursor.execute("SELECT COUNT(*) FROM withdrawals WHERE status = 'pending'")
-        pending_withdrawals = self.db.cursor.fetchone()[0]
-        
-        self.db.cursor.execute("SELECT SUM(balance) FROM users")
-        total_balance = self.db.cursor.fetchone()[0] or 0.0
-        
-        message = (
-            f"👑 <b>ADMIN PANELİ v7.0</b>\n"
-            f"══════════════════════════════\n\n"
-            f"📊 <b>İSTATİSTİKLER</b>\n"
-            f"• Toplam Kullanıcı: {total_users}\n"
-            f"• Toplam Kampanya: {total_campaigns}\n"
-            f"• Bekleyen Kampanya: {pending_campaigns}\n"
-            f"• Bekleyen Para Çekim: {pending_withdrawals}\n"
-            f"• Toplam Bakiye: {total_balance:.2f}₺\n\n"
-            f"🛠️ <b>ADMIN ARAÇLARI</b>"
-        )
-        
-        markup = {
-            'inline_keyboard': [
-                [
-                    {'text': "📊 İstatistikler", 'callback_data': 'admin_stats'},
-                    {'text': "👥 Kullanıcılar", 'callback_data': 'admin_users'}
-                ],
-                [
-                    {'text': "🎯 Kampanyalar", 'callback_data': 'admin_campaigns'},
-                    {'text': "💸 Para Çekimler", 'callback_data': 'admin_withdrawals'}
-                ],
-                [
-                    {'text': "📢 Bildirim Gönder", 'callback_data': 'admin_broadcast'},
-                    {'text': "⚙️ Ayarlar", 'callback_data': 'admin_settings'}
-                ],
-                [
-                    {'text': "🔙 Ana Menü", 'callback_data': 'menu'}
-                ]
-            ]
-        }
-        
-        send_telegram_message(user_id, message, markup)
-    
-    def process_legacy_callback(self, user_id, data):
-        """Eski callback'leri işle (geriye uyumluluk için)"""
-        # Kanal kontrolü
-        need_channel = ['tasks', 'create_task', 'daily_bonus', 'withdraw', 'request_withdraw']
-        
-        if data in need_channel:
-            if not get_chat_member(f"@{MANDATORY_CHANNEL}", user_id):
-                send_telegram_message(
-                    user_id,
-                    f"❌ Önce kanala katıl! @{MANDATORY_CHANNEL}"
-                )
-                return
-        
-        if data == 'profile':
-            self.show_profile(user_id)
-        elif data.startswith('task_'):
-            self.show_task_info(user_id, data.replace('task_', ''))
-        elif data == 'create_task':
-            self.start_task_creation(user_id)
-        elif data == 'daily_bonus':
-            self.handle_daily_bonus(user_id)
-        elif data == 'referral':
-            self.show_referral(user_id)
-        elif data == 'balance':
-            self.show_balance(user_id)
-        elif data == 'admin':
-            self.show_admin_panel(user_id)
-        elif data == 'help':
-            self.show_help(user_id)
-        else:
-            self.show_main_menu(user_id)
-    
     def show_profile(self, user_id):
-        """PROFİL (eski sistem)"""
+        """PROFİL"""
         user = self.db.get_user(user_id)
         
         message = (
@@ -1329,23 +1531,18 @@ class BotSystem:
             f"══════════════════════════════\n\n"
             f"🆔 <b>ID:</b> {user_id}\n"
             f"👤 <b>İsim:</b> {user.get('name', 'Kullanıcı')}\n"
+            f"🔗 <b>Kullanıcı Adı:</b> @{user.get('username', 'yok')}\n"
             f"💰 <b>Bakiye:</b> {user.get('balance', 0):.2f}₺\n"
             f"📊 <b>Tamamlanan Görev:</b> {user.get('tasks_completed', 0)}\n"
             f"👥 <b>Referans:</b> {user.get('referrals', 0)}\n"
             f"🎯 <b>Toplam Kazanç:</b> {user.get('total_earned', 0):.2f}₺\n\n"
-            f"💸 <b>Para Çekim:</b>\n"
-            f"• Toplam: {user.get('withdrawal_total', 0):.2f}₺\n"
-            f"• Sayı: {user.get('withdrawal_count', 0)}\n"
-            f"══════════════════════════════"
+            f"📅 <b>Kayıt Tarihi:</b> {user.get('created_at', 'Bilinmiyor')[:10]}"
         )
         
         markup = {
             'inline_keyboard': [
                 [
                     {'text': "💰 Bakiye", 'callback_data': 'balance'},
-                    {'text': "💸 Para Çek", 'callback_data': 'withdraw'}
-                ],
-                [
                     {'text': "🔙 Geri", 'callback_data': 'menu'}
                 ]
             ]
@@ -1354,7 +1551,7 @@ class BotSystem:
         send_telegram_message(user_id, message, markup)
     
     def show_balance(self, user_id):
-        """BAKİYE (eski sistem)"""
+        """BAKİYE"""
         user = self.db.get_user(user_id)
         
         message = (
@@ -1365,13 +1562,17 @@ class BotSystem:
             f"💵 <b>Mevcut Bakiye:</b> {user.get('balance', 0):.2f}₺\n"
             f"🏆 <b>Toplam Kazanç:</b> {user.get('total_earned', 0):.2f}₺\n"
             f"📊 <b>Minimum Çekim:</b> 20₺\n\n"
-            f"💡 <i>Para çekmek için en az 20₺ bakiyen olmalı.</i>"
+            f"💡 <b>Para kazanmak için:</b>\n"
+            f"1. Görev yap\n"
+            f"2. Kampanya oluştur\n"
+            f"3. Referans davet et\n"
+            f"4. Günlük bonus al"
         )
         
         markup = {
             'inline_keyboard': [
                 [
-                    {'text': "💸 Para Çek", 'callback_data': 'withdraw'},
+                    {'text': "📢 Kampanya Oluştur", 'callback_data': 'create_campaign'},
                     {'text': "🔙 Geri", 'callback_data': 'menu'}
                 ]
             ]
@@ -1379,148 +1580,29 @@ class BotSystem:
         
         send_telegram_message(user_id, message, markup)
     
-    def handle_joined(self, user_id):
-        """KATILIM KONTROLÜ"""
-        if get_chat_member(f"@{MANDATORY_CHANNEL}", user_id):
-            self.db.update_user(user_id, {'in_channel': 1})
-            self.show_main_menu(user_id)
-        else:
-            send_telegram_message(
-                user_id,
-                f"❌ Hala kanala katılmadın!\n\n"
-                f"👉 @{MANDATORY_CHANNEL}"
-            )
-    
-    def start_task_creation(self, user_id):
-        """GÖREV OLUŞTURMA (eski sistem)"""
-        message = (
-            "📢 <b>GÖREV OLUŞTURMA</b>\n"
-            "══════════════════════════════\n\n"
-            "1️⃣ <b>Adım:</b> Botu kanalına/grubuna ekle\n"
-            "2️⃣ <b>Adım:</b> Admin yetkileri ver\n"
-            "3️⃣ <b>Adım:</b 'Görev Yap' butonuna bas\n\n"
-            "👇 <b>Görev tipini seç:</b>"
-        )
-        
-        markup = {
-            'inline_keyboard': [
-                [
-                    {'text': "🤖 Bot Görevi", 'callback_data': 'create_bot'},
-                    {'text': "📢 Kanal Görevi", 'callback_data': 'create_channel'}
-                ],
-                [
-                    {'text': "👥 Grup Görevi", 'callback_data': 'create_group'},
-                    {'text': "🔙 Geri", 'callback_data': 'menu'}
-                ]
-            ]
-        }
-        
-        send_telegram_message(user_id, message, markup)
-    
-    def show_task_info(self, user_id, task_type):
-        """GÖREV BİLGİSİ (eski sistem)"""
-        prices = {'bot': 2.5, 'channel': 1.5, 'group': 1.0}
-        price = prices.get(task_type, 1.0)
-        
-        task_names = {
-            'bot': '🤖 BOT GÖREVİ',
-            'channel': '📢 KANAL GÖREVİ',
-            'group': '👥 GRUP GÖREVİ'
-        }
-        
-        message = (
-            f"🎯 <b>{task_names.get(task_type)}</b>\n"
-            f"══════════════════════════════\n\n"
-            f"💰 <b>Ödül:</b> {price}₺\n\n"
-            f"📊 <b>Kota Hesaplama:</b>\n"
-            f"• 10₺ = {int(10/price)} görev\n"
-            f"• 50₺ = {int(50/price)} görev\n"
-            f"• 100₺ = {int(100/price)} görev\n\n"
-            f"⚠️ <i>Görev oluşturmak için 'GÖREV OLUŞTUR' butonuna bas.</i>"
-        )
-        
-        markup = {
-            'inline_keyboard': [
-                [
-                    {'text': "📝 Görev Oluştur", 'callback_data': 'create_task'},
-                    {'text': "🔙 Geri", 'callback_data': 'tasks'}
-                ]
-            ]
-        }
-        
-        send_telegram_message(user_id, message, markup)
-    
-    def handle_daily_bonus(self, user_id):
-        """GÜNLÜK BONUS (eski sistem)"""
+    def show_withdraw(self, user_id):
+        """PARA ÇEKME - YAKINDA"""
         user = self.db.get_user(user_id)
-        now = datetime.now()
-        
-        # Bugün bonus alınmış mı?
-        last_daily = user.get('last_daily')
-        if last_daily:
-            last_date = datetime.fromisoformat(last_daily).date()
-            if last_date == now.date():
-                # Bugün zaten alınmış
-                next_time = (now + timedelta(days=1)).strftime('%d.%m.%Y %H:%M')
-                
-                message = (
-                    f"🎁 <b>GÜNLÜK BONUS</b>\n"
-                    f"══════════════════════════════\n\n"
-                    f"❌ <b>Bugünkü bonusu zaten aldın!</b>\n\n"
-                    f"⏳ <b>Bir sonraki bonus:</b> {next_time}\n"
-                    f"🔥 <b>Üst üste gün:</b> {user.get('daily_streak', 0)}\n\n"
-                    f"💡 <i>Yarın tekrar gel!</i>"
-                )
-                
-                markup = {
-                    'inline_keyboard': [
-                        [{'text': "🔙 Geri", 'callback_data': 'menu'}]
-                    ]
-                }
-                
-                send_telegram_message(user_id, message, markup)
-                return
-        
-        # Bonus ver (1-5₺ arası)
-        import random
-        bonus = round(random.uniform(1.0, 5.0), 2)
-        
-        # Streak hesapla
-        streak = user.get('daily_streak', 0)
-        if last_daily:
-            last_date = datetime.fromisoformat(last_daily).date()
-            yesterday = (now - timedelta(days=1)).date()
-            
-            if last_date == yesterday:
-                streak += 1
-            else:
-                streak = 1
-        else:
-            streak = 1
-        
-        # Bonusu ekle
-        self.db.add_balance(user_id, bonus)
-        
-        # Kullanıcıyı güncelle
-        self.db.update_user(user_id, {
-            'last_daily': now.isoformat(),
-            'daily_streak': streak
-        })
+        balance = user.get('balance', 0)
         
         message = (
-            f"🎁 <b>GÜNLÜK BONUS</b>\n"
+            f"💸 <b>PARA ÇEKME SİSTEMİ</b>\n"
             f"══════════════════════════════\n\n"
-            f"🎉 <b>TEBRİKLER! Günlük bonusun yüklendi!</b>\n\n"
-            f"💰 <b>Bonus:</b> {bonus:.2f}₺\n"
-            f"🔥 <b>Üst üste gün:</b> {streak}\n"
-            f"💸 <b>Yeni Bakiye:</b> {user.get('balance', 0) + bonus:.2f}₺\n\n"
-            f"💡 <i>Yarın daha fazla kazanmak için tekrar gel!</i>"
+            f"💰 <b>Mevcut Bakiye:</b> {balance:.2f}₺\n"
+            f"📊 <b>Minimum Çekim:</b> 20₺\n\n"
+            f"🎯 <b>❗ YAKINDA AKTİF OLACAK ❗</b>\n\n"
+            f"⏳ <b>Geliştirme Aşamasında...</b>\n\n"
+            f"💡 <b>Şimdilik yapabilecekleriniz:</b>\n"
+            f"1. Görev yaparak para biriktir\n"
+            f"2. Referans sisteminden kazan\n"
+            f"3. Kampanya oluştur\n\n"
+            f"📢 <b>Sistem yakında aktif olacaktır!</b>"
         )
         
         markup = {
             'inline_keyboard': [
                 [
-                    {'text': "💰 Bakiye", 'callback_data': 'balance'},
+                    {'text': "📢 Kampanya Oluştur", 'callback_data': 'create_campaign'},
                     {'text': "🔙 Geri", 'callback_data': 'menu'}
                 ]
             ]
@@ -1529,7 +1611,7 @@ class BotSystem:
         send_telegram_message(user_id, message, markup)
     
     def show_referral(self, user_id):
-        """REFERANS (eski sistem)"""
+        """REFERANS"""
         user = self.db.get_user(user_id)
         ref_link = f"https://t.me/GorevYapsamBot?start=ref_{user_id}"
         
@@ -1564,8 +1646,80 @@ class BotSystem:
         
         send_telegram_message(user_id, message, markup)
     
+    def handle_daily_bonus(self, user_id):
+        """GÜNLÜK BONUS"""
+        user = self.db.get_user(user_id)
+        now = datetime.now()
+        
+        last_daily = user.get('last_daily')
+        if last_daily:
+            last_date = datetime.fromisoformat(last_daily).date()
+            if last_date == now.date():
+                next_time = (now + timedelta(days=1)).strftime('%d.%m.%Y %H:%M')
+                
+                message = (
+                    f"🎁 <b>GÜNLÜK BONUS</b>\n"
+                    f"══════════════════════════════\n\n"
+                    f"❌ <b>Bugünkü bonusu zaten aldın!</b>\n\n"
+                    f"⏳ <b>Bir sonraki bonus:</b> {next_time}\n"
+                    f"🔥 <b>Üst üste gün:</b> {user.get('daily_streak', 0)}\n\n"
+                    f"💡 <i>Yarın tekrar gel!</i>"
+                )
+                
+                markup = {
+                    'inline_keyboard': [
+                        [{'text': "🔙 Geri", 'callback_data': 'menu'}]
+                    ]
+                }
+                
+                send_telegram_message(user_id, message, markup)
+                return
+        
+        import random
+        bonus = round(random.uniform(1.0, 5.0), 2)
+        
+        streak = user.get('daily_streak', 0)
+        if last_daily:
+            last_date = datetime.fromisoformat(last_daily).date()
+            yesterday = (now - timedelta(days=1)).date()
+            
+            if last_date == yesterday:
+                streak += 1
+            else:
+                streak = 1
+        else:
+            streak = 1
+        
+        self.db.add_balance(user_id, bonus)
+        
+        self.db.update_user(user_id, {
+            'last_daily': now.isoformat(),
+            'daily_streak': streak
+        })
+        
+        message = (
+            f"🎁 <b>GÜNLÜK BONUS</b>\n"
+            f"══════════════════════════════\n\n"
+            f"🎉 <b>TEBRİKLER! Günlük bonusun yüklendi!</b>\n\n"
+            f"💰 <b>Bonus:</b> {bonus:.2f}₺\n"
+            f"🔥 <b>Üst üste gün:</b> {streak}\n"
+            f"💸 <b>Yeni Bakiye:</b> {user.get('balance', 0) + bonus:.2f}₺\n\n"
+            f"💡 <i>Yarın daha fazla kazanmak için tekrar gel!</i>"
+        )
+        
+        markup = {
+            'inline_keyboard': [
+                [
+                    {'text': "💰 Bakiye", 'callback_data': 'balance'},
+                    {'text': "🔙 Geri", 'callback_data': 'menu'}
+                ]
+            ]
+        }
+        
+        send_telegram_message(user_id, message, markup)
+    
     def show_help(self, user_id):
-        """YARDIM (eski sistem)"""
+        """YARDIM"""
         message = (
             f"❓ <b>YARDIM</b>\n"
             f"══════════════════════════════\n\n"
@@ -1574,17 +1728,24 @@ class BotSystem:
             f"• /menu - Ana menü\n"
             f"• /profile - Profilim\n"
             f"• /balance - Bakiyem\n"
-            f"• /tasks - Görev yap\n"
+            f"• /createcampaign - Kampanya oluştur\n"
             f"• /bonus - Günlük bonus\n"
             f"• /referral - Referans sistemi\n"
-            f"• /withdraw - Para çekme\n"
-            f"• /createcampaign - Kampanya oluştur\n"
-            f"• /checkadmin - Admin kontrolü\n"
+            f"• /withdraw - Para çekme (YAKINDA)\n"
             f"• /help - Yardım\n\n"
-            f"🎯 <b>YENİ ÖZELLİKLER</b>\n"
-            f"• Kampanya Oluşturma\n"
-            f"• Para Çekim Sistemi\n"
-            f"• Bot Admin Kontrolü\n\n"
+            f"🎯 <b>KAMPANYA TİPLERİ</b>\n"
+            f"1. 🤖 <b>Bot Kampanyası</b>\n"
+            f"   • Görev: Bot mesajını forward et\n"
+            f"   • Ödül: 2.5₺\n"
+            f"   • Gereksinim: Forward mesajı\n\n"
+            f"2. 📢 <b>Kanal Kampanyası</b>\n"
+            f"   • Görev: Kanala katıl\n"
+            f"   • Ödül: 1.5₺\n"
+            f"   • Gereksinim: Bot kanalda admin olmalı\n\n"
+            f"3. 👥 <b>Grup Kampanyası</b>\n"
+            f"   • Görev: Gruba katıl\n"
+            f"   • Ödül: 1₺\n"
+            f"   • Gereksinim: Bot grupta admin olmalı\n\n"
             f"⚠️ <b>ÖNEMLİ KURALLAR</b>\n"
             f"• Sahte görev yasak\n"
             f"• Çoklu hesap yasak\n"
@@ -1595,45 +1756,88 @@ class BotSystem:
         markup = {
             'inline_keyboard': [
                 [
-                    {'text': "📞 Destek", 'callback_data': 'support'},
+                    {'text': "📢 Kampanya Oluştur", 'callback_data': 'create_campaign'},
                     {'text': "🔙 Geri", 'callback_data': 'menu'}
                 ]
             ]
         }
         
         send_telegram_message(user_id, message, markup)
+    
+    def show_admin_panel(self, user_id):
+        """ADMIN PANELİ"""
+        if user_id != ADMIN_ID:
+            send_telegram_message(user_id, "❌ Bu işlem için yetkiniz yok!")
+            return
+        
+        # İstatistikler
+        self.db.cursor.execute("SELECT COUNT(*) as count FROM users")
+        total_users = self.db.cursor.fetchone()['count']
+        
+        self.db.cursor.execute("SELECT COUNT(*) as count FROM campaigns WHERE status = 'pending'")
+        pending_campaigns = self.db.cursor.fetchone()['count']
+        
+        self.db.cursor.execute("SELECT COUNT(*) as count FROM campaigns WHERE status = 'active'")
+        active_campaigns = self.db.cursor.fetchone()['count']
+        
+        message = (
+            f"👑 <b>ADMIN PANELİ v10.0</b>\n"
+            f"══════════════════════════════\n\n"
+            f"📊 <b>İSTATİSTİKLER</b>\n"
+            f"• Toplam Kullanıcı: <b>{total_users}</b>\n"
+            f"• Bekleyen Kampanya: {pending_campaigns}\n"
+            f"• Aktif Kampanya: {active_campaigns}\n\n"
+            f"🛠️ <b>ADMIN ARAÇLARI</b>"
+        )
+        
+        markup = {
+            'inline_keyboard': [
+                [
+                    {'text': "📋 Bekleyenler", 'callback_data': 'admin_pending'},
+                    {'text': "📊 İstatistik", 'callback_data': 'admin_stats'}
+                ],
+                [
+                    {'text': "👥 Kullanıcılar", 'callback_data': 'admin_users'},
+                    {'text': "📢 Bildirim", 'callback_data': 'admin_broadcast'}
+                ],
+                [
+                    {'text': "🔙 Ana Menü", 'callback_data': 'menu'}
+                ]
+            ]
+        }
+        
+        send_telegram_message(user_id, message, markup)
 
-# ================= 7. ANA PROGRAM =================
+# ================= 6. ANA PROGRAM =================
 def main():
     print("""
     ╔════════════════════════════════════════════════════════════════╗
-    ║                    GÖREV YAPSAM BOT v7.0                       ║
-    ║            PARA ÇEKİM + KAMPANYA SİSTEMİ + ADMIN YETKİ         ║
+    ║                    GÖREV YAPSAM BOT v10.0                      ║
+    ║        FORWARD SİSTEMİ + BOT ADMIN KONTROLÜ + 5 ADIMLI ONAY    ║
     ╚════════════════════════════════════════════════════════════════╝
     
     ✅ /start ÇALIŞIYOR
-    ✅ Para Çekim Sistemi
-    ✅ Kampanya Oluşturma
-    ✅ Bot Admin Kontrolü
-    ✅ SQLite Veritabanı
-    ✅ Render Uyumlu
+    ✅ 🤖 Bot: Forward mesajı gereksinimi
+    ✅ 📢 Kanal: Bot admin kontrolü
+    ✅ 👥 Grup: Bot admin kontrolü
+    ✅ 👑 5 adımlı onay sistemi
+    ✅ Admin onayı ile yayınlama
     """)
     
-    # Botu başlat
     bot = BotSystem()
     
-    # Telegram polling'i thread'de başlat
     bot_thread = threading.Thread(target=bot.start_polling, daemon=True)
     bot_thread.start()
     
     print("✅ Bot başarıyla başlatıldı!")
-    print("🔗 Telegram'da /start yazarak test edin")
     print(f"👑 Admin ID: {ADMIN_ID}")
     print(f"📢 Zorunlu Kanal: @{MANDATORY_CHANNEL}")
+    print("🔗 Telegram'da /start yazarak test edin")
+    print("🎯 Komutlar: /menu, /createcampaign")
     
     return app
 
-# ================= 8. UYGULAMA BAŞLATMA =================
+# ================= 7. UYGULAMA BAŞLATMA =================
 if __name__ == "__main__":
     if not TOKEN:
         print("""
@@ -1647,12 +1851,10 @@ if __name__ == "__main__":
         3. MANDATORY_CHANNEL = GY_Refim
         """)
     else:
-        # Flask web server'ı başlat
         app_instance = main()
         port = int(os.environ.get('PORT', 8080))
         print(f"🌐 Web server başlatılıyor: http://0.0.0.0:{port}")
         app_instance.run(host='0.0.0.0', port=port, debug=False)
 
-# WSGI için
 def create_app():
     return main()
